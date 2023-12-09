@@ -7,8 +7,7 @@ output: word_document
 knitr::opts_chunk$set(echo = TRUE)
 
 #read in data from excel worksheet, assuming it is located in the working directory
-knitr::opts_knit$set(root.dir = "C:\\Users\\Joyce Hu\\OneDrive - National University of Singapore\\YSPH\\Research\\Green gentrification\\greengentrification\\Gentrification Index R code and dependent files")
-
+knitr::opts_knit$set(root.dir = "C:/Users/Joyce Hu/OneDrive - National University of Singapore/YSPH/Research/Green gentrification/greengentrification/Gentrification")
 ############################################################################################
 # R code for data processing and analysis to compute small area indices of gentrification. #
 # This application is for New York City census tracts.                                     #
@@ -39,11 +38,11 @@ library(matrixStats)
 library(ggplot2)
 
 # STEP 2: Bayesian spatial smoothing
-#library(maptools) retired package
-#library(rgdal) retired package
-#library(rgeos) retired package
+#library(maptools) 
+#library(rgdal) 
+#library(rgeos) 
 library(shapefiles)
-library(sp)
+#library(sp)
 library(spdep)
 library(CARBayes)
 library(sf) #to replace rgdal package
@@ -51,6 +50,7 @@ if(!require('CARBayes')) {
   install.packages('CARBayes')
   library('CARBayes')
 }
+library(terra)
 ```
 
 ```{r PCA and its alternatives, echo = FALSE}
@@ -87,23 +87,35 @@ rate00_16 <- data %>%
 ```{r Bayesian spatial smoothing, echo=FALSE}
 #STEP 2: Bayesian spatial smoothing
 
+
+#######ORIGINAL CODE WRITTEN FOR SP##############
 # Create a spatial data object that combines attributes with polygons from a shape file
-shp <- (read.shp(shp.name = "Gentrification.shp"))
-dbf <- (read.dbf(dbf.name = "Gentrification.dbf"))
-dbf$dbf <- dbf$dbf[,1:2] #1st 2 columns are all that is needed
-# Following places tractFIPS in the first column, whose values must match, row by row, with rownames of the attributes frame
-dbf$dbf <- dbf$dbf[,c(2,1)] 
-dbf$dbf<-dbf$dbf[order(dbf$dbf$tractid), ] #ensure sorted by tract order
-library(sp)
-merge = merge(rate00_16, dbf)
-data.combined = st_sf(merge, shp)
-
-data.combined <- combine.data.shapefile(rate00_16, shp, dbf) 
-
-
+#shp <- read.shp(shp.name = "Gentrification.shp")
+#dbf <- (read.dbf(dbf.name = "Gentrification.dbf"))
+#dbf$dbf <- dbf$dbf[,1:2] #1st 2 columns are all that is needed
+#dbf$dbf <- dbf$dbf[,c(2,1)] 
+#dbf$dbf<-dbf$dbf[order(dbf$dbf$tractid), ] #ensure sorted by tract order
+#data.combined <- combine.data.shapefile(rate00_16, shp, dbf) 
 # Create a spatial weights matrix
-W.nb <- poly2nb(data.combined, row.names = dbf$dbf[,1])
-W.mat <- nb2mat(W.nb, style = "B", zero.policy=T) #basic binary weights, not standardized
+#W.nb <- poly2nb(data.combined, row.names = dbf$dbf[,1])
+#W.mat <- nb2mat(W.nb, style = "B", zero.policy=T) #basic binary weights, not standardized
+
+######EDITED SF CODE#############
+shp = st_read("Gentrification.shp")
+dbf = vect("Gentrification.dbf")
+dbf = data.frame(dbf$tractid, dbf[, 1:2])
+# Following places tractFIPS in the first column, whose values must match, row by row, with rownames of the attributes frame
+names(dbf) = c("tractid", "dbf")
+dbf = dbf[order(dbf$tractid), ] #ensure sorted by tract order
+
+# Merge attribute data with polygons 
+data.combined = merge(shp, dbf, by = "tractid")
+
+# Create a spatial weights matrix (using spdep)
+W.nb = poly2nb(data.combined, row.names = data.combined$tractid)
+W.mat = nb2mat(W.nb, style = "B", zero.policy = TRUE)
+###################################
+###ORIGINAL CODE###################
 
 # Manually associate neighbors with island tracts [NOTE: each polygon must be associated with at lest one other]
 # tracts = 36005051600 (City Island, Bronx), 36081107201 (in Jamaica Bay, near Rockaways), 36081092200 (Breezy Point)
@@ -143,3 +155,39 @@ final_dataset <- cbind(rate00_16, scores, PCA00_16CARBayesQuants) #assure all so
 write.csv(final_dataset, "PCA00_16CARBayes.csv")
 ```
 
+```{r}
+#Mapping (own code added)
+final_dataset
+final_dataset$tractid = shp$tractid
+final_dataset$geometry = shp$geometry
+
+library(ggplot2)
+library(classInt)
+library(RColorBrewer)
+
+# Set the number of breaks
+num_breaks = 5
+
+# Categorize into natural breaks (jenks)
+breaks = classIntervals(final_dataset$score_0.5, n = num_breaks, style = "jenks")
+
+# Assign colors
+color_palette = brewer.pal(num_breaks, "YlOrRd")
+color_palette = rev(color_palette)
+
+# Apply colors to  data
+final_dataset$colors = cut(final_dataset$score_0.5, breaks = breaks$brks, labels = FALSE)
+final_dataset$colors = color_palette[final_dataset$colors]
+
+category_labels = sprintf("%1.2f to %1.2f", head(breaks$brks, -1), tail(breaks$brks, -1))
+
+# Plot map
+ggplot()+
+  geom_sf(data=final_dataset,aes(geometry = geometry, fill = factor(final_dataset$colors))) +
+  scale_fill_brewer(palette="YlOrRd", labels = category_labels)+
+  labs(fill = "Categorized by Natural breaks",
+       title = "Gentrification Index")
+
+```
+
+```
