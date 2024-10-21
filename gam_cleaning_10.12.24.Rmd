@@ -1,0 +1,399 @@
+---
+title: "gam_cleaning_9.26.24"
+output: html_document
+date: "2024-09-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages (JH - check if any are unused after code cleaned)
+```{r}
+library(tidyverse)
+library(tigris)
+library(arrow)
+library(here)
+library(mgcv)
+library(fixest)
+library(lmtest)
+library(terra)
+library(exactextractr)
+library(tidyterra)
+library(sf)
+library(mgcViz)
+
+library(DHARMa)
+library(qqplotr)
+library(readxl) # for read_excel()
+library(spdep) # for moran.test()
+library(tidycensus) # for median income
+library(distr) # for qqbounds()
+library(spatialreg) # for spatial lag and error models
+library(gridExtra) # for viewing plots side-by-side
+library(qgam) 
+```
+
+Load and clean data
+```{r}
+# Check if 'data' directory exists; if not, create it
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+# load gentrification score by tract
+gentrification <- read.csv(here("Data_NYC_Gentrification_2000_16.csv")) %>% 
+  mutate(tractid = as.character(tractid)) %>% 
+  dplyr::select(tractid, score_0.5)
+
+# pull NYC tract IDs/fips from gentrification index dataset for filtering
+nyc_fips <- gentrification$tractid
+
+# load NYC tracts shapefile
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), year = 2010) %>%
+  # clean lat and long for Conley SEs
+  mutate(lat = as.numeric(INTPTLAT10), long = as.numeric(INTPTLON10), GEOID = GEOID10) %>% 
+  # filter for FIPS codes included in gentrification index dataset
+  filter(GEOID %in% nyc_fips)
+
+
+#load NY tracts populatuion weighted centroid points from Census data
+nyc_weighted_centroids <- read.table("https://www2.census.gov/geo/docs/reference/cenpop2010/tract/CenPop2010_Mean_TR36.txt", 
+                         header = TRUE, sep = ",", stringsAsFactors = FALSE, 
+                         colClasses = c("character", "character", "character", "numeric", "numeric", "numeric")) %>%
+  mutate(FIPS = paste(STATEFP, COUNTYFP, TRACTCE, sep = "")) %>% 
+  ## filter for only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%  
+  rename(Longitude_weighted = LONGITUDE, 
+         Latitude_weighted = LATITUDE)
+
+# JH - 10/12/24, warning persists 10/13, 10/14 Warning: R metadata may have unsafe or invalid elements ℹ Type: "externalptr" options(arrow.unsafe_metadata = TRUE) #
+
+# temperature data
+if(!file.exists(here("data","summarized_daily_temp_preds.parquet"))){download.file("https://zenodo.org/records/10557980/files/summarized_daily_temp_preds.parquet?download=1", 
+                                                                                   destfile = here("data","summarized_daily_temp_preds.parquet"))}
+
+# temperature by tract
+temp <- read_parquet(here("data","summarized_daily_temp_preds.parquet")) %>%
+  filter(str_detect(date, "2016")) %>%
+  mutate(temp_c = mean_temp_daily_cK/100-273.15) %>% 
+  mutate(temp_f = temp_c*9/5+32) %>% 
+  group_by(GEOID, date) %>%
+  ungroup() %>% 
+  group_by(GEOID) %>% 
+  summarize(mean_temp = mean(mean_temp_daily_cK/100))
+
+# ndvi by tract (need to have it downloaded and stored locally)
+ndvi_2016 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_2000 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+# PM2.5 data
+# download data from URL
+download_data <- function() {
+  # set longer timeout
+  options(timeout = 7200)
+  if(!file.exists(here("data", "2016_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_pm25_daily_average.txt.gz", destfile = here("data", "2016_pm25_daily_average.txt.gz"))} #2016
+  if(!file.exists(here("data", "2002_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_pm25_daily_average.txt.gz", destfile = here("data", "2002_pm25_daily_average.txt.gz"))}} #2002
+download_data()
+
+# read in PM2.5 daily average by census tract from EPA FAQSD - 2002
+pm_tract_2002 <- read.delim(gzfile(here("data", "2002_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## Include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## Calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# read in PM2.5 daily average by census tract from EPA FAQSD - 2016
+pm_tract_2016 <- read.delim(gzfile(here("data", "2016_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(pm_mean_2016 = mean(Prediction), 
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+  
+
+# combine 2002 and 2016 pm data for nyc_tracts
+pm_tract <- pm_tract_2002 %>%
+  inner_join(pm_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# NO2 CACES
+no2_2016_caces <- read.csv(here("data", "2016_no2_caces.csv")) %>% 
+  mutate(no2_2016 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_2000_caces <- read.csv(here("data", "2000_no2_caces.csv")) %>% 
+  mutate(no2_2000 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_caces <- left_join(no2_2000_caces, no2_2016_caces, by = "fips") %>% 
+  select(no2_2000, no2_2016, fips)
+
+#O3 data download
+options(timeout = 7200)
+if(!file.exists(here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))} #2016
+if(!file.exists(here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))} #2002
+
+# read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2002
+o3_tract_2002 <- read.delim(gzfile(here("data", "2002_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>% 
+  ## include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>% 
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2016
+o3_tract_2016 <- read.delim(gzfile(here("data", "2016_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>% 
+  ## calculate annual average by tract using  population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(o3_mean_2016 = mean(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+
+o3_tract <- o3_tract_2002 %>%
+  left_join(o3_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# merge all exposure data
+all_data <- nyc_tracts %>% 
+  # join gentrification index by tract
+  right_join(gentrification, by = c("GEOID10" = "tractid")) %>%
+  left_join(pm_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016-pm_2002) %>% 
+  left_join(o3_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002) %>% 
+  left_join(no2_caces, by = c("GEOID" = "fips")) %>% 
+  mutate(no2_change = no2_2016-no2_2000) %>% 
+  mutate(ndvi_2016 = ndvi_2016, ndvi_2000 = ndvi_2000, ndvi_change = ndvi_2016-ndvi_2000) %>% 
+  left_join(temp, by = "GEOID")
+
+# models adjusting for median income in 2016
+income <- get_acs(variables = "B06011_001", year = 2016, state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2016 = estimate)
+
+all_data_inc <- all_data %>% 
+  left_join(income, by = "GEOID") %>% 
+  # coerce GEOID to numeric then factor class to avoid error in MRF smooth
+  mutate(GEOID = as.numeric(GEOID)) %>% 
+  mutate(GEOID = factor(GEOID))
+
+##################### models adjusting for median income in 2016 and distance to downtown ###############
+# load nyc roads
+downtown_st <- roads(state = "NY", county = "New York", year = 2011)
+ggplot() + geom_sf(data = downtown_st)
+
+# Define bounding box
+bbox_coords <- matrix(c(
+  -74.0187, 40.70158,  # Southwest
+  -74.0187, 40.77279,  # Northwest
+  -73.95953, 40.77279, # Northeast
+  -73.95953, 40.70158, # Southeast
+  -74.0187, 40.70158   # Closing the polygon
+), ncol = 2, byrow = TRUE)
+
+# convert bounding box to sf
+bbox_polygon <- st_sfc(st_polygon(list(bbox_coords)), crs = 4326)
+
+# Ensure roads are the same CRS and filter for streets within bbox
+downtown_st <- st_transform(downtown_st, crs = st_crs(bbox_polygon))
+filtered_streets <- downtown_st[st_within(downtown_st, bbox_polygon, sparse = FALSE), ]
+
+# Plot filtered downtown streets and bounding box
+ggplot() +
+  geom_sf(data = filtered_streets) +
+  geom_sf(data = bbox_polygon, fill = NA, color = 'red') +
+  ggtitle("Downtown Streets within Bounding Box")
+
+# Ensure census tracts are in the same CRS
+nyc_tracts <- st_transform(nyc_tracts, crs = st_crs(bbox_polygon))
+
+# Filter intersecting tracts within downtown
+intersecting_tracts <- st_intersection(nyc_tracts, bbox_polygon)
+combined_area <- st_union(intersecting_tracts)
+#get downtown centroid
+area_centroid <- st_centroid(combined_area)
+
+ggplot() +
+  geom_sf(data = intersecting_tracts, fill = 'lightblue', color = 'black') +
+  geom_sf(data = area_centroid, color = 'red', size = 3) +
+  ggtitle('Centroid of Downtown Census Tracts')
+
+# Calculate distances and add to "all_data_inc" dataframe
+distances <- st_distance(nyc_tracts, area_centroid)
+all_data_inc$dt_dist <- as.numeric(distances)
+```
+
+
+Models (JH 10/6/24 -works, 10/10/24 - something didn't save, might need to reorder)
+```{r}
+run_gam_models <- function(data, exposure, baseline_exposure = NULL) {
+  
+  # Define dependent variable
+  exp_var <- paste0(exposure, "_change")
+  
+  # Define model formulas
+  formulas <- list(
+    tp_base = as.formula(paste0(exp_var, " ~ s(score_0.5) + te(long, lat, d = 2, bs = 'gp', m = 2)")),
+    tp_income = as.formula(paste0(exp_var, " ~ s(score_0.5) + s(med_income_2016) + te(long, lat, d = 2, bs = 'gp', m = 2)")),
+    tp_income_dist = as.formula(paste0(exp_var, " ~ s(score_0.5) + s(med_income_2016) + s(dt_dist) + te(long, lat, d = 2, bs = 'gp', m = 2)")),
+    mrf_base = as.formula(paste0(exp_var, " ~ s(score_0.5) + s(GEOID, bs = 'mrf', xt = list(nb = nb))")),
+    mrf_income = as.formula(paste0(exp_var, " ~ s(score_0.5) + s(med_income_2016) + s(GEOID, bs = 'mrf', xt = list(nb = nb))")),
+    mrf_income_dist = as.formula(paste0(exp_var, " ~ s(score_0.5) + s(med_income_2016) + s(dt_dist) + s(GEOID, bs = 'mrf', xt = list(nb = nb))"))
+  )
+  
+  # Add baseline exposure to formulas if provided
+  if (!is.null(baseline_exposure)) {
+    formulas$tp_full <- as.formula(paste0(exp_var, " ~ s(score_0.5) + s(med_income_2016) + s(dt_dist) + s(", baseline_exposure, ") + te(long, lat, d = 2, bs = 'gp', m = 2)"))
+    formulas$mrf_full <- as.formula(paste0(exp_var, " ~ s(score_0.5) + s(med_income_2016) + s(dt_dist) + s(", baseline_exposure, ") + s(GEOID, bs = 'mrf', xt = list(nb = nb))"))
+  }
+  
+  # Run models
+  models <- purrr::map(formulas, ~try(gam(., family = scat, data = data, method = "REML"), silent = TRUE))
+  
+  # Return models
+  return(models)
+
+# Define exposures and their baseline values
+exposures <- list(
+  pm = list(name = "pm", baseline = "pm_2002"),
+  o3 = list(name = "o3", baseline = "o3_2002"),
+  no2 = list(name = "no2", baseline = "no2_2000"),
+  ndvi = list(name = "ndvi", baseline = "ndvi_2002"),
+  temp = list(name = "temp", baseline = NULL)
+)
+
+# Run models for each exposure
+all_models <- purrr::map(exposures, ~run_gam_models(all_data_inc, .x$name, .x$baseline))
+
+# Name the list elements
+names(all_models) <- purrr::map_chr(exposures, "name")
+}
+```
+
+Model summaries (JH - works - 10/6 - but don't know if this is useful)
+```{r}
+#model summaries
+model_summaries <- map(all_models, function(models) map(models, summary))
+
+#plot residuals
+plot_residuals <- function(model) {
+  par(mfrow = c(2, 2))
+  plot(model$residuals ~ fitted(model), main = "Residuals vs Fitted")
+  qqnorm(model$residuals, main = "Normal Q-Q")
+  qqline(model$residuals)
+  hist(model$residuals, main = "Residuals Histogram")
+}
+```
+
+qqplot model attempts - need to fix errors.
+```{r}
+generate_direct_qq_plots <- function(models_list) {
+  plots <- map(names(models_list), function(exposure) {
+    exposure_models <- models_list[[exposure]]
+    map(names(exposure_models), function(model_name) {
+      model <- exposure_models[[model_name]]
+      if (inherits(model, "try-error")) {
+        return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, label = paste("Error in model:", model_name)) + 
+               ggtitle(paste(exposure, "-", model_name)))
+      }
+      
+      residuals <- try(residuals(model, type = "deviance"), silent = TRUE)
+      if (inherits(residuals, "try-error") || length(residuals) == 0) {
+        return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, label = "No residuals available") + 
+               ggtitle(paste(exposure, "-", model_name)))
+      }
+      
+      df <- data.frame(residuals = residuals)
+      ggplot(df, aes(sample = residuals)) +
+        stat_qq() +
+        stat_qq_line() +
+        labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+        ggtitle(paste(exposure, "-", model_name))
+    })
+  })
+  
+  do.call(grid.arrange, c(flatten(plots), ncol = 4))
+}
+
+# Usage:
+generate_direct_qq_plots(all_models)
+```
+
+
+## getting error messages in some of the models - check this code (JH 10.12.24)
+```{r}
+
+generate_direct_qq_plots <- function(models_list) {
+  exposure_plots <- map(names(models_list), function(exposure) {
+    exposure_models <- models_list[[exposure]]
+    
+    model_plots <- map(names(exposure_models), function(model_name) {
+      model <- exposure_models[[model_name]]
+      if (inherits(model, "try-error")) {
+        return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, label = paste("Error in model:", model_name)) + 
+               ggtitle(paste(exposure, "-", model_name)))
+      }
+      
+      residuals <- try(residuals(model, type = "deviance"), silent = TRUE)
+      if (inherits(residuals, "try-error") || length(residuals) == 0) {
+        return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, label = "No residuals available") + 
+               ggtitle(paste(exposure, "-", model_name)))
+      }
+      
+      df <- data.frame(residuals = residuals)
+      ggplot(df, aes(sample = residuals)) +
+        stat_qq() +
+        stat_qq_line() +
+        labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+        ggtitle(paste(exposure, "-", model_name))
+    })
+    
+    # Arrange model plots in a grid for this exposure
+    do.call(grid.arrange, c(model_plots, ncol = 2))  # Adjust ncol as needed
+  })
+  
+  # Combine all exposure plots into a single list for display
+  do.call(grid.arrange, c(exposure_plots, ncol = 1))  # Adjust ncol as needed
+}
+
+# Usage:
+generate_direct_qq_plots(all_models)
+
+```
+
+#test
+

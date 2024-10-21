@@ -1,0 +1,67 @@
+---
+title: "sensitivity_10.12.24"
+output: html_document
+date: "2024-10-12"
+---
+
+---
+title: "sensitivity_10.12.24"
+author: "Joyce Hu"
+date: "2024-10-12"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(tigris)
+library(arrow)
+library(here)
+library(mgcv)
+library(fixest)
+library(lmtest)
+library(terra)
+library(exactextractr)
+library(tidyterra)
+library(sf)
+library(mgcViz)
+
+library(DHARMa)
+library(qqplotr)
+library(readxl) # for read_excel()
+library(spdep) # for moran.test()
+library(tidycensus) # for median income
+library(distr) # for qqbounds()
+library(spatialreg) # for spatial lag and error models
+library(gridExtra) # for viewing plots side-by-side
+library(qgam) 
+```
+
+```{r}
+udp_gent <- read_excel(here("data","udp_ny_final_typology_jan_2019.xlsx")) %>%
+  rename(type = Type_1.19, GEOID = geoid) %>% 
+  mutate(GEOID = as.character(GEOID)) #to facilitate join later
+```
+
+```{r}
+#Get NYC census tracts using tigris
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond", year = 2010))
+
+# Join the gentrification data with the spatial data
+nyc_gent_map <- nyc_tracts %>%
+  left_join(udp_gent, by = c("GEOID" = "GEOID"))
+
+# Create the map
+nyc_gent_map_udp <- ggplot(data = nyc_gent_map) +
+  geom_sf(aes(fill = type), color = NA) +
+  scale_fill_brewer(palette = "YlOrRd", name = "Gentrification Type") +
+  theme_minimal() +
+  labs(title = "NYC Gentrification Index by Census Tract",
+       subtitle = "Based on UDP Gentrification Index") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+nyc_gent_map_udp
+```
+
+```{r}
+```
