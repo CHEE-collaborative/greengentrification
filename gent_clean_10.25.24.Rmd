@@ -363,7 +363,18 @@ data_prepared <- all_data_inc %>%
 
 # Construct neighbors list for MRF models
 nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
-names(nb) <- attr(nb, "region.id") # JH 10/25/24 check if warning about presence of non-neighbors persists
+names(nb) <- attr(nb, "region.id") 
+
+# JH 10/25/24 Warning: some observations have no neighbours; if this seems unexpected, try increasing the snap argument.Warning: neighbour object has 4 sub-graphs; if this sub-graph count seems unexpected, try increasing the snap argument.
+```
+Checking neighbor relationships for MRF models
+```{r}
+# Visualize the sub-graphs
+plot(all_data_inc$geometry)
+colors <- rainbow(length(nb))
+plot(nb, st_coordinates(st_centroid(all_data_inc)), col=colors, add=TRUE)
+# the sub-graphs match the islands.
+# since we are adjusting by borough in the models, the 4 sub-graphs might be okay?? JH 10/26/24
 ```
 
 Run models and check models
@@ -388,42 +399,43 @@ model_status <- map(all_models, check_models)
 model_status
 ```
 
-Create qqplot functions
+Create basic QQ plots for models
 ```{r}
 # Function to create QQ plots for a specific exposure
 create_exposure_qq_plots <- function(models_list, exposure_name) {
   exposure_models <- models_list[[exposure_name]]
-  plots <- list()
   
-  for (model_name in names(exposure_models)) {
-    model <- exposure_models[[model_name]]
-    
-    # Skip if model is an error
-    if (inherits(model, "try-error")) {
-      next
-    }
-    
-    # Create QQ plot
-    resid_df <- data.frame(
-      residuals = residuals(model, type = "deviance"),
-      fitted = fitted(model)
-    )
-    
-    plots[[model_name]] <- ggplot(resid_df, aes(sample = residuals)) +
-      stat_qq() +
-      stat_qq_line(color = "red") +
-      labs(
-        title = paste0(exposure_name, "\n", model_name),
-        x = "Theoretical Quantiles",
-        y = "Sample Quantiles"
-      ) +
-      theme_minimal() +
-      theme(
-        plot.title = element_text(size = 10, hjust = 0.5),
-        axis.title = element_text(size = 8),
-        axis.text = element_text(size = 7)
+  plots <- names(exposure_models) %>%
+    purrr::map(function(model_name) {
+      model <- exposure_models[[model_name]]
+      
+      # Skip if model is an error
+      if (inherits(model, "try-error")) {
+        return(NULL)
+      }
+      
+      # Create QQ plot
+      resid_df <- data.frame(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model)
       )
-  }
+      
+      ggplot(resid_df, aes(sample = residuals)) +
+        stat_qq() +
+        stat_qq_line(color = "red") +
+        labs(
+          title = paste0(exposure_name, "\n", model_name),
+          x = "Theoretical Quantiles",
+          y = "Sample Quantiles"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(size = 10, hjust = 0.5),
+          axis.title = element_text(size = 8),
+          axis.text = element_text(size = 7)
+        )
+    }) %>%
+    purrr::compact() # Remove NULL values from the list
   
   # Calculate grid layout
   n_plots <- length(plots)
@@ -444,18 +456,21 @@ create_exposure_qq_plots <- function(models_list, exposure_name) {
 
 # Function to create QQ plots for a specific model type across exposures
 create_model_type_qq_plots <- function(models_list, model_type) {
-  plots <- list()
-  
-  for (exposure_name in names(models_list)) {
-    exposure_models <- models_list[[exposure_name]]
-    
-    # Check if the model type exists for this exposure
-    if (model_type %in% names(exposure_models)) {
+  # Convert the for loop to purrr::map
+  plots <- names(models_list) %>%
+    purrr::map(function(exposure_name) {
+      exposure_models <- models_list[[exposure_name]]
+      
+      # Check if the model type exists for this exposure
+      if (!model_type %in% names(exposure_models)) {
+        return(NULL)
+      }
+      
       model <- exposure_models[[model_type]]
       
       # Skip if model is an error
       if (inherits(model, "try-error")) {
-        next
+        return(NULL)
       }
       
       # Create QQ plot
@@ -464,7 +479,7 @@ create_model_type_qq_plots <- function(models_list, model_type) {
         fitted = fitted(model)
       )
       
-      plots[[exposure_name]] <- ggplot(resid_df, aes(sample = residuals)) +
+      ggplot(resid_df, aes(sample = residuals)) +
         stat_qq() +
         stat_qq_line(color = "red") +
         labs(
@@ -478,8 +493,8 @@ create_model_type_qq_plots <- function(models_list, model_type) {
           axis.title = element_text(size = 8),
           axis.text = element_text(size = 7)
         )
-    }
-  }
+    }) %>%
+    purrr::compact() # Remove NULL values from the list
   
   # Calculate grid layout
   n_plots <- length(plots)
@@ -507,19 +522,106 @@ list_model_types <- function(models_list) {
 list_exposures <- function(models_list) {
   names(models_list)
 }
+
 ```
 
-Display qqplots for models
+
+Display basic QQ plots for models
 ```{r}
 # List all model types
 model_types <- list_model_types(all_models)
 
-# Display all qqplots
+# Display all QQ plots
 purrr::walk(model_types, ~create_model_type_qq_plots(all_models, .))
 
 ```
 
-Create functions for comprehensive diagnostic plots
+Create functions for QQ plots with confidence intervals
+```{r}
+# Function to create a single QQ plot with confidence bands
+create_single_qq_plot <- function(model, title) {
+  if (inherits(model, "try-error")) return(NULL)
+  
+  data.frame(
+    residuals = residuals(model, type = "deviance"),
+    fitted = fitted(model)
+  ) %>%
+    ggplot(aes(sample = residuals)) +
+    geom_qq_band(bandType = "ks", mapping = aes(fill = "KS"), alpha = 0.5) +
+    geom_qq_band(bandType = "ts", mapping = aes(fill = "TS"), alpha = 0.5) +
+    geom_qq_band(bandType = "pointwise", mapping = aes(fill = "Normal"), alpha = 0.5) +
+    geom_qq_band(bandType = "boot", mapping = aes(fill = "Bootstrap"), alpha = 0.5) +  
+    stat_qq_line(color = "red") +
+    stat_qq_point(size = 1) +
+    labs(
+      title = title,
+      x = "Theoretical Quantiles",
+      y = "Sample Quantiles"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 10, hjust = 0.5),
+      axis.title = element_text(size = 8),
+      axis.text = element_text(size = 7)
+    )
+}
+
+# Function to arrange plots in a grid
+arrange_plots <- function(plots, main_title) {
+  n_plots <- length(plots)
+  n_cols <- min(3, n_plots)  
+  n_rows <- ceiling(n_plots / n_cols)
+  
+  gridExtra::grid.arrange(
+    grobs = plots,
+    ncol = n_cols,
+    nrow = n_rows,
+    top = grid::textGrob(
+      main_title,
+      gp = grid::gpar(fontsize = 12)  
+    )
+  )
+}
+
+# Main display function
+display_qq_plots_by_model_type <- function(models_list) {
+  # Get all unique model types
+  model_types <- models_list %>%
+    map(names) %>%
+    reduce(union)
+  
+  # Create plots for each model type
+  walk(model_types, function(model_type) {
+    # Extract all models of this type across exposures
+    plots <- models_list %>%
+      imap(function(exposure_models, exposure_name) {
+        if (!model_type %in% names(exposure_models)) return(NULL)
+        
+        create_single_qq_plot(
+          exposure_models[[model_type]], 
+          title = paste0(exposure_name, "\n", model_type)
+        )
+      }) %>%
+      compact()
+    
+    # Arrange and display plots for this model type
+    arrange_plots(
+      plots,
+      main_title = paste("QQ Plots for", model_type)
+    )
+  })
+}
+
+```
+
+Display QQ plots with confidence bands for models
+```{r}
+# Display QQ plots
+display_qq_plots_by_model_type(all_models)
+```
+
+
+Create functions for comprehensive diagnostic plots (JH 10.26.24 - should convert this to purr map if keeping)
 ```{r}
 # Function to create comprehensive diagnostic plots for a specific model type
 create_model_diagnostics_by_type <- function(models_list, model_type) {
@@ -687,7 +789,88 @@ model_types <- list_model_types(all_models)
 display_all_model_diagnostics(all_models)
 ```
 
-Functions for scaling by IQR for mrf_income models
+10.26.24 attempts to scale, forest plot with massive CIs
+```{r}
+# Create function to scale by IQR
+scale_by_iqr <- function(x) {
+  x / (quantile(x, 0.75, na.rm = TRUE) - quantile(x, 0.25, na.rm = TRUE))
+}
+
+# Create scaled dataset
+data_scaled <- data_prepared %>%
+  mutate(across(c(pm_change, o3_change, no2_change, ndvi_change, mean_temp, med_income_2016, score_0.5), scale_by_iqr))
+
+# Function to fit MRF income model and extract results
+fit_and_extract <- function(exposure_var, data) {
+  formula <- as.formula(paste0(exposure_var, " ~ s(score_0.5) + s(med_income_2016) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb)) + s(COUNTYFP10, bs='re')"))
+  
+  model <- gam(formula, family = scat, data = data, method = "REML")
+  
+  # Extract effect size at specific gentrification scores
+  grid <- data.frame(
+    score_0.5 = seq(min(data$score_0.5), max(data$score_0.5), length.out = 100),
+    med_income_2016 = median(data$med_income_2016),
+    GEOID = data$GEOID[1],
+    COUNTYFP10 = data$COUNTYFP10[1]
+  )
+  
+  pred <- predict(model, grid, type = "terms")
+  effect <- diff(range(pred[,"s(score_0.5)"]))
+  
+  # Get standard error
+  se <- sqrt(sum((predict(model, grid, type = "terms", se.fit = TRUE)$se.fit[,"s(score_0.5)"])^2))
+  
+  return(list(
+    exposure = exposure_var,
+    effect = effect,
+    se = se,
+    ci_lower = effect - 1.96 * se,
+    ci_upper = effect + 1.96 * se
+  ))
+}
+
+# Fit models and extract results
+exposures <- c("pm_change", "o3_change", "no2_change", "ndvi_change", "mean_temp")
+results <- lapply(exposures, fit_and_extract, data = data_scaled)
+results_df <- do.call(rbind.data.frame, results)
+
+# Create exposure labels for plot
+results_df$exposure_label <- c("PM2.5", "O3", "NO2", "NDVI", "Temperature")
+results_df$exposure_label <- factor(results_df$exposure_label, 
+                                  levels = rev(c("PM2.5", "O3", "NO2", "NDVI", "Temperature")))
+
+# Create forest plot
+ggplot(results_df, aes(y = exposure_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = ci_lower, xmax = ci_upper), height = 0.2) +
+  geom_point(aes(x = effect), size = 3) +
+  labs(x = "Effect Size (IQR-Scaled)", 
+       y = "Environmental Exposure",
+       title = "Association Between Gentrification and Environmental Changes") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(breaks = seq(-1, 1, by = 0.2))
+
+# Print numeric results
+results_df %>%
+  select(exposure_label, effect, ci_lower, ci_upper) %>%
+  mutate(across(where(is.numeric), round, 3)) %>%
+  mutate(estimate = sprintf("%.3f (%.3f, %.3f)", effect, ci_lower, ci_upper)) %>%
+  select(exposure_label, estimate)
+
+results_df
+
+
+
+```
+
+
+
+JH 10.26.24 still to do - compare the above and below. check if the scaling is being done correctly. see why CIs are so big. check if the mrf model is being run properly when scaled. where does the deviance explained, r squared etc go/apply?
+
+
+10.25.24 stuff
+Functions for scaling by IQR for mrf_income models (for loop) - gent not scaled here
 ```{r}
 # Function to scale exposures by IQR and fit MRF income models
 scale_and_fit_mrf <- function(data, exposure_list) {
@@ -892,7 +1075,8 @@ analyze_gentrification_effects <- function(scaled_results) {
 }
 ```
 
-Display scaled results
+
+Display scaled results - not working bc gent_analysis not found
 ```{r}
 # Create visualization with proper axis labels
 ggplot(gent_analysis, aes(x = score, y = effect)) +
