@@ -991,5 +991,98 @@ ggplot(effects_df_scaled, aes(y = exposure_label)) +
 
 ```
 
+Understanding direction and magnitude of exposure changes 
+```{r}
+# Function to analyze changes in exposures
+analyze_exposure_changes <- function(data, exposure_list) {
+  results <- list()
+  
+  for (exp_name in names(exposure_list)) {
+    exp_info <- exposure_list[[exp_name]]
+    change_var <- exp_info$change
+    
+    # Skip temperature which doesn't have baseline/change structure
+    if (exp_name != "temp") {
+      baseline_var <- exp_info$baseline
+      
+      # Calculate summary statistics
+      change_stats <- data %>%
+        summarise(
+          n = n(),
+          mean_change = mean(.data[[change_var]], na.rm = TRUE),
+          median_change = median(.data[[change_var]], na.rm = TRUE),
+          sd_change = sd(.data[[change_var]], na.rm = TRUE),
+          pct_positive = mean(.data[[change_var]] > 0, na.rm = TRUE) * 100,
+          q25 = quantile(.data[[change_var]], 0.25, na.rm = TRUE),
+          q75 = quantile(.data[[change_var]], 0.75, na.rm = TRUE)
+        )
+      
+      # Create histogram
+      hist_plot <- ggplot(data, aes(x = .data[[change_var]])) +
+        geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+        geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+        labs(
+          title = paste("Distribution of Changes in", toupper(exp_name)),
+          x = "Change",
+          y = "Count"
+        ) +
+        theme_minimal()
+      
+      # Store results
+      results[[exp_name]] <- list(
+        stats = change_stats,
+        plot = hist_plot
+      )
+    }
+  }
+  
+  return(results)
+}
 
+# Run the analysis
+change_analysis <- analyze_exposure_changes(data_prepared, exposure_list)
 
+# Print summary statistics for each exposure
+for (exp_name in names(change_analysis)) {
+  cat("\n=== Summary for", toupper(exp_name), "===\n")
+  print(change_analysis[[exp_name]]$stats)
+}
+
+# Create a combined plot of all histograms
+plot_list <- lapply(names(change_analysis), function(exp_name) {
+  change_analysis[[exp_name]]$plot
+})
+
+# Arrange all plots in a grid
+library(gridExtra)
+grid.arrange(grobs = plot_list, ncol = 2)
+
+# Create boxplots for another view of the distributions
+combined_changes <- data.frame(
+  Exposure = character(),
+  Change = numeric()
+)
+
+for (exp_name in names(exposure_list)) {
+  if (exp_name != "temp") {
+    change_var <- exposure_list[[exp_name]]$change
+    tmp_data <- data.frame(
+      Exposure = toupper(exp_name),
+      Change = data_prepared[[change_var]]
+    )
+    combined_changes <- rbind(combined_changes, tmp_data)
+  }
+}
+
+# Create boxplot
+ggplot(combined_changes, aes(x = Exposure, y = Change)) +
+  geom_boxplot(fill = "skyblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Distribution of Changes Across All Exposures",
+    x = "Exposure Type",
+    y = "Change"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
