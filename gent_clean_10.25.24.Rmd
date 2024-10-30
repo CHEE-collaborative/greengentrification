@@ -747,14 +747,20 @@ display_all_model_diagnostics <- function(models_list) {
     })
   }
 }
+```
 
-# Function to get summary statistics for a specific model type
+GET SUMMARY STATS PER MODEL TYPE 
+```{r}
+#Function to generate summary statistics by model type for every exposure
 get_model_type_summary <- function(models_list, model_type) {
   summary_stats <- data.frame(
     exposure = character(),
-    r_squared = numeric(),
     deviance_explained = numeric(),
     aic = numeric(),
+    edf = numeric(),
+    ref_df = numeric(),
+    chi_sq = numeric(),
+    p_value = numeric(),
     stringsAsFactors = FALSE
   )
   
@@ -765,21 +771,217 @@ get_model_type_summary <- function(models_list, model_type) {
       model <- exposure_models[[model_type]]
       
       if (!inherits(model, "try-error")) {
-        summary_stats <- rbind(summary_stats, data.frame(
-          exposure = exposure_name,
-          r_squared = summary(model)$r.sq,
-          deviance_explained = summary(model)$dev.expl * 100,
-          aic = AIC(model),
-          stringsAsFactors = FALSE
-        ))
+        model_summary <- summary(model)
+        
+        # Get the smooth terms table
+        smooth_table <- model_summary$s.table
+        
+        if (!is.null(smooth_table)) {
+          summary_stats <- rbind(summary_stats, data.frame(
+            exposure = exposure_name,
+            deviance_explained = model_summary$dev.expl * 100,
+            aic = AIC(model),
+            edf = smooth_table[1, "edf"],
+            ref_df = smooth_table[1, "Ref.df"],
+            chi_sq = smooth_table[1, "Chi.sq"],  
+            p_value = smooth_table[1, "p-value"],
+            stringsAsFactors = FALSE
+          ))
+        }
       }
     }
   }
   
   return(summary_stats)
 }
+
+# Generate summary stats for mrf_income model for every exposure
+summary_stats <- get_model_type_summary(all_models, "mrf_income")
+print(summary_stats)
+
 ```
 
+Create effects summary data frame and forest plot
+```{r}
+# Function to extract effect estimates for score_0.5
+get_score_effects <- function(models_list, model_type = "mrf_income") {
+  effects_list <- list()
+  
+  for (exposure_name in names(models_list)) {
+    model <- models_list[[exposure_name]][[model_type]]
+    
+    if (!inherits(model, "try-error")) {
+      # Get predicted values across range of scores
+      score_seq <- seq(min(model$model$score_0.5), max(model$model$score_0.5), length.out = 100)
+      pred_data <- data.frame(
+        score_0.5 = score_seq,
+        med_income_2016 = mean(model$model$med_income_2016),
+        COUNTYFP10 = levels(model$model$COUNTYFP10)[1],
+        GEOID = levels(model$model$GEOID)[1]
+      )
+      
+      # Get predictions with standard errors
+      preds <- predict(model, pred_data, type = "terms", se.fit = TRUE)
+      
+      # Extract effect for score_0.5 smooth term
+      score_effect <- data.frame(
+        exposure = exposure_name,
+        estimate = diff(range(preds$fit[,"s(score_0.5)"])),
+        se = diff(range(preds$se.fit[,"s(score_0.5)"])),
+        p_value = summary(model)$s.table["s(score_0.5)", "p-value"]
+      )
+      
+      effects_list[[exposure_name]] <- score_effect
+    }
+  }
+  
+  # Combine all effects into one dataframe
+  effects_df <- do.call(rbind, effects_list)
+  
+  # Calculate confidence intervals
+  effects_df$lower <- effects_df$estimate - 1.96 * effects_df$se
+  effects_df$upper <- effects_df$estimate + 1.96 * effects_df$se
+  
+  return(effects_df)
+}
+
+# Get effects
+effects_df <- get_score_effects(all_models)
+
+# Create forest plot
+library(ggplot2)
+
+# Create exposure labels with significance indicators
+effects_df$exposure_label <- paste0(
+  toupper(effects_df$exposure), 
+  ifelse(effects_df$p_value < 0.001, "***",
+         ifelse(effects_df$p_value < 0.01, "**",
+                ifelse(effects_df$p_value < 0.05, "*", "")))
+)
+
+# Create the forest plot
+ggplot(effects_df, aes(y = exposure_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = estimate), size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  labs(
+    title = "Estimated Effects of Gentrification Score on Environmental Exposures",
+    subtitle = "MRF Income Model Results",
+    x = "Effect Size (Range of Smooth Term)",
+    y = "Exposure Type",
+    caption = "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+    plot.caption = element_text(size = 8, hjust = 0),
+    panel.grid.minor = element_blank()
+  )
+
+# Print numerical results
+print(effects_df[, c("exposure_label", "estimate", "se", "p_value", "lower", "upper")])
+```
+
+
+Scale mrf_income models by IQR and create scaled forest plot
+```{r}
+# Function to extract IQR-scaled effect estimates for score_0.5
+get_score_effects_scaled <- function(models_list, model_type = "mrf_income") {
+  effects_list <- list()
+  
+  for (exposure_name in names(models_list)) {
+    model <- models_list[[exposure_name]][[model_type]]
+    
+    if (!inherits(model, "try-error")) {
+      # Get model data
+      model_data <- model$model
+      
+      # Calculate IQRs
+      score_iqr <- IQR(model_data$score_0.5)
+      exposure_var <- exposure_list[[exposure_name]]$change
+      exposure_iqr <- IQR(model_data[[exposure_var]])
+      
+      # Get predicted values across range of scores
+      score_seq <- seq(min(model_data$score_0.5), max(model_data$score_0.5), length.out = 100)
+      pred_data <- data.frame(
+        score_0.5 = score_seq,
+        med_income_2016 = mean(model_data$med_income_2016),
+        COUNTYFP10 = levels(model_data$COUNTYFP10)[1],
+        GEOID = levels(model_data$GEOID)[1]
+      )
+      
+      # Get predictions with standard errors
+      preds <- predict(model, pred_data, type = "terms", se.fit = TRUE)
+      
+      # Extract and scale effect for score_0.5 smooth term
+      raw_effect <- diff(range(preds$fit[,"s(score_0.5)"]))
+      raw_se <- diff(range(preds$se.fit[,"s(score_0.5)"]))
+      
+      # Scale effects by IQRs
+      scaled_effect <- (raw_effect * score_iqr) / exposure_iqr
+      scaled_se <- (raw_se * score_iqr) / exposure_iqr
+      
+      score_effect <- data.frame(
+        exposure = exposure_name,
+        estimate = scaled_effect,
+        se = scaled_se,
+        p_value = summary(model)$s.table["s(score_0.5)", "p-value"],
+        exposure_iqr = exposure_iqr,
+        score_iqr = score_iqr
+      )
+      
+      effects_list[[exposure_name]] <- score_effect
+    }
+  }
+  
+  # Combine all effects into one dataframe
+  effects_df <- do.call(rbind, effects_list)
+  
+  # Calculate confidence intervals
+  effects_df$lower <- effects_df$estimate - 1.96 * effects_df$se
+  effects_df$upper <- effects_df$estimate + 1.96 * effects_df$se
+  
+  return(effects_df)
+}
+
+# Get scaled effects
+effects_df_scaled <- get_score_effects_scaled(all_models)
+
+# Create forest plot with scaled effects
+effects_df_scaled$exposure_label <- paste0(
+  toupper(effects_df_scaled$exposure), 
+  ifelse(effects_df_scaled$p_value < 0.001, "***",
+         ifelse(effects_df_scaled$p_value < 0.01, "**",
+                ifelse(effects_df_scaled$p_value < 0.05, "*", "")))
+)
+
+ggplot(effects_df_scaled, aes(y = exposure_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = estimate), size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  labs(
+    title = "IQR-Scaled Effects of Gentrification Score on Environmental Exposures",
+    subtitle = "MRF Income Model Results",
+    x = "Effect Size (Change in Exposure IQR per Score IQR)",
+    y = "Exposure Type",
+    caption = "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+    plot.caption = element_text(size = 8, hjust = 0),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+###################################################old code to tidy up/delete
 Display all diagnostic plots for models
 ```{r}
 # List all model types
@@ -787,10 +989,11 @@ model_types <- list_model_types(all_models)
 
 # Display all diagnostics 
 display_all_model_diagnostics(all_models)
+
 ```
 
 10.26.24 attempts to scale, forest plot with massive CIs
-```{r}
+
 # Create function to scale by IQR
 scale_by_iqr <- function(x) {
   x / (quantile(x, 0.75, na.rm = TRUE) - quantile(x, 0.25, na.rm = TRUE))
