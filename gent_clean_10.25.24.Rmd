@@ -621,103 +621,91 @@ Display QQ plots with confidence bands for models
 display_qq_plots_by_model_type(all_models)
 ```
 
-
-Create functions for comprehensive diagnostic plots (JH 10.26.24 - should convert this to purr map if keeping 11/2/24 - displaying tables instead of the plots)
+Create comprehensive diagnostic plots (11/2 - need to change the scale of the plots for visibility)
 ```{r}
-# Function to create comprehensive diagnostic plots for a specific model type
 create_model_diagnostics_by_type <- function(models_list, model_type) {
-  # List to store plots for each exposure
-  diagnostic_plots <- list()
-  
-  for (exposure_name in names(models_list)) {
-    exposure_models <- models_list[[exposure_name]]
-    
-    # Check if the model type exists for this exposure
-    if (model_type %in% names(exposure_models)) {
-      model <- exposure_models[[model_type]]
-      
-      # Skip if model is an error
-      if (inherits(model, "try-error")) {
-        next
+  # Create diagnostic plots for each exposure
+  diagnostic_plots <- models_list %>%
+    imap(function(exposure_models, exposure_name) {
+      # Skip if model type doesn't exist or is error
+      if (!model_type %in% names(exposure_models) || 
+          inherits(exposure_models[[model_type]], "try-error")) {
+        return(NULL)
       }
       
-      # Extract residuals and fitted values
-      resid_df <- data.frame(
+      model <- exposure_models[[model_type]]
+      
+      # Create residuals dataframe
+      resid_df <- tibble(
         residuals = residuals(model, type = "deviance"),
         fitted = fitted(model),
         scale_residuals = residuals(model, type = "scaled.pearson"),
         response = model$y
       )
       
-      # Create plot list for this exposure
-      exposure_plots <- list()
-      
-      # 1. QQ plot
-      exposure_plots[["qq"]] <- ggplot(resid_df, aes(sample = residuals)) +
-        stat_qq() +
-        stat_qq_line(color = "red") +
-        labs(title = paste(exposure_name, "- Normal Q-Q Plot")) +
-        theme_minimal() +
-        theme(plot.title = element_text(size = 8))
-      
-      # 2. Residuals vs Fitted
-      exposure_plots[["resid"]] <- ggplot(resid_df, aes(x = fitted, y = residuals)) +
-        geom_point(alpha = 0.5) +
-        geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
-        geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +
-        labs(title = paste(exposure_name, "- Residuals vs Fitted"),
-             x = "Fitted values",
-             y = "Deviance residuals") +
-        theme_minimal() +
-        theme(plot.title = element_text(size = 8))
-      
-      # 3. Scale-location plot
-      exposure_plots[["scale"]] <- ggplot(resid_df, 
-                                        aes(x = fitted, y = sqrt(abs(scale_residuals)))) +
-        geom_point(alpha = 0.5) +
-        geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
-        labs(title = paste(exposure_name, "- Scale-Location"),
-             x = "Fitted values",
-             y = "√|Standardized residuals|") +
-        theme_minimal() +
-        theme(plot.title = element_text(size = 8))
-      
-      # 4. Response vs Fitted
-      exposure_plots[["resp"]] <- ggplot(resid_df, aes(x = fitted, y = response)) +
-        geom_point(alpha = 0.5) +
-        geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
-        labs(title = paste(exposure_name, "- Response vs Fitted"),
-             x = "Fitted values",
-             y = "Response") +
-        theme_minimal() +
-        theme(plot.title = element_text(size = 8))
-      
-      # Store all plots for this exposure
-      diagnostic_plots[[exposure_name]] <- exposure_plots
-    }
-  }
+      # Create the four diagnostic plots
+      list(
+        # 1. QQ plot
+        qq = ggplot(resid_df, aes(sample = residuals)) +
+          stat_qq() +
+          stat_qq_line(color = "red") +
+          labs(title = paste(exposure_name, "- Normal Q-Q Plot")) +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8)),
+        
+        # 2. Residuals vs Fitted
+        resid = ggplot(resid_df, aes(x = fitted, y = residuals)) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +
+          labs(title = paste(exposure_name, "- Residuals vs Fitted"),
+               x = "Fitted values",
+               y = "Deviance residuals") +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8)),
+        
+        # 3. Scale-location plot
+        scale = ggplot(resid_df, 
+                      aes(x = fitted, y = sqrt(abs(scale_residuals)))) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Scale-Location"),
+               x = "Fitted values",
+               y = "√|Standardized residuals|") +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8)),
+        
+        # 4. Response vs Fitted
+        resp = ggplot(resid_df, aes(x = fitted, y = response)) +
+          geom_point(alpha = 0.5) +
+          geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Response vs Fitted"),
+               x = "Fitted values",
+               y = "Response") +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8))
+      )
+    }) %>%
+    compact() # Remove NULL entries
   
-  # Calculate layout dimensions
-  n_exposures <- length(diagnostic_plots)
-  if (n_exposures == 0) {
+  # Stop if no valid models found
+  if (length(diagnostic_plots) == 0) {
     stop("No valid models found for the specified model type")
   }
   
-  # Create a list of all plots in the desired order
-  all_plots <- list()
-  for (exposure_name in names(diagnostic_plots)) {
-    all_plots <- c(all_plots, diagnostic_plots[[exposure_name]])
-  }
+  # Flatten the nested list of plots
+  all_plots <- diagnostic_plots %>%
+    flatten()
   
-  # Calculate grid dimensions based on number of exposures
+  # Calculate grid dimensions
+  n_exposures <- length(diagnostic_plots)
   n_cols <- 4  # One column for each type of diagnostic plot
-  n_rows <- n_exposures  # One row for each exposure
   
   # Combine all plots
   combined_plot <- gridExtra::grid.arrange(
     grobs = all_plots,
     ncol = n_cols,
-    nrow = n_rows,
+    nrow = n_exposures,
     top = grid::textGrob(
       paste("Diagnostic Plots for Model Type:", model_type),
       gp = grid::gpar(fontsize = 12, fontface = "bold")
@@ -727,40 +715,42 @@ create_model_diagnostics_by_type <- function(models_list, model_type) {
   return(combined_plot)
 }
 
-# Function to display diagnostics for all model types
 display_all_model_diagnostics <- function(models_list) {
   # Get unique model types
-  model_types <- unique(unlist(lapply(models_list, names)))
+  model_types <- models_list %>%
+    map(names) %>%
+    flatten_chr() %>%
+    unique()
   
-  # Create plots for each model type
-  for (model_type in model_types) {
-    tryCatch({
-      plot <- create_model_diagnostics_by_type(models_list, model_type)
-      print(plot)
-      # Add a pause between plots if running interactively
-      if (interactive()) {
-        readline(prompt = paste("Press [Enter] to see next plot for model type:", 
-                              model_type))
-      }
-    }, error = function(e) {
-      message(paste("Error creating plots for model type:", model_type))
-      message(e)
-    })
-  }
+  # Create and display all plots at once
+  plots <- model_types %>%
+    map(~{
+      tryCatch({
+        create_model_diagnostics_by_type(models_list, .x)
+      }, error = function(e) {
+        message(paste("Error creating plots for model type:", .x))
+        message(e)
+        return(NULL)
+      })
+    }) %>%
+    compact()
+  
+  # Calculate grid layout for all model types
+  n_types <- length(plots)
+  grid_dims <- c(ceiling(sqrt(n_types)), floor(sqrt(n_types)))
+  if (prod(grid_dims) < n_types) grid_dims[2] <- grid_dims[2] + 1
+  
+  # Display all plots in a single grid
+  do.call(gridExtra::grid.arrange, 
+          c(plots, 
+            list(ncol = grid_dims[1],
+                 nrow = grid_dims[2])))
 }
-```
-
-Display all diagnostic plots for models
-```{r}
-# List all model types
-model_types <- list_model_types(all_models)
-
-# Display all diagnostics 
 display_all_model_diagnostics(all_models)
 
 ```
 
-GET SUMMARY STATS PER MODEL TYPE 
+Function to get summary statistics for models
 ```{r}
 #Function to generate summary statistics by model type for every exposure
 get_model_type_summary <- function(models_list, model_type) {
