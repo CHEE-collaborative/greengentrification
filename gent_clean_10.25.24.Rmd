@@ -33,6 +33,7 @@ library(distr) # for qqbounds()
 library(spatialreg) # for spatial lag and error models
 library(gridExtra) # for viewing plots side-by-side
 library(qgam) 
+library(dplyr)
 ```
 
 Load and clean data
@@ -302,7 +303,7 @@ run_gam_models <- function(data, exposure_info) {
     return(NULL)
   }
   
-  # Base components that will be in all models
+  # Base components that will be in all models: gentrification score and county/borough
   base_formula <- paste(exp_var, "~ s(score_0.5) + s(COUNTYFP10, bs='re')")
   
   # Create model formulas
@@ -315,7 +316,7 @@ run_gam_models <- function(data, exposure_info) {
     tp_income = paste(base_formula, "+ s(med_income_2016) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
     mrf_income = paste(base_formula, "+ s(med_income_2016) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
     
-    # Models with distance
+    # Models with distance to downtown
     tp_dist = paste(base_formula, "+ s(dt_dist) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
     mrf_dist = paste(base_formula, "+ s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
   )
@@ -621,7 +622,7 @@ display_qq_plots_by_model_type(all_models)
 ```
 
 
-Create functions for comprehensive diagnostic plots (JH 10.26.24 - should convert this to purr map if keeping)
+Create functions for comprehensive diagnostic plots (JH 10.26.24 - should convert this to purr map if keeping 11/2/24 - displaying tables instead of the plots)
 ```{r}
 # Function to create comprehensive diagnostic plots for a specific model type
 create_model_diagnostics_by_type <- function(models_list, model_type) {
@@ -1008,7 +1009,7 @@ analyze_exposure_changes <- function(data, exposure_list) {
       # Calculate summary statistics
       change_stats <- data %>%
         summarise(
-          n = n(),
+          n = nrow(data),
           mean_change = mean(.data[[change_var]], na.rm = TRUE),
           median_change = median(.data[[change_var]], na.rm = TRUE),
           sd_change = sd(.data[[change_var]], na.rm = TRUE),
@@ -1042,11 +1043,8 @@ analyze_exposure_changes <- function(data, exposure_list) {
 # Run the analysis
 change_analysis <- analyze_exposure_changes(data_prepared, exposure_list)
 
-# Print summary statistics for each exposure
-for (exp_name in names(change_analysis)) {
-  cat("\n=== Summary for", toupper(exp_name), "===\n")
-  print(change_analysis[[exp_name]]$stats)
-}
+# Print summary statistics 
+print(change_analysis)
 
 # Create a combined plot of all histograms
 plot_list <- lapply(names(change_analysis), function(exp_name) {
