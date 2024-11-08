@@ -203,18 +203,28 @@ all_data <- nyc_tracts %>%
   mutate(ndvi_2016 = ndvi_2016, ndvi_2000 = ndvi_2000, ndvi_change = ndvi_2016-ndvi_2000) %>% 
   left_join(temp, by = "GEOID")
 
-# models adjusting for median income in 2016
-income <- get_acs(variables = "B06011_001", year = 2016, state = "NY", 
+#Find median household income variable in 2000 decennial census
+all_vars_dec <- 
+  load_variables(year = 2000, dataset = "sf3")
+
+# models adjusting for median income in 2000 (note: 2000 decennial census is 1999 data)
+income <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
                   county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
-  rename(med_income_2016 = estimate)
+  rename(med_income_2000 = value)
+#results in 226 missing tracts in terms of 2010 tracts.
 
 all_data_inc <- all_data %>% 
   left_join(income, by = "GEOID") %>% 
   # coerce GEOID to numeric then factor class to avoid error in MRF smooth
   mutate(GEOID = as.numeric(GEOID)) %>% 
-  mutate(GEOID = factor(GEOID))
+  mutate(GEOID = factor(GEOID)) %>% 
+ # coerce COUNTYFP10 to numeric then factor class to avoid error ?
+  mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
+  mutate(COUNTYFP10 = factor(COUNTYFP10))
 
-############# models adjusting for median income in 2016 and distance to downtown #########
+all_data_inc_na <- na.omit(all_data_inc)
+
+############# models adjusting for median income in 2000 and distance to downtown #########
 # load nyc roads
 downtown_st <- roads(state = "NY", county = "New York", year = 2011)
 ggplot() + geom_sf(data = downtown_st)
@@ -260,6 +270,572 @@ distances <- st_distance(nyc_tracts, area_centroid)
 all_data_inc$dt_dist <- as.numeric(distances)
 ```
 
+# Construct neighbors list for MRF models
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+
+
+tp_income_pm_na <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_o3_na <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_no2_na <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_ndvi_na <- gam(ndvi_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_temp_na <- gam(mean_temp ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+
+gam.check(tp_income_pm_na)
+gam.check(tp_income_o3_na)
+gam.check(tp_income_no2_na)
+gam.check(tp_income_ndvi_na)
+gam.check(tp_income_temp_na)
+##############################################
+
+Testing residuals using tp model for now
+```{r}
+# Extract residuals for each model
+resid_pm <- resid(tp_income_pm_na)
+resid_o3 <- resid(tp_income_o3_na)
+resid_no2 <- resid(tp_income_no2_na)
+resid_ndvi <- resid(tp_income_ndvi_na)
+resid_temp <- resid(tp_income_ndvi_na)
+
+
+# Add residuals to the original dataset (ensure this corresponds to the right model)
+all_data_inc_na$resid_pm <- resid_pm
+all_data_inc_na$resid_o3 <- resid_o3
+all_data_inc_na$resid_no2 <- resid_no2
+all_data_inc_na$resid_ndvi <- resid_ndvi
+all_data_inc_na$resid_temp <- resid_temp
+```
+
+Code for just PM to base function on
+```{r}
+# Visualize residuals for PM model, for example
+ggplot(all_data_inc_na, aes(x = long, y = lat, color = resid_pm)) +
+  geom_point() +
+  scale_color_gradient2(midpoint = 0, low = "blue", mid = "white", high = "red") +
+  theme_minimal() +
+  labs(title = "Spatial Distribution of Residuals (PM)", color = "Residuals")
+  
+# Calculate the 10th and 90th percentiles of the residuals
+lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
+upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
+
+# Create dichotomous variable based on thresholds
+all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
+                                        ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
+
+# Visualize the result
+ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+  geom_point() +
+  scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+  theme_minimal() +
+  labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+
+
+# Calculate the 10th and 90th percentiles of the residuals
+lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
+upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
+
+# Create dichotomous variable based on thresholds
+all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
+                                        ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
+
+# Visualize the result
+ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+  geom_point() +
+  scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+  theme_minimal() +
+  labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+
+
+# Visualize gaps using the dichotomous color scale
+ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+  geom_point() +
+  scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+  theme_minimal() +
+  labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+
+# Summary statistics for residuals (e.g., PM)
+summary(all_data_inc_na$resid_pm)
+
+# Identify the locations with extreme residuals
+high_residuals <- all_data_inc_na[all_data_inc_na$resid_pm > threshold, ]
+low_residuals <- all_data_inc_na[all_data_inc_na$resid_pm < -threshold, ]
+
+# View the locations of high and low residuals
+head(high_residuals[, c("long", "lat", "resid_pm")])
+head(low_residuals[, c("long", "lat", "resid_pm")])
+
+
+```
+############################################
+function to analyze residuals for all exposures based on tp model 
+```{r}
+analyze_spatial_residuals <- function(data, residual_col, lon_col = "long", lat_col = "lat", 
+                                    lower_quantile = 0.1, upper_quantile = 0.9) {
+  # Input validation
+  if (!all(c(residual_col, lon_col, lat_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create analysis environment
+  results <- list()
+  
+  # Basic summary statistics
+  results$summary <- summary(data[[residual_col]])
+  
+  # Calculate thresholds
+  results$thresholds <- list(
+    lower = quantile(data[[residual_col]], lower_quantile, na.rm = TRUE),
+    upper = quantile(data[[residual_col]], upper_quantile, na.rm = TRUE)
+  )
+  
+  # Create categorical variable for residual gaps
+  data$residual_category <- case_when(
+    data[[residual_col]] > results$thresholds$upper ~ "High Residual",
+    data[[residual_col]] < results$thresholds$lower ~ "Low Residual",
+    TRUE ~ "Normal"
+  )
+  
+  # Generate plots
+  # 1. Continuous residual plot
+  results$continuous_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                            y = .data[[lat_col]], 
+                                            color = .data[[residual_col]])) +
+    geom_point(alpha = 0.6) +
+    scale_color_gradient2(midpoint = 0, 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red") +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residuals:", residual_col),
+         color = "Residuals") +
+    theme(legend.position = "right")
+  
+  # 2. Categorical residual plot
+  results$categorical_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                             y = .data[[lat_col]], 
+                                             color = residual_category)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = c("High Residual" = "red", 
+                                 "Low Residual" = "blue", 
+                                 "Normal" = "grey")) +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residual Gaps:", residual_col),
+         color = "Residual Category") +
+    theme(legend.position = "right")
+  
+  # Extract extreme locations
+  results$extreme_locations <- list(
+    high = data %>%
+      filter(residual_category == "High Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(desc(.data[[residual_col]])),
+    
+    low = data %>%
+      filter(residual_category == "Low Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(.data[[residual_col]])
+  )
+  
+  # Calculate summary statistics by category
+  results$category_stats <- data %>%
+    group_by(residual_category) %>%
+    summarise(
+      count = dplyr::n(),
+      mean_residual = mean(.data[[residual_col]], na.rm = TRUE),
+      sd_residual = sd(.data[[residual_col]], na.rm = TRUE),
+      min_residual = min(.data[[residual_col]], na.rm = TRUE),
+      max_residual = max(.data[[residual_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  return(results)
+}
+
+# Example usage for each environmental variable
+results_pm <- analyze_spatial_residuals(all_data_inc_na, "resid_pm")
+results_o3 <- analyze_spatial_residuals(all_data_inc_na, "resid_o3")
+results_no2 <- analyze_spatial_residuals(all_data_inc_na, "resid_no2")
+results_ndvi <- analyze_spatial_residuals(all_data_inc_na, "resid_ndvi")
+results_temp <- analyze_spatial_residuals(all_data_inc_na, "resid_temp")
+
+
+# Display results for pm2.5
+print(results_pm$summary)
+print(results_pm$category_stats)
+results_pm$continuous_plot
+results_pm$categorical_plot
+head(results_pm$extreme_locations$high)
+head(results_pm$extreme_locations$low)
+
+print(results_o3$summary)
+print(results_o3$category_stats)
+results_o3$continuous_plot
+results_o3$categorical_plot
+head(results_o3$extreme_locations$high)
+head(results_o3$extreme_locations$low)
+
+print(results_no2$summary)
+print(results_no2$category_stats)
+results_no2$continuous_plot
+results_no2$categorical_plot
+head(results_no2$extreme_locations$high)
+head(results_no2$extreme_locations$low)
+
+print(results_ndvi$summary)
+print(results_ndvi$category_stats)
+results_ndvi$continuous_plot
+results_ndvi$categorical_plot
+head(results_ndvi$extreme_locations$high)
+head(results_ndvi$extreme_locations$low)
+
+print(results_temp$summary)
+print(results_temp$category_stats)
+results_temp$continuous_plot
+results_temp$categorical_plot
+head(results_temp$extreme_locations$high)
+head(results_temp$extreme_locations$low)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+analyze_residual_overlap <- function(data, residual_cols, lon_col = "long", lat_col = "lat", 
+                                   lower_quantile = 0.1, upper_quantile = 0.9) {
+  # Input validation
+  if (!all(c(residual_cols, lon_col, lat_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create category columns for each residual
+  results <- list()
+  data_enhanced <- data
+  
+  # Categorize each residual
+  for (col in residual_cols) {
+    thresholds <- quantile(data[[col]], c(lower_quantile, upper_quantile), na.rm = TRUE)
+    cat_col_name <- paste0(col, "_category")
+    
+    data_enhanced[[cat_col_name]] <- case_when(
+      data[[col]] > thresholds[2] ~ "High",
+      data[[col]] < thresholds[1] ~ "Low",
+      TRUE ~ "Normal"
+    )
+  }
+  
+  # Count overlapping high/low/extreme areas
+  data_enhanced$high_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "High"
+    })
+  )
+  
+  data_enhanced$low_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "Low"
+    })
+  )
+  
+  # Count either high or low (extreme) overlaps
+  data_enhanced$extreme_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] %in% c("High", "Low")
+    })
+  )
+  
+  # Create overlap visualizations
+  # 1. High residual overlap plot
+  results$high_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(high_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "magma", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of High Residuals",
+         color = "Number of\nOverlapping\nHigh Residuals") +
+    theme(legend.position = "right")
+  
+  # 2. Low residual overlap plot
+  results$low_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(low_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "mako", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of Low Residuals",
+         color = "Number of\nOverlapping\nLow Residuals") +
+    theme(legend.position = "right")
+  
+  # 3. Extreme (either high or low) residual overlap plot
+  results$extreme_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(extreme_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "viridis", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of Extreme Residuals (High or Low)",
+         color = "Number of\nOverlapping\nExtreme Residuals") +
+    theme(legend.position = "right")
+  
+  # Create summary of overlaps
+  results$overlap_summary <- data_enhanced %>%
+    summarise(
+      locations_with_no_extremes = sum(extreme_overlap_count == 0),
+      locations_with_one_extreme = sum(extreme_overlap_count == 1),
+      locations_with_multiple_extremes = sum(extreme_overlap_count > 1),
+      max_extreme_overlap = max(extreme_overlap_count),
+      locations_with_no_high = sum(high_overlap_count == 0),
+      locations_with_one_high = sum(high_overlap_count == 1),
+      locations_with_multiple_high = sum(high_overlap_count > 1),
+      max_high_overlap = max(high_overlap_count),
+      locations_with_no_low = sum(low_overlap_count == 0),
+      locations_with_one_low = sum(low_overlap_count == 1),
+      locations_with_multiple_low = sum(low_overlap_count > 1),
+      max_low_overlap = max(low_overlap_count)
+    )
+  
+  # Create detailed overlap patterns
+  results$overlap_patterns <- data_enhanced %>%
+    group_by(extreme_overlap_count) %>%
+    summarise(
+      count = dplyr::n(),
+      pct_of_total = round(100 * dplyr::n() / nrow(data_enhanced), 1),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(count))
+  
+  # Add the enhanced dataset to results
+  results$data <- data_enhanced
+  
+  return(results)
+}
+
+# Example usage
+residual_columns <- c("resid_pm", "resid_o3", "resid_no2", "resid_ndvi")
+overlap_results <- analyze_residual_overlap(all_data_inc_na, residual_columns)
+
+# Display summary statistics
+print("Summary of overlapping patterns:")
+print(overlap_results$overlap_summary)
+
+print("\nDistribution of extreme residual overlaps:")
+print(overlap_results$overlap_patterns)
+
+# Create a combined visualization using patchwork
+library(patchwork)
+combined_plot <- overlap_results$high_overlap_plot + 
+  overlap_results$low_overlap_plot +
+  overlap_results$extreme_overlap_plot +
+  plot_layout(ncol = 3) +
+  plot_annotation(
+    title = "Spatial Patterns of Overlapping Residuals",
+    subtitle = "Left: High Residuals, Center: Low Residuals, Right: Combined Extreme Residuals"
+  )
+
+print(combined_plot)
+
+# Find locations with multiple extreme residuals
+extreme_overlap_locations <- overlap_results$data %>%
+  filter(extreme_overlap_count >= 2) %>%
+  select(long, lat, extreme_overlap_count, 
+         ends_with("_category")) %>%
+  arrange(desc(extreme_overlap_count))
+
+print("Locations with multiple extreme residuals:")
+head(extreme_overlap_locations, 10)
+
+# Optional: Create a summary table of which combinations of exposures tend to have extreme residuals together
+exposure_combinations <- overlap_results$data %>%
+  filter(extreme_overlap_count >= 2) %>%
+  summarise(
+    PM_O3 = sum((resid_pm_category != "Normal") & (resid_o3_category != "Normal")),
+    PM_NO2 = sum((resid_pm_category != "Normal") & (resid_no2_category != "Normal")),
+    PM_NDVI = sum((resid_pm_category != "Normal") & (resid_ndvi_category != "Normal")),
+    O3_NO2 = sum((resid_o3_category != "Normal") & (resid_no2_category != "Normal")),
+    O3_NDVI = sum((resid_o3_category != "Normal") & (resid_ndvi_category != "Normal")),
+    NO2_NDVI = sum((resid_no2_category != "Normal") & (resid_ndvi_category != "Normal"))
+  )
+
+print("\nCommon pairs of exposures with extreme residuals:")
+print(exposure_combinations)
+```
+#additonal investigation?
+```{r}
+library(spdep)  # for spatial weights and Moran's I
+library(dbscan) # for DBSCAN clustering
+library(sf)     # for spatial operations
+library(ggplot2)
+library(dplyr)
+
+analyze_residual_clusters <- function(data, residual_cols, lon_col = "long", lat_col = "lat") {
+  results <- list()
+  
+  # Debug data structure
+  cat("Data structure diagnostics:\n")
+  cat("Class of input data:", class(data), "\n")
+  cat("Dimension of input data:", dim(data), "\n")
+  cat("Classes of coordinate columns:\n")
+  print(sapply(data[c(lon_col, lat_col)], class))
+  
+  # Input validation
+  if (!all(c(lon_col, lat_col) %in% names(data))) {
+    stop("Longitude and latitude columns not found in data")
+  }
+  
+  if (!all(residual_cols %in% names(data))) {
+    stop("One or more residual columns not found in data")
+  }
+  
+  # Function to safely convert potentially nested columns to numeric
+  safe_to_numeric <- function(x) {
+    if (is.list(x)) {
+      # If it's a list column, try to unlist it first
+      x <- unlist(x)
+    }
+    # Try to convert to character first, then to numeric
+    as.numeric(as.character(x))
+  }
+  
+  # Extract and validate coordinates
+  coords <- tryCatch({
+    # Create a clean data frame for coordinates
+    coords_df <- data.frame(
+      longitude = safe_to_numeric(data[[lon_col]]),
+      latitude = safe_to_numeric(data[[lat_col]])
+    )
+    
+    # Check for conversion success
+    if (any(is.na(coords_df$longitude)) && !all(is.na(coords_df$longitude))) {
+      warning(paste("Some longitude values could not be converted to numeric. First problematic value:",
+                   data[[lon_col]][which(!is.na(data[[lon_col]]) & is.na(coords_df$longitude))[1]]))
+    }
+    if (any(is.na(coords_df$latitude)) && !all(is.na(coords_df$latitude))) {
+      warning(paste("Some latitude values could not be converted to numeric. First problematic value:",
+                   data[[lat_col]][which(!is.na(data[[lat_col]]) & is.na(coords_df$latitude))[1]]))
+    }
+    
+    # Remove rows with NA coordinates
+    valid_rows <- complete.cases(coords_df)
+    if (sum(!valid_rows) > 0) {
+      warning(paste(sum(!valid_rows), "rows removed due to invalid coordinates"))
+    }
+    coords_df <- coords_df[valid_rows, ]
+    
+    # Validate coordinate ranges
+    invalid_lon <- coords_df$longitude < -180 | coords_df$longitude > 180
+    invalid_lat <- coords_df$latitude < -90 | coords_df$latitude > 90
+    
+    if (any(invalid_lon)) {
+      warning(paste("Found", sum(invalid_lon), "longitude values outside valid range (-180 to 180)"))
+    }
+    if (any(invalid_lat)) {
+      warning(paste("Found", sum(invalid_lat), "latitude values outside valid range (-90 to 90)"))
+    }
+    
+    # Remove invalid coordinates
+    coords_df <- coords_df[!invalid_lon & !invalid_lat, ]
+    
+    if (nrow(coords_df) == 0) {
+      stop("No valid coordinates remaining after cleaning")
+    }
+    
+    as.matrix(coords_df)
+  }, error = function(e) {
+    stop(paste("Error processing coordinates:", e$message, "\nPlease check your coordinate data structure."))
+  })
+  
+  # Function to analyze single residual with error handling
+  analyze_single_residual <- function(residual_col) {
+    tryCatch({
+      # Clean residual data
+      residual_values <- safe_to_numeric(data[[residual_col]])
+      if (all(is.na(residual_values))) {
+        stop("All values in residual column are NA")
+      }
+      
+      # Match residuals with valid coordinates
+      residual_values <- residual_values[valid_rows][!invalid_lon & !invalid_lat]
+      
+      # 1. Global Moran's I
+      knn <- knearneigh(coords, k = min(5, nrow(coords) - 1))
+      nb <- knn2nb(knn)
+      weights <- nb2listw(nb, style = "W")
+      
+      moran_result <- moran.test(residual_values, weights)
+      
+      # 2. Local Moran's I (LISA)
+      lisa_result <- localmoran(residual_values, weights)
+      
+      # 3. DBSCAN Clustering
+      clustering_data <- cbind(scale(coords), scale(residual_values))
+      eps <- 0.5 * sd(dist(clustering_data))
+      dbscan_result <- dbscan(clustering_data, eps = eps, minPts = min(5, nrow(clustering_data)/10))
+      
+      # Store results
+      results_df <- data.frame(
+        lisa_pvalue = lisa_result[, 5],
+        cluster = dbscan_result$cluster
+      )
+      
+      return(list(
+        moran = moran_result,
+        lisa = lisa_result,
+        dbscan = dbscan_result,
+        results_df = results_df
+      ))
+    }, error = function(e) {
+      warning(paste("Error analyzing", residual_col, ":", e$message))
+      return(NULL)
+    })
+  }
+  
+  # Analyze each residual
+  results$individual_analyses <- lapply(residual_cols, analyze_single_residual)
+  names(results$individual_analyses) <- residual_cols
+  
+  # Create summary
+  results$summary <- data.frame(
+    residual = residual_cols,
+    n_valid_points = sapply(results$individual_analyses, function(x) {
+      if (!is.null(x)) nrow(x$results_df) else NA
+    }),
+    moran_i = sapply(results$individual_analyses, function(x) {
+      if (!is.null(x)) x$moran$estimate[1] else NA
+    }),
+    moran_p = sapply(results$individual_analyses, function(x) {
+      if (!is.null(x)) x$moran$p.value else NA
+    })
+  )
+  
+  return(results)
+}
+
+# Check the structure of your data
+str(all_data_inc_na[c("long", "lat")])
+
+# If needed, unnest your coordinate columns
+if (is.list(all_data_inc_na$long)) {
+  all_data_inc_na$long <- unlist(all_data_inc_na$long)
+}
+if (is.list(all_data_inc_na$lat)) {
+  all_data_inc_na$lat <- unlist(all_data_inc_na$lat)
+}
+
+# Then run the analysis
+residual_columns <- c("resid_pm", "resid_o3", "resid_no2", "resid_ndvi")
+cluster_results <- analyze_residual_clusters(all_data_inc_na, residual_columns)
+
+# Check the results
+print(cluster_results$summary)
+```
+
+################################
 Create model functions
 ```{r}
 # Create exposure list
@@ -304,7 +880,7 @@ run_gam_models <- function(data, exposure_info) {
   }
   
   # Base components that will be in all models: gentrification score and county/borough
-  base_formula <- paste(exp_var, "~ s(score_0.5) + s(COUNTYFP10, bs='re')")
+  base_formula <- paste(exp_var, "~ score_0.5 + s(COUNTYFP10, bs='re')")
   
   # Create model formulas
   formulas <- list(
@@ -315,7 +891,8 @@ run_gam_models <- function(data, exposure_info) {
     # Models with income
     tp_income = paste(base_formula, "+ s(med_income_2016) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
     mrf_income = paste(base_formula, "+ s(med_income_2016) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
-    
+    mrf_income_rank = paste(base_formula, "+ rank(med_income_2016) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+
     # Models with distance to downtown
     tp_dist = paste(base_formula, "+ s(dt_dist) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
     mrf_dist = paste(base_formula, "+ s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
@@ -398,7 +975,61 @@ check_models <- function(models) {
 # Check status of all models
 model_status <- map(all_models, check_models)
 model_status
+
 ```
+
+
+Model diagnostics (11/8/24)
+```{r}
+# Extract the mrf_income models
+mrf_income_models <- purrr::map(all_models, "mrf_income")
+
+# Check the summary of all mrf_income models
+purrr::walk(mrf_income_models, summary)
+
+summary(mrf_income_models$pm)
+plot(resid(mrf_income_models$pm))
+plot(mrf_income_models$pm, pages = 1)
+
+#gam check
+gam.check(mrf_income_models$pm)
+gam.check(mrf_income_models$o3)
+gam.check(mrf_income_models$no2)
+gam.check(mrf_income_models$ndvi)
+gam.check(mrf_income_models$temp)
+# p values all non sig fr checking which is good  for med income, but GEOID and county return NA p values?
+
+#concurvity - high worst between s(COUNTYFP10) and s(GEOID) - 0.86 -problematic?
+concurvity(mrf_income_models$pm, full = TRUE)
+concurvity(mrf_income_models$pm, full = FALSE)
+concurvity(mrf_income_models$o3, full = TRUE)
+concurvity(mrf_income_models$o3, full = FALSE)
+concurvity(mrf_income_models$no2, full = TRUE)
+concurvity(mrf_income_models$no2, full = FALSE)
+concurvity(mrf_income_models$ndvi, full = TRUE)
+concurvity(mrf_income_models$ndvi, full = FALSE)
+
+# Get the fitted values and residuals
+fitted_values <- fitted(mrf_income_models$pm)
+residuals <- resid(mrf_income_models$pm)
+
+# Create a data frame for plotting
+plot_data <- data.frame(fitted = fitted_values, residuals = residuals)
+
+# Plot Residuals vs Fitted
+ggplot(plot_data, aes(x = fitted, y = residuals)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals") +
+  theme_minimal()
+
+
+
+traceback()
+
+```
+# Plot the residuals for the "pm" mrf_income model
+
 
 Create basic QQ plots for models
 ```{r}
@@ -749,56 +1380,145 @@ display_all_model_diagnostics <- function(models_list) {
 display_all_model_diagnostics(all_models)
 
 ```
-
-Function to get summary statistics for models
 ```{r}
-#Function to generate summary statistics by model type for every exposure
-get_model_type_summary <- function(models_list, model_type) {
-  summary_stats <- data.frame(
-    exposure = character(),
-    deviance_explained = numeric(),
-    aic = numeric(),
-    edf = numeric(),
-    ref_df = numeric(),
-    chi_sq = numeric(),
-    p_value = numeric(),
-    stringsAsFactors = FALSE
-  )
-  
-  for (exposure_name in names(models_list)) {
-    exposure_models <- models_list[[exposure_name]]
-    
-    if (model_type %in% names(exposure_models)) {
+
+create_model_diagnostics_by_type <- function(models_list, model_type) {
+  # Create diagnostic plots for each exposure
+  diagnostic_plots <- models_list %>%
+    imap(function(exposure_models, exposure_name) {
+      # Skip if model type doesn't exist or is error
+      if (!model_type %in% names(exposure_models) || 
+          inherits(exposure_models[[model_type]], "try-error")) {
+        return(NULL)
+      }
+      
       model <- exposure_models[[model_type]]
       
-      if (!inherits(model, "try-error")) {
-        model_summary <- summary(model)
+      # Create residuals dataframe
+      resid_df <- tibble(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model),
+        scale_residuals = residuals(model, type = "scaled.pearson"),
+        response = model$y
+      )
+      
+      # Create the four diagnostic plots
+      list(
+        # 1. QQ plot
+        qq = ggplot(resid_df, aes(sample = residuals)) +
+          stat_qq() +
+          stat_qq_line(color = "red") +
+          labs(title = paste(exposure_name, "- Normal Q-Q Plot")) +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12)),
         
-        # Get the smooth terms table
-        smooth_table <- model_summary$s.table
+        # 2. Residuals vs Fitted
+        resid = ggplot(resid_df, aes(x = fitted, y = residuals)) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +
+          labs(title = paste(exposure_name, "- Residuals vs Fitted"),
+               x = "Fitted values",
+               y = "Deviance residuals") +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12)),
         
-        if (!is.null(smooth_table)) {
-          summary_stats <- rbind(summary_stats, data.frame(
-            exposure = exposure_name,
-            deviance_explained = model_summary$dev.expl * 100,
-            aic = AIC(model),
-            edf = smooth_table[1, "edf"],
-            ref_df = smooth_table[1, "Ref.df"],
-            chi_sq = smooth_table[1, "Chi.sq"],  
-            p_value = smooth_table[1, "p-value"],
-            stringsAsFactors = FALSE
-          ))
-        }
-      }
-    }
+        # 3. Scale-location plot
+        scale = ggplot(resid_df, 
+                      aes(x = fitted, y = sqrt(abs(scale_residuals)))) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Scale-Location"),
+               x = "Fitted values",
+               y = "√|Standardized residuals|") +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12)),
+        
+        # 4. Response vs Fitted
+        resp = ggplot(resid_df, aes(x = fitted, y = response)) +
+          geom_point(alpha = 0.5) +
+          geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Response vs Fitted"),
+               x = "Fitted values",
+               y = "Response") +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12))
+      )
+    }) %>%
+    compact() # Remove NULL entries
+  
+  # Stop if no valid models found
+  if (length(diagnostic_plots) == 0) {
+    stop("No valid models found for the specified model type")
   }
   
-  return(summary_stats)
+  # Flatten the nested list of plots
+  all_plots <- diagnostic_plots %>%
+    flatten()
+  
+  # Calculate grid dimensions
+  n_exposures <- length(diagnostic_plots)
+  n_cols <- 4  # One column for each type of diagnostic plot
+  
+  # Combine all plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = all_plots,
+    ncol = n_cols,
+    nrow = n_exposures,
+    top = grid::textGrob(
+      paste("Diagnostic Plots for Model Type:", model_type),
+      gp = grid::gpar(fontsize = 18, fontface = "bold")
+    ),
+    heights = rep(1, n_exposures),  # Adjust height of each row to ensure plots are not squished
+    padding = unit(1, "cm")  # Add padding between plots
+  )
+  
+  return(combined_plot)
 }
 
-# Generate summary stats for mrf_income model for every exposure
-summary_stats <- get_model_type_summary(all_models, "mrf_income")
-print(summary_stats)
+display_all_model_diagnostics <- function(models_list) {
+  # Get unique model types
+  model_types <- models_list %>%
+    map(names) %>%
+    flatten_chr() %>%
+    unique()
+  
+  # Create and display all plots at once
+  plots <- model_types %>%
+    map(~{
+      tryCatch({
+        create_model_diagnostics_by_type(models_list, .x)
+      }, error = function(e) {
+        message(paste("Error creating plots for model type:", .x))
+        message(e)
+        return(NULL)
+      })
+    }) %>%
+    compact()
+  
+  # Calculate grid layout for all model types
+  n_types <- length(plots)
+  grid_dims <- c(ceiling(sqrt(n_types)), floor(sqrt(n_types)))
+  if (prod(grid_dims) < n_types) grid_dims[2] <- grid_dims[2] + 1
+  
+  # Display all plots in a single grid
+  do.call(gridExtra::grid.arrange, 
+          c(plots, 
+            list(ncol = grid_dims[1],
+                 nrow = grid_dims[2],
+                 top = grid::textGrob("All Model Diagnostics", 
+                                      gp = grid::gpar(fontsize = 18, fontface = "bold")))))
+}
+display_all_model_diagnostics(all_models)
+
 
 ```
 
