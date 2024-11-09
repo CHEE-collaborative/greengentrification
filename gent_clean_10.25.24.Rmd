@@ -222,6 +222,7 @@ all_data_inc <- all_data %>%
   mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
   mutate(COUNTYFP10 = factor(COUNTYFP10))
 
+#temporary df using med_income_2000, removing missing tracts
 all_data_inc_na <- na.omit(all_data_inc)
 
 ############# models adjusting for median income in 2000 and distance to downtown #########
@@ -269,37 +270,232 @@ ggplot() +
 distances <- st_distance(nyc_tracts, area_centroid)
 all_data_inc$dt_dist <- as.numeric(distances)
 ```
-
+```{r}
 # Construct neighbors list for MRF models
 nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
 names(nb) <- attr(nb, "region.id") 
+```
 
 
+testing tp model with med_income_2000 for pm2.5
+```{r}
 tp_income_pm_na <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
 
+# Try increasing k for the tensor product smooth of longitude and latitude (from 24 default)
+tp_income_pm_na_2 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 100), method = 'REML', family = scat, data = all_data_inc_na) #when k=40 and k=100, p value still significant (= bad)
+
+tp_income_pm_na_3 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 150), method = 'REML', family = scat, data = all_data_inc_na) 
+
+tp_income_pm_na_4 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) 
+
+tp_income_pm_na_4 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) 
+
+tp_income_pm_na_5 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re", k=10) + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) 
+
+
+
+#model diagnostics using gam.check
+gam.check(tp_income_pm_na)
+gam.check(tp_income_pm_na_2)
+gam.check(tp_income_pm_na_3)
+gam.check(tp_income_pm_na_4)
+gam.check(tp_income_pm_na_5)
+
+
+# First, let's get the fitted random effects properly
+fitted_terms <- predict(tp_income_pm_na_5, type="terms")
+county_term <- fitted_terms[,"s(COUNTYFP10)"]  # Extract county random effects
+
+# Create summary by county
+county_summary <- data.frame(
+    COUNTYFP10 = all_data_inc_na$COUNTYFP10,
+    effect = county_term
+) %>%
+    group_by(COUNTYFP10) %>%
+    summarize(mean_effect = mean(effect)) %>%
+    arrange(desc(abs(mean_effect)))
+
+# View the most extreme counties
+print(head(county_summary))
+
+# Visualize
+library(ggplot2)
+ggplot(county_summary, aes(y=mean_effect, x=reorder(COUNTYFP10, mean_effect))) +
+    geom_point() +
+    theme_minimal() +
+    theme(axis.text.x = element_blank()) +  # Hide county codes for clarity
+    labs(x="Counties", y="Random Effect")
+
+# Look at the data for the most extreme county
+extreme_county <- county_summary$COUNTYFP10[1]
+extreme_county_data <- all_data_inc_na %>%
+    filter(COUNTYFP10 == extreme_county) %>%
+    select(pm_change, score_0.5, med_income_2000, long, lat)
+
+print("Data for most extreme county:")
+print(summary(extreme_county_data)) #extreme county is 85 - Manhattan/NY county
+
+print("Overall data summary:")
+print(summary(all_data_inc_na[,c("pm_change", "score_0.5", "med_income_2000")]))
+####
+
+####
+
+# Calculate Cook's distance
+cooks_d <- cooks.distance(tp_income_pm_na)
+plot(cooks_d, type = "h", main = "Cook's Distance")
+abline(h = 4/length(cooks_d), col = "red")  # Rule of thumb threshold
+
+# Identify potential influential points
+influential <- which(cooks_d > 4/length(cooks_d))
+
+influential_data <- all_data_inc_na[influential, ]
+print(influential_data)  # Look at characteristics of these points
+
+# Options for handling influential points:
+# a. Fit model without them to compare
+tp_income_pm_na_reduced <- gam(
+  pm_change ~ score_0.5 + 
+    s(COUNTYFP10, bs = "re") + 
+    rank(med_income_2000) + 
+    te(long, lat, d = 2, bs = 'gp', m = 2, k = 150),
+  method = 'REML',
+  family = scat,
+  data = all_data_inc_na[-influential, ]
+)
+
+# Compare coefficients and predictions
+summary(tp_income_pm_na)
+summary(tp_income_pm_na_reduced)
+
+# b. Investigate why these points are influential:
+# Plot their locations
+plot(all_data_inc_na$long, all_data_inc_na$lat)
+points(all_data_inc_na$long[influential], 
+       all_data_inc_na$lat[influential], 
+       col = "red", pch = 16)
+
+
+# Checking that scat is indeed better (comparing t distribution to gaussian)
+model_scat <- gam(
+  pm_change ~ score_0.5 + 
+    s(COUNTYFP10, bs = "re") + 
+    rank(med_income_2000) + 
+    te(long, lat, d = 2, bs = 'gp', m = 2, k = 150),
+  method = 'REML',
+  family = scat,
+  data = all_data_inc_na
+)
+
+model_gaussian <- gam(
+  pm_change ~ score_0.5 + 
+    s(COUNTYFP10, bs = "re") + 
+    rank(med_income_2000) + 
+    te(long, lat, d = 2, bs = 'gp', m = 2, k = 150),
+  method = 'REML',
+  family = gaussian,
+  data = all_data_inc_na
+)
+
+# Compare QQ plots
+par(mfrow=c(1,2))
+qq.gam(model_scat, main="Scaled t")
+qq.gam(model_gaussian, main="Gaussian")
+
+# Compare predictions
+pred_scat <- predict(model_scat)
+pred_gaussian <- predict(model_gaussian)
+plot(pred_scat, pred_gaussian, 
+     xlab="Scaled t predictions", 
+     ylab="Gaussian predictions")
+abline(0,1, col="red")
+
+# Compare AIC (if models have same scale)
+AIC(model_scat, model_gaussian)
+# Check if residual patterns differ
+par(mfrow=c(2,2))
+gam.check(tp_income_pm_gaussian)
+
+
+```
+
+testing tp models for o3
+```{r}
 tp_income_o3_na <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
 
+
+#increasing k in tp
+tp_income_o3_na_2 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 150), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_o3_na_3 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 250), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_o3_na_4 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) # k still 0.02
+
+tp_income_o3_na_5 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 225), method = 'REML', family = scat, data = all_data_inc_na) #k no longer significant
+
+
+gam.check(tp_income_o3_na)
+gam.check(tp_income_o3_na_2)
+gam.check(tp_income_o3_na_3)
+gam.check(tp_income_o3_na_4)
+gam.check(tp_income_o3_na_5)
+
+
+
+
+```
+
+testing tp models for no2
+```{r}
 tp_income_no2_na <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
 
+tp_income_no2_na_2 <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k= 200), method = 'REML', family = scat, data = all_data_inc_na) #still significant
+
+tp_income_no2_na_3 <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k= 250), method = 'REML', family = scat, data = all_data_inc_na) #still significant
+ 
+tp_income_no2_na_4 <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k= 450), method = 'REML', family = scat, data = all_data_inc_na) #takes forever to run - not feasible
+
+gam.check(tp_income_no2_na)
+gam.check(tp_income_no2_na_2)
+gam.check(tp_income_no2_na_3)
+gam.check(tp_income_no2_na_4)
+
+
+```
+testing tp models for ndvi
+```{r}
 tp_income_ndvi_na <- gam(ndvi_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
 
+tp_income_ndvi_na_2 <- gam(ndvi_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_ndvi_na_3 <- gam(ndvi_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 300), method = 'REML', family = scat, data = all_data_inc_na) # still very significant
+
+gam.check(tp_income_ndvi_na)
+gam.check(tp_income_ndvi_na_2)
+gam.check(tp_income_ndvi_na_3)
+
+```
+testing tp models for temp
+```{r}
 tp_income_temp_na <- gam(mean_temp ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
 
+tp_income_temp_na_2<- gam(mean_temp ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na)
 
-gam.check(tp_income_pm_na)
-gam.check(tp_income_o3_na)
-gam.check(tp_income_no2_na)
-gam.check(tp_income_ndvi_na)
+tp_income_temp_na_3<- gam(mean_temp ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 300), method = 'REML', family = scat, data = all_data_inc_na) # still very significant
+
+
 gam.check(tp_income_temp_na)
-##############################################
+gam.check(tp_income_temp_na_2)
+gam.check(tp_income_temp_na_3)
+```
 
 Testing residuals using tp model for now
 ```{r}
 # Extract residuals for each model
-resid_pm <- resid(tp_income_pm_na)
-resid_o3 <- resid(tp_income_o3_na)
-resid_no2 <- resid(tp_income_no2_na)
-resid_ndvi <- resid(tp_income_ndvi_na)
+resid_pm <- resid(tp_income_pm_na_5)
+resid_o3 <- resid(tp_income_o3_na_5)
+resid_no2 <- resid(tp_income_no2_na_3)
+resid_ndvi <- resid(tp_income_ndvi_na_3)
 resid_temp <- resid(tp_income_ndvi_na)
 
 
@@ -313,67 +509,67 @@ all_data_inc_na$resid_temp <- resid_temp
 
 Code for just PM to base function on
 ```{r}
-# Visualize residuals for PM model, for example
-ggplot(all_data_inc_na, aes(x = long, y = lat, color = resid_pm)) +
-  geom_point() +
-  scale_color_gradient2(midpoint = 0, low = "blue", mid = "white", high = "red") +
-  theme_minimal() +
-  labs(title = "Spatial Distribution of Residuals (PM)", color = "Residuals")
-  
-# Calculate the 10th and 90th percentiles of the residuals
-lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
-upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
-
-# Create dichotomous variable based on thresholds
-all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
-                                        ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
-
-# Visualize the result
-ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
-  geom_point() +
-  scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
-  theme_minimal() +
-  labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
-
-
-# Calculate the 10th and 90th percentiles of the residuals
-lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
-upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
-
-# Create dichotomous variable based on thresholds
-all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
-                                        ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
-
-# Visualize the result
-ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
-  geom_point() +
-  scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
-  theme_minimal() +
-  labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
-
-
-# Visualize gaps using the dichotomous color scale
-ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
-  geom_point() +
-  scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
-  theme_minimal() +
-  labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
-
-# Summary statistics for residuals (e.g., PM)
-summary(all_data_inc_na$resid_pm)
-
-# Identify the locations with extreme residuals
-high_residuals <- all_data_inc_na[all_data_inc_na$resid_pm > threshold, ]
-low_residuals <- all_data_inc_na[all_data_inc_na$resid_pm < -threshold, ]
-
-# View the locations of high and low residuals
-head(high_residuals[, c("long", "lat", "resid_pm")])
-head(low_residuals[, c("long", "lat", "resid_pm")])
+# # Visualize residuals for PM model, for example
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = resid_pm)) +
+#   geom_point() +
+#   scale_color_gradient2(midpoint = 0, low = "blue", mid = "white", high = "red") +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residuals (PM)", color = "Residuals")
+#   
+# # Calculate the 10th and 90th percentiles of the residuals
+# lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
+# upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
+# 
+# # Create dichotomous variable based on thresholds
+# all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
+#                                         ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
+# 
+# # Visualize the result
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+#   geom_point() +
+#   scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+# 
+# 
+# # Calculate the 10th and 90th percentiles of the residuals
+# lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
+# upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
+# 
+# # Create dichotomous variable based on thresholds
+# all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
+#                                         ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
+# 
+# # Visualize the result
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+#   geom_point() +
+#   scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+# 
+# 
+# # Visualize gaps using the dichotomous color scale
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+#   geom_point() +
+#   scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+# 
+# # Summary statistics for residuals (e.g., PM)
+# summary(all_data_inc_na$resid_pm)
+# 
+# # Identify the locations with extreme residuals
+# high_residuals <- all_data_inc_na[all_data_inc_na$resid_pm > threshold, ]
+# low_residuals <- all_data_inc_na[all_data_inc_na$resid_pm < -threshold, ]
+# 
+# # View the locations of high and low residuals
+# head(high_residuals[, c("long", "lat", "resid_pm")])
+# head(low_residuals[, c("long", "lat", "resid_pm")])
 
 
 ```
 ############################################
-function to analyze residuals for all exposures based on tp model 
+function to analyze residuals for all exposures based on tp model (based on high and low quantiles)
 ```{r}
 analyze_spatial_residuals <- function(data, residual_col, lon_col = "long", lat_col = "lat", 
                                     lower_quantile = 0.1, upper_quantile = 0.9) {
@@ -501,11 +697,136 @@ results_temp$categorical_plot
 head(results_temp$extreme_locations$high)
 head(results_temp$extreme_locations$low)
 ```
-
+function to analyze residuals for all exposures based on tp model (based on high and low quantiles, narrower limits)
 ```{r}
-library(ggplot2)
-library(dplyr)
+analyze_spatial_residuals <- function(data, residual_col, lon_col = "long", lat_col = "lat", 
+                                    lower_quantile = 0.05, upper_quantile = 0.95) {
+  # Input validation
+  if (!all(c(residual_col, lon_col, lat_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create analysis environment
+  results <- list()
+  
+  # Basic summary statistics
+  results$summary <- summary(data[[residual_col]])
+  
+  # Calculate thresholds
+  results$thresholds <- list(
+    lower = quantile(data[[residual_col]], lower_quantile, na.rm = TRUE),
+    upper = quantile(data[[residual_col]], upper_quantile, na.rm = TRUE)
+  )
+  
+  # Create categorical variable for residual gaps
+  data$residual_category <- case_when(
+    data[[residual_col]] > results$thresholds$upper ~ "High Residual",
+    data[[residual_col]] < results$thresholds$lower ~ "Low Residual",
+    TRUE ~ "Normal"
+  )
+  
+  # Generate plots
+  # 1. Continuous residual plot
+  results$continuous_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                            y = .data[[lat_col]], 
+                                            color = .data[[residual_col]])) +
+    geom_point(alpha = 0.6) +
+    scale_color_gradient2(midpoint = 0, 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red") +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residuals:", residual_col),
+         color = "Residuals") +
+    theme(legend.position = "right")
+  
+  # 2. Categorical residual plot
+  results$categorical_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                             y = .data[[lat_col]], 
+                                             color = residual_category)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = c("High Residual" = "red", 
+                                 "Low Residual" = "blue", 
+                                 "Normal" = "grey")) +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residual Gaps:", residual_col),
+         color = "Residual Category") +
+    theme(legend.position = "right")
+  
+  # Extract extreme locations
+  results$extreme_locations <- list(
+    high = data %>%
+      filter(residual_category == "High Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(desc(.data[[residual_col]])),
+    
+    low = data %>%
+      filter(residual_category == "Low Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(.data[[residual_col]])
+  )
+  
+  # Calculate summary statistics by category
+  results$category_stats <- data %>%
+    group_by(residual_category) %>%
+    summarise(
+      count = dplyr::n(),
+      mean_residual = mean(.data[[residual_col]], na.rm = TRUE),
+      sd_residual = sd(.data[[residual_col]], na.rm = TRUE),
+      min_residual = min(.data[[residual_col]], na.rm = TRUE),
+      max_residual = max(.data[[residual_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  return(results)
+}
 
+# Example usage for each environmental variable
+results_pm <- analyze_spatial_residuals(all_data_inc_na, "resid_pm")
+results_o3 <- analyze_spatial_residuals(all_data_inc_na, "resid_o3")
+results_no2 <- analyze_spatial_residuals(all_data_inc_na, "resid_no2")
+results_ndvi <- analyze_spatial_residuals(all_data_inc_na, "resid_ndvi")
+results_temp <- analyze_spatial_residuals(all_data_inc_na, "resid_temp")
+
+
+# Display results for pm2.5
+print(results_pm$summary)
+print(results_pm$category_stats)
+results_pm$continuous_plot
+results_pm$categorical_plot
+head(results_pm$extreme_locations$high)
+head(results_pm$extreme_locations$low)
+
+print(results_o3$summary)
+print(results_o3$category_stats)
+results_o3$continuous_plot
+results_o3$categorical_plot
+head(results_o3$extreme_locations$high)
+head(results_o3$extreme_locations$low)
+
+print(results_no2$summary)
+print(results_no2$category_stats)
+results_no2$continuous_plot
+results_no2$categorical_plot
+head(results_no2$extreme_locations$high)
+head(results_no2$extreme_locations$low)
+
+print(results_ndvi$summary)
+print(results_ndvi$category_stats)
+results_ndvi$continuous_plot
+results_ndvi$categorical_plot
+head(results_ndvi$extreme_locations$high)
+head(results_ndvi$extreme_locations$low)
+
+print(results_temp$summary)
+print(results_temp$category_stats)
+results_temp$continuous_plot
+results_temp$categorical_plot
+head(results_temp$extreme_locations$high)
+head(results_temp$extreme_locations$low)
+```
+Analyze residual overlap between exposures
+```{r}
 analyze_residual_overlap <- function(data, residual_cols, lon_col = "long", lat_col = "lat", 
                                    lower_quantile = 0.1, upper_quantile = 0.9) {
   # Input validation
@@ -650,7 +971,7 @@ extreme_overlap_locations <- overlap_results$data %>%
 print("Locations with multiple extreme residuals:")
 head(extreme_overlap_locations, 10)
 
-# Optional: Create a summary table of which combinations of exposures tend to have extreme residuals together
+# Create a summary table of which combinations of exposures tend to have extreme residuals together
 exposure_combinations <- overlap_results$data %>%
   filter(extreme_overlap_count >= 2) %>%
   summarise(
@@ -665,7 +986,134 @@ exposure_combinations <- overlap_results$data %>%
 print("\nCommon pairs of exposures with extreme residuals:")
 print(exposure_combinations)
 ```
-#additonal investigation?
+More detailed summaries on where residuals overlap
+```{r}
+analyze_residual_overlap <- function(data, residual_cols, lon_col = "long", lat_col = "lat", 
+                                   geoid_col = "geoid", county_col = "NAME", # 
+                                   lower_quantile = 0.1, upper_quantile = 0.9) {
+  # Input validation
+  if (!all(c(residual_cols, lon_col, lat_col, geoid_col, county_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create category columns for each residual
+  results <- list()
+  data_enhanced <- data
+  
+  # Categorize each residual
+  for (col in residual_cols) {
+    thresholds <- quantile(data[[col]], c(lower_quantile, upper_quantile), na.rm = TRUE)
+    cat_col_name <- paste0(col, "_category")
+    
+    data_enhanced[[cat_col_name]] <- case_when(
+      data[[col]] > thresholds[2] ~ "High",
+      data[[col]] < thresholds[1] ~ "Low",
+      TRUE ~ "Normal"
+    )
+  }
+  
+  # Count overlapping high/low/extreme areas
+  data_enhanced$high_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "High"
+    })
+  )
+  
+  data_enhanced$low_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "Low"
+    })
+  )
+  
+  # Count either high or low (extreme) overlaps
+  data_enhanced$extreme_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] %in% c("High", "Low")
+    })
+  )
+  
+  # Create overlap visualizations
+  # 1. High residual overlap plot
+  results$high_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(high_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "magma", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of High Residuals",
+         color = "Number of\nOverlapping\nHigh Residuals") +
+    theme(legend.position = "right")
+  
+  # Create location summaries with geoids and county names
+  results$location_summary <- data_enhanced %>%
+    filter(extreme_overlap_count > 0) %>%
+    select(
+      !!sym(geoid_col),
+      !!sym(county_col), # Added county name
+      !!sym(lon_col),
+      !!sym(lat_col),
+      extreme_overlap_count,
+      high_overlap_count,
+      low_overlap_count,
+      ends_with("_category")
+    ) %>%
+    arrange(desc(extreme_overlap_count))
+  
+  # Summary of overlap patterns by geoid and county
+  results$overlap_patterns <- data_enhanced %>%
+    group_by(extreme_overlap_count) %>%
+    summarise(
+      n_locations = dplyr::n(),
+      geoids = list(get(geoid_col)),
+      counties = list(unique(get(county_col))), # Added county names
+      pct_of_total = round(100 * dplyr::n() / nrow(data_enhanced), 1),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(extreme_overlap_count))
+  
+  # Create detailed overlap combinations for high overlap areas
+  results$overlap_combinations <- data_enhanced %>%
+    filter(extreme_overlap_count >= 2) %>%
+    group_by(!!sym(geoid_col)) %>%
+    summarise(
+      county = first(!!sym(county_col)), # Added county name
+      extreme_overlap_count = first(extreme_overlap_count),
+      combination = paste(names(which(sapply(residual_cols, function(col) {
+        first(get(paste0(col, "_category"))) != "Normal"
+      }))), collapse = ", "),
+      categories = paste(sapply(residual_cols, function(col) {
+        paste0(col, ": ", first(get(paste0(col, "_category"))))
+      }), collapse = "; "),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(extreme_overlap_count))
+  
+  # Add the enhanced dataset to results
+  results$data <- data_enhanced
+  
+  return(results)
+}
+
+overlap_results <- analyze_residual_overlap(
+   data = all_data_inc_na,
+   residual_cols = c("resid_pm", "resid_o3", "resid_no2", "resid_ndvi"),
+   geoid_col = "GEOID",
+   county_col = "NAME"
+ )
+
+# View locations with overlaps
+print(overlap_results$location_summary)
+
+# View overlap patterns
+print(overlap_results$overlap_patterns)
+
+# View detailed combinations
+print(overlap_results$overlap_combinations)
+
+
+
+```
+
 ```{r}
 library(spdep)  # for spatial weights and Moran's I
 library(dbscan) # for DBSCAN clustering
