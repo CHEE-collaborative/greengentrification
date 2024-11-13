@@ -208,13 +208,21 @@ all_vars_dec <-
   load_variables(year = 2000, dataset = "sf3")
 
 # models adjusting for median income in 2000 (note: 2000 decennial census is 1999 data)
-income <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
+income_2000 <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
                   county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
   rename(med_income_2000 = value)
 #results in 226 missing tracts in terms of 2010 tracts.
 
-all_data_inc <- all_data %>% 
-  left_join(income, by = "GEOID") %>% 
+#Find median household income variable in 2010 ACS
+income_2010 <- get_acs(variables = "B06011_001", year = 2010, state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2010 = estimate)
+
+# Joining both income sets with data and imputing 2010 data where 2000 data is missing
+all_data_inc <- all_data %>%
+  left_join(income_2000, by = "GEOID") %>%
+  left_join(income_2010, by = "GEOID") %>%
+  mutate(med_income_2000_impute = coalesce(med_income_2000, med_income_2010)) %>% 
   # coerce GEOID to numeric then factor class to avoid error in MRF smooth
   mutate(GEOID = as.numeric(GEOID)) %>% 
   mutate(GEOID = factor(GEOID)) %>% 
@@ -222,8 +230,9 @@ all_data_inc <- all_data %>%
   mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
   mutate(COUNTYFP10 = factor(COUNTYFP10))
 
-#temporary df using med_income_2000, removing missing tracts
-all_data_inc_na <- na.omit(all_data_inc)
+# 
+# #temporary df using med_income_2000, removing missing tracts
+# all_data_inc_na <- na.omit(all_data_inc)
 
 ############# models adjusting for median income in 2000 and distance to downtown #########
 # load nyc roads
@@ -270,6 +279,135 @@ ggplot() +
 distances <- st_distance(nyc_tracts, area_centroid)
 all_data_inc$dt_dist <- as.numeric(distances)
 ```
+2000 vs 2010 income checking
+```{r}
+library(tidyverse)
+library(stats)
+
+analyze_tract_incomes <- function(all_data, income_2000, income_2010) {
+  # Merge data
+  analysis_df <- all_data %>%
+    left_join(income_2000 %>% select(GEOID, med_income_2000), by = "GEOID") %>%
+    left_join(income_2010 %>% select(GEOID, med_income_2010), by = "GEOID")
+  
+  # Create summary statistics grouped by whether 2000 data exists
+  summary_stats <- analysis_df %>%
+    mutate(has_2000_data = !is.na(med_income_2000)) %>%
+    group_by(has_2000_data) %>%
+    summarise(
+      n_tracts = dplyr::n(),
+      mean_2010 = mean(med_income_2010, na.rm = TRUE),
+      median_2010 = median(med_income_2010, na.rm = TRUE),
+      sd_2010 = sd(med_income_2010, na.rm = TRUE),
+      q25_2010 = quantile(med_income_2010, 0.25, na.rm = TRUE),
+      q75_2010 = quantile(med_income_2010, 0.75, na.rm = TRUE)
+    )
+  
+  # Perform Wilcoxon rank sum test (Mann-Whitney U test)
+  test_result <- wilcox.test(
+    med_income_2010 ~ !is.na(med_income_2000),
+    data = analysis_df,
+    alternative = "two.sided"
+  )
+  
+  # Create visualization
+  plot <- analysis_df %>%
+    mutate(has_2000_data = if_else(!is.na(med_income_2000), 
+                                  "Has 2000 Data", 
+                                  "Missing 2000 Data")) %>%
+    ggplot(aes(x = has_2000_data, y = med_income_2010)) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(
+      title = "2010 Income Distribution: Tracts With vs Without 2000 Data",
+      x = "",
+      y = "2010 Median Income"
+    )
+  
+  # Calculate percent difference in means
+  pct_diff <- with(summary_stats, 
+                  (mean_2010[!has_2000_data] - mean_2010[has_2000_data]) / 
+                    mean_2010[has_2000_data] * 100)
+  
+  # Return results
+  list(
+    summary_stats = summary_stats,
+    wilcox_test = test_result,
+    percent_difference = pct_diff,
+    plot = plot
+  )
+}
+
+# Use the function
+results <- analyze_tract_incomes(all_data, income, income_2010)
+
+# Print results
+print("Summary Statistics:")
+print(results$summary_stats)
+
+print("\nWilcoxon Test Results:")
+print(results$wilcox_test)
+
+print(sprintf("\nPercent difference in means: %.2f%%", results$percent_difference))
+
+# Display plot
+print(results$plot)
+print(results$plot)
+
+#additional analysis based on average, variation, standard deviation- checking normality to see which statistical signifiancetest is appropriate
+
+# Create analysis dataset
+analysis_df <- all_data %>%
+  left_join(income %>% select(GEOID, med_income_2000), by = "GEOID") %>%
+  left_join(income_2010 %>% select(GEOID, med_income_2010), by = "GEOID") %>%
+  mutate(has_2000_data = !is.na(med_income_2000))
+
+# Calculate summary statistics
+stats_summary <- analysis_df %>%
+  group_by(has_2000_data) %>%
+  summarise(
+    n = dplyr::n(),
+    mean_2010 = mean(med_income_2010, na.rm = TRUE),
+    var_2010 = var(med_income_2010, na.rm = TRUE),
+    sd_2010 = sd(med_income_2010, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+# Test for normality using Shapiro-Wilk test
+normality_test_with_2000 <- shapiro.test(analysis_df$med_income_2010[analysis_df$has_2000_data])
+normality_test_without_2000 <- shapiro.test(analysis_df$med_income_2010[!analysis_df$has_2000_data])
+
+# Perform F-test for equality of variances
+var_test <- var.test(med_income_2010 ~ has_2000_data, data = analysis_df)
+
+# Perform t-test (both equal and unequal variance versions)
+t_test_equal_var <- t.test(med_income_2010 ~ has_2000_data, data = analysis_df, var.equal = TRUE)
+t_test_unequal_var <- t.test(med_income_2010 ~ has_2000_data, data = analysis_df, var.equal = FALSE)
+
+# Perform Wilcoxon rank sum test
+wilcox_test <- wilcox.test(med_income_2010 ~ has_2000_data, data = analysis_df)
+
+# Print results
+cat("Summary Statistics:\n")
+print(stats_summary)
+
+cat("\nNormality Tests (Shapiro-Wilk):\n")
+cat("Tracts with 2000 data: p =", normality_test_with_2000$p.value, "\n")
+cat("Tracts without 2000 data: p =", normality_test_without_2000$p.value, "\n")
+
+cat("\nF-test for Equal Variances:\n")
+cat("F =", round(var_test$statistic, 3), ", p =", var_test$p.value, "\n")
+
+cat("\nt-test (Equal Variances):\n")
+cat("t =", round(t_test_equal_var$statistic, 3), ", p =", t_test_equal_var$p.value, "\n")
+
+cat("\nt-test (Unequal Variances):\n")
+cat("t =", round(t_test_unequal_var$statistic, 3), ", p =", t_test_unequal_var$p.value, "\n")
+
+cat("\nWilcoxon Rank Sum Test:\n")
+cat("W =", wilcox_test$statistic, ", p =", wilcox_test$p.value, "\n")
+```
+
 ```{r}
 # Construct neighbors list for MRF models
 nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
