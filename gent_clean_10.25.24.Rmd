@@ -279,6 +279,252 @@ ggplot() +
 distances <- st_distance(nyc_tracts, area_centroid)
 all_data_inc$dt_dist <- as.numeric(distances)
 ```
+################################# try mrf_income first to test k and concurvity with county
+```{r}
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+
+#ranking median income (can't do it directly in gam formula?)
+all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)  
+
+#testing ranking baseline exposure
+all_data_inc$pm_baseline_rank <- rank(all_data_inc$pm_2002)
+
+mrf_income_pm <- gam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #changing the k, whether or not income has a spline/log/nothing affects sig of score_0.5; k needs to be at least 15 for residuals etc to be okay (k=15 highest sig but maybe not best diagnostic plots)
+
+mrf_income_pm_baseline <- gam(pm_change ~ score_0.5 + med_income_ranked +pm_baseline_rank + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+
+summary(mrf_income_pm)
+gam.check(mrf_income_pm)
+concurvity(mrf_income_pm, full = TRUE)
+
+summary(mrf_income_pm_baseline) #after taking into account baseline rank, gent score not significant at all p = 0.72
+
+
+#ozone
+
+mrf_income_o3 <- gam(o3_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+mrf_income_o3_county <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs='re') + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+summary(mrf_income_o3)
+gam.check(mrf_income_o3)
+concurvity(mrf_income_o3, full = TRUE)
+
+summary(mrf_income_o3_county)
+gam.check(mrf_income_o3_county) #worse than without county
+concurvity(mrf_income_o3_county, full = TRUE)
+
+#testing ranking baseline exposure
+all_data_inc$o3_baseline_rank <- rank(all_data_inc$o3_2002)
+mrf_income_o3_baseline <- gam(o3_change ~ score_0.5 + med_income_ranked + o3_baseline_rank + s(GEOID, bs='mrf', k=20, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+summary(mrf_income_o3_baseline)#but with o3, after adding baseline, score_0.5 still sig
+gam.check(mrf_income_o3_baseline) #curve is worse
+concurvity(mrf_income_o3, full = TRUE)
+
+#no2
+mrf_income_no2 <- gam(no2_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #at k=5 is significant but residuals weird, when k increases, residuals and stuff still patterned-ish but better overall and no longer sig
+summary(mrf_income_no2)
+gam.check(mrf_income_no2)
+concurvity(mrf_income_no2, full = TRUE)
+
+all_data_inc$no2_baseline_rank <- rank(all_data_inc$no2_2000)
+
+mrf_income_no2_baseline <- gam(no2_change ~ score_0.5 + med_income_ranked + no2_baseline_rank + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+
+summary(mrf_income_no2_baseline)
+gam.check(mrf_income_no2_baseline)
+
+#ndvi
+mrf_income_ndvi <- gam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+summary(mrf_income_ndvi)
+gam.check(mrf_income_ndvi)
+concurvity(mrf_income_ndvi, full = TRUE)
+
+all_data_inc$ndvi_baseline_rank <- rank(all_data_inc$ndvi_2000)
+mrf_income_ndvi_baseline <- gam(ndvi_change ~ score_0.5 + med_income_ranked + ndvi_baseline_rank + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+summary(mrf_income_ndvi_baseline)
+gam.check(mrf_income_ndvi_baseline)
+
+
+#temp
+mrf_income_temp <- gam(mean_temp ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")  #terrible residual plots
+summary(mrf_income_temp)
+gam.check(mrf_income_temp)
+concurvity(mrf_income_temp, full = TRUE)
+
+
+```
+
+################################ANALYZE COOK DISTANCE AND RESIDUALS ETC FOR MRF MODELS 
+
+################################
+
+Create model functions (NEW FOR MRF ONLY)
+```{r}
+# Create exposure list
+exposure_list <- list(
+  pm = list(
+    name = "pm",
+    baseline = "pm_2002",
+    change = "pm_change"
+  ),
+  o3 = list(
+    name = "o3",
+    baseline = "o3_2002",
+    change = "o3_change"
+  ),
+  no2 = list(
+    name = "no2",
+    baseline = "no2_2000",
+    change = "no2_change"
+  ),
+  ndvi = list(
+    name = "ndvi",
+    baseline = "ndvi_2000",
+    change = "ndvi_change"
+  ),
+  temp = list(
+    name = "mean_temp",
+    baseline = NULL,
+    change = "mean_temp"  # No change variable for temp
+  )
+)
+
+# Function to run GAM models
+run_gam_models <- function(data, exposure_info) {
+  # Extract exposure information
+  exp_var <- exposure_info$change
+  baseline_exposure <- exposure_info$baseline
+  
+  # Skip if data is missing the exposure variable - gives warning 
+  if (!exp_var %in% names(data)) {
+    warning(paste("Variable", exp_var, "not found in dataset"))
+    return(NULL)
+  }
+  
+  # Base components that will be in all models: gentrification score and county/borough
+  base_formula <- paste(exp_var, "~ score_0.5 + s(COUNTYFP10, bs='re')")
+  
+  # Create model formulas
+  formulas <- list(
+    # Base model (score + county + spatial) for mrf smooth
+    mrf_base = paste(base_formula, "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+    
+    # Models with income
+    mrf_income = paste(base_formula, "+ rank(med_income_2000_impute) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+
+    # Models with distance to downtown
+    mrf_dist = paste(base_formula, "+ s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  )
+  
+  # Add baseline models if baseline exposure level exists (all except temp)
+  if (!is.null(baseline_exposure) && baseline_exposure %in% names(data)) {
+    formulas$mrf_baseline <- paste(base_formula, "+", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    # Combinations with baseline
+    formulas$mrf_income_baseline <- paste(base_formula, "+ rank(med_income_2000_impute) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$mrf_dist_baseline <- paste(base_formula, "+ s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$mrf_full <- paste(base_formula, "+ rank(med_income_2000_impute) + s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  }
+  
+  # Add income + distance combinations
+  formulas$mrf_income_dist <- paste(base_formula, "+ rank(med_income_2000_impute) + s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  
+  # Convert formulas to formula objects
+  formulas <- lapply(formulas, as.formula)
+  
+  # Run models
+  models <- purrr::map(formulas, ~try(gam(., 
+                                        family = scat, 
+                                        data = data, 
+                                        method = "REML"), 
+                                    silent = TRUE))
+  
+  return(models)
+}
+
+# drop geometry from spatial data while keeping coordinates
+data_prepared <- all_data_inc %>%
+  mutate(
+    COUNTYFP10 = as.factor(COUNTYFP10),
+    GEOID = as.factor(GEOID)
+  ) %>%
+  st_drop_geometry()
+
+# Construct neighbors list for MRF models
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+
+# JH 10/25/24 Warning: some observations have no neighbours; if this seems unexpected, try increasing the snap argument.Warning: neighbour object has 4 sub-graphs; if this sub-graph count seems unexpected, try increasing the snap argument.
+```
+
+Run models and check models
+```{r}
+# Run models for each exposure
+all_models <- purrr::map(exposure_list, ~run_gam_models(data_prepared, .))
+
+# Function to check which models succeeded/failed
+check_models <- function(models) {
+  model_status <- map(models, ~!inherits(., "try-error"))
+  successful_models <- names(models)[unlist(model_status)]
+  failed_models <- names(models)[!unlist(model_status)]
+  
+  return(list(
+    successful = successful_models,
+    failed = failed_models
+  ))
+}
+
+# Check status of all models
+model_status <- map(all_models, check_models)
+model_status
+
+```
+```{r}
+# Function to check and summarize all GAM models
+check_and_summarize_models <- function(models) {
+  # Apply gam.check and summary to each model
+  purrr::map(models, function(model_list) {
+    purrr::map(model_list, ~ {
+      # Perform a check on the GAM model
+      gam_check_result <- try(gam.check(.), silent = TRUE)
+      
+      # If gam.check runs without error, print it
+      if (inherits(gam_check_result, "try-error")) {
+        message("Error in gam.check for model: ", deparse(substitute(.)))
+      } else {
+        print(gam_check_result)
+      }
+      
+      # Get the summary of the model
+      summary_result <- try(summary(.), silent = TRUE)
+      
+      # If summary runs without error, print it
+      if (inherits(summary_result, "try-error")) {
+        message("Error in summary for model: ", deparse(substitute(.)))
+      } else {
+        print(summary_result)
+      }
+    })
+  })
+}
+
+# Example usage:
+check_and_summarize_models(all_models)
+```
+
+
+
+
+
+######################################################################
+######################################################################
+#####################################################################
 2000 vs 2010 income checking
 ```{r}
 library(tidyverse)
