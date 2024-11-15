@@ -280,6 +280,8 @@ distances <- st_distance(nyc_tracts, area_centroid)
 all_data_inc$dt_dist <- as.numeric(distances)
 ```
 ################################# try mrf_income first to test k and concurvity with county
+
+
 ```{r}
 nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
 names(nb) <- attr(nb, "region.id") 
@@ -292,6 +294,10 @@ all_data_inc$pm_baseline_rank <- rank(all_data_inc$pm_2002)
 
 mrf_income_pm <- gam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #changing the k, whether or not income has a spline/log/nothing affects sig of score_0.5; k needs to be at least 15 for residuals etc to be okay (k=15 highest sig but maybe not best diagnostic plots)
 
+mrf_income_pm_county <- gam(pm_change ~ score_0.5 + med_income_ranked + s(COUNTYFP10, bs='re')+ s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+summary(mrf_income_pm_county)
+gam.check(mrf_income_pm_county)
+
 mrf_income_pm_baseline <- gam(pm_change ~ score_0.5 + med_income_ranked +pm_baseline_rank + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
 
 
@@ -300,6 +306,18 @@ gam.check(mrf_income_pm)
 concurvity(mrf_income_pm, full = TRUE)
 
 summary(mrf_income_pm_baseline) #after taking into account baseline rank, gent score not significant at all p = 0.72
+
+mrf_income_pm_5 <- gam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+summary(mrf_income_pm_5)
+gam.check(mrf_income_pm_5)
+
+mrf_income_pm_county_dt <- gam(pm_change ~ score_0.5 + med_income_ranked + s(COUNTYFP10, bs='re')+ s(dt_dist) + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+summary(mrf_income_pm_county_dt)
+gam.check(mrf_income_pm_county_dt)
+
+income_pm <- gam(pm_change ~ score_0.5 + med_income_ranked + s(COUNTYFP10, bs='re')+ s(dt_dist), family = scat, data = all_data_inc, method = "REML") 
+
+mrf_income_pm_county_dt_300 <- gam(pm_change ~ score_0.5 + med_income_ranked + s(COUNTYFP10, bs='re')+ s(dt_dist) + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
 
 
 #ozone
@@ -318,7 +336,7 @@ concurvity(mrf_income_o3_county, full = TRUE)
 
 #testing ranking baseline exposure
 all_data_inc$o3_baseline_rank <- rank(all_data_inc$o3_2002)
-mrf_income_o3_baseline <- gam(o3_change ~ score_0.5 + med_income_ranked + o3_baseline_rank + s(GEOID, bs='mrf', k=20, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+mrf_income_o3_baseline <- gam(o3_change ~ score_0.5 + med_income_ranked + o3_baseline_rank + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
 
 summary(mrf_income_o3_baseline)#but with o3, after adding baseline, score_0.5 still sig
 gam.check(mrf_income_o3_baseline) #curve is worse
@@ -337,6 +355,12 @@ mrf_income_no2_baseline <- gam(no2_change ~ score_0.5 + med_income_ranked + no2_
 summary(mrf_income_no2_baseline)
 gam.check(mrf_income_no2_baseline)
 
+mrf_income_no2_15 <- gam(no2_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+summary(mrf_income_no2_15)
+gam.check(mrf_income_no2_15)
+
+
 #ndvi
 mrf_income_ndvi <- gam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
 summary(mrf_income_ndvi)
@@ -348,6 +372,9 @@ mrf_income_ndvi_baseline <- gam(ndvi_change ~ score_0.5 + med_income_ranked + nd
 summary(mrf_income_ndvi_baseline)
 gam.check(mrf_income_ndvi_baseline)
 
+mrf_income_ndvi_15 <- gam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+summary(mrf_income_ndvi_15)
+gam.check(mrf_income_ndvi_15)
 
 #temp
 mrf_income_temp <- gam(mean_temp ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")  #terrible residual plots
@@ -358,10 +385,595 @@ concurvity(mrf_income_temp, full = TRUE)
 
 ```
 
-################################ANALYZE COOK DISTANCE AND RESIDUALS ETC FOR MRF MODELS 
+```{r}
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Method 1: Simply use zero.policy = TRUE (keeping all observations)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(income_pm)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+# Create Moran's I plot
+library(ggplot2)
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Remove NA values if any exist
+moran_df <- na.omit(moran_df)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+
+################################ANALYZE COOK DISTANCE AND RESIDUALS ETC FOR MRF MODELS
+```{r}
+# Calculate Cook's distance
+cooks_d <- cooks.distance(mrf_income_pm)
+plot(cooks_d, type = "h", main = "Cook's Distance")
+abline(h = 4/length(cooks_d), col = "red")  # Rule of thumb threshold
+
+# Identify potential influential points
+influential <- which(cooks_d > 4/length(cooks_d))
+
+influential_data <- all_data_inc[influential, ]
+print(influential_data)  # Look at characteristics of these points
+
+# Investigate why these points are influential:
+# Plot their locations
+plot(all_data_inc_na$long, all_data_inc_na$lat)
+points(all_data_inc_na$long[influential], 
+       all_data_inc_na$lat[influential], 
+       col = "red", pch = 16)
+
+```
+```{r}
+# Plot the smooth effect for GEOID
+plot(mrf_income_pm, select = 1, scale = 0, main = "MRF Smooth for GEOID")
+summary(nb)
+
+```
 
 ################################
 
+```{r}
+
+library(purrr)
+library(ggplot2)
+
+# List of model names
+model_names <- c(
+  "mrf_income_pm", "mrf_income_pm_baseline", "mrf_income_pm_5",
+  "mrf_income_o3", "mrf_income_o3_baseline",
+  "mrf_income_no2", "mrf_income_no2_baseline", "mrf_income_no2_15",
+  "mrf_income_ndvi", "mrf_income_ndvi_baseline", "mrf_income_ndvi_15",
+  "mrf_income_temp"
+)
+
+# Function to calculate Cook's Distance, plot results, and identify influential points
+process_model <- function(model_name) {
+  
+  # Retrieve the model from the global environment using get()
+  model <- get(model_name)
+  
+  # Calculate Cook's Distance
+  cooks_d <- cooks.distance(model)
+  
+  # Plot Cook's Distance with model name in title
+  plot(cooks_d, type = "h", main = paste("Cook's Distance:", model_name))
+  abline(h = 4/length(cooks_d), col = "red")  # Rule of thumb threshold
+  
+  # Identify influential points
+  influential <- which(cooks_d > 4/length(cooks_d))
+  
+  # Retrieve the data for the influential points
+  influential_data <- all_data_inc[influential, ]
+  print(paste("Influential points for", model_name))
+  print(influential_data)  # Look at characteristics of these points
+  
+  # Plot the locations of influential points on the map
+  plot(all_data_inc_na$long, all_data_inc_na$lat,
+       main = paste("Influential Points for", model_name),  # Add model name to the map plot title
+       xlab = "Longitude", ylab = "Latitude")
+  points(all_data_inc_na$long[influential], 
+         all_data_inc_na$lat[influential], 
+         col = "red", pch = 16)
+  
+  return(influential_data)
+}
+
+# Use purrr::map to apply the function to all models
+influential_points_list <- map(model_names, process_model)
+
+# If you want to inspect the influential points for each model, you can print the list
+influential_points_list
+
+```
+trying SLM and SEM models again (no spatial autocorrelation, but linear so qqplots bad)
+```{r}
+
+#### QQ plots with confidence intervals
+get_qq_plot <- function(model) {
+  
+  model_resid <- data.frame(residuals = model$residuals)
+  
+  plot <- ggplot(data = model_resid, mapping = aes(sample = residuals)) + 
+    geom_qq_band(bandType = "ks", mapping = aes(fill = "KS"), alpha = 0.5) +
+    geom_qq_band(bandType = "ts", mapping = aes(fill = "TS"), alpha = 0.5) +
+    geom_qq_band(bandType = "pointwise", mapping = aes(fill = "Normal"), alpha = 0.5) +
+    geom_qq_band(bandType = "boot", mapping = aes(fill = "Bootstrap"), alpha = 0.5) +
+    stat_qq_band() +
+    stat_qq_line() +
+    stat_qq_point()
+  
+  return(plot)
+}
+
+############## SLM and SEM models
+
+vars <- list("pm_change", "o3_change", "no2_change", "ndvi_change", "mean_temp")
+
+# build linear models to test spatial error and spatial lag terms
+pm_lm <- lm(pm_change ~ score_0.5 + med_income_ranked, data = all_data_inc)
+
+# testing spatial error model
+lm.RStests(pm_lm, ny.6, test="RSerr", zero.policy = T) # significant p value
+# testing spatial lag model
+lm.RStests(pm_lm, ny.6, test="RSerr", zero.policy = T) # significant p value
+
+# fit spatial error models
+get_sem <- function(var) {
+  
+  data_sem <- all_data_inc %>% 
+    rename(dv = all_of(var))
+  
+  sem <- errorsarlm(dv ~ score_0.5 + med_income_ranked, data = data_sem, listw = ny.6, zero.policy = TRUE)
+  
+  return(sem)
+}
+
+sem_list <- lapply(vars, get_sem)
+
+# fit spatial lag models
+get_slm <- function(var) {
+  
+  data_slm <- all_data_inc %>% 
+    rename(dv = all_of(var))
+  
+  slm <- lagsarlm(dv ~ score_0.5 + med_income_ranked, data = data_slm, listw = ny.6, zero.policy = TRUE)
+  
+  return(slm)
+}
+
+slm_list <- lapply(vars, get_slm)
+
+# test residuals
+moran_sem <- purrr::map(sem_list, ~ moran.test(.x$residuals, ny.6)) 
+moran_slm <- purrr::map(slm_list, ~ moran.test(.x$residuals, ny.6))
+
+# qq plots
+qq_sem <- lapply(sem_list, get_qq_plot)
+qq_slm <- lapply(slm_list, get_qq_plot)
+
+grid.arrange(qq_sem[[1]], qq_sem[[2]], qq_sem[[3]], qq_sem[[4]], qq_sem[[5]])
+grid.arrange(qq_slm[[1]], qq_slm[[2]], qq_slm[[3]], qq_slm[[4]], qq_slm[[5]])
+
+# stratified SLM
+get_slm_strat <- function(countyfp) {
+  
+  # filter data for county/borough
+  data_borough <- all_data_inc %>% 
+    filter(COUNTYFP %in% countyfp)
+  
+  # list all exposure variables for borough dataset
+  exposures <- list(data_borough$pm_change, data_borough$o3_change, data_borough$no2_change,
+                    data_borough$ndvi_change, data_borough$mean_temp)
+  
+  # identify neighbor relationships
+  spdat.sens_borough <- as_Spatial(data_borough)
+  ny.6_borough <- knearneigh(sp::coordinates(spdat.sens_borough), k=6)
+  ny.6_borough <- knn2nb(ny.6_borough)
+  ny.6_borough <- make.sym.nb(ny.6_borough)
+  ny.6_borough <- nb2listw(ny.6_borough, style="W")
+  
+  get_slm <- function(exposure) {
+    
+    # assign exposure of interest as "var" variable
+    data_borough <- data_borough %>% 
+      mutate(var = exposure)
+    
+    slm <- lagsarlm(var ~ score_0.5 + med_income_ranked, data = data_borough, listw = ny.6_borough, zero.policy = TRUE)
+    
+    return(slm)
+  }
+  
+  models <- lapply(exposures, get_slm)
+  
+  return(models)
+}
+
+countyfp <- list("005", "047", "061", "081", "085")
+
+  # filter data for county/borough
+  data_borough <- all_data_inc %>% 
+    filter(COUNTYFP %in% countyfp)
+  
+  # list all exposure variables for borough dataset
+  exposures <- list(data_borough$pm_change, data_borough$o3_change, data_borough$no2_change,
+                    data_borough$ndvi_change, data_borough$mean_temp)
+  
+ 
+
+slm_strat <- lapply(countyfp, get_slm_strat) %>% 
+  # flatten list of 25 models - PM2.5, O3, NO2, NDVI, temp, for 5 boroughs
+  unlist(recursive = FALSE)
+
+qq_slm_strat <- lapply(slm_strat, get_qq_plot)
+
+# Bronx
+grid.arrange(qq_slm_strat[[1]], qq_slm_strat[[2]], qq_slm_strat[[3]], qq_slm_strat[[4]], qq_slm_strat[[5]])
+# Brooklyn
+grid.arrange(qq_slm_strat[[6]], qq_slm_strat[[7]], qq_slm_strat[[8]], qq_slm_strat[[9]], qq_slm_strat[[10]])
+# Manhattan
+grid.arrange(qq_slm_strat[[11]], qq_slm_strat[[12]], qq_slm_strat[[13]], qq_slm_strat[[14]], qq_slm_strat[[15]])
+# Queens
+grid.arrange(qq_slm_strat[[16]], qq_slm_strat[[17]], qq_slm_strat[[18]], qq_slm_strat[[19]], qq_slm_strat[[20]])
+# Staten Island
+grid.arrange(qq_slm_strat[[21]], qq_slm_strat[[22]], qq_slm_strat[[23]], qq_slm_strat[[24]], qq_slm_strat[[25]])
+
+# stratified SEM
+get_sem_strat <- function(countyfp) {
+  
+  # filter data for county/borough
+  data_borough <- all_data_inc %>% 
+    filter(COUNTYFP %in% countyfp)
+  
+  # list all exposure variables for borough dataset
+  exposures <- list(data_borough$pm_change, data_borough$o3_change, data_borough$no2_change,
+                    data_borough$ndvi_change, data_borough$mean_temp)
+  
+  # identify neighbor relationships
+  spdat.sens_borough <- as_Spatial(data_borough)
+  ny.6_borough <- knearneigh(sp::coordinates(spdat.sens_borough), k=6)
+  ny.6_borough <- knn2nb(ny.6_borough)
+  ny.6_borough <- make.sym.nb(ny.6_borough)
+  ny.6_borough <- nb2listw(ny.6_borough, style="W")
+  
+  get_sem <- function(exposure) {
+    
+    # assign exposure of interest as "var" variable
+    data_borough <- data_borough %>% 
+      mutate(var = exposure)
+    
+    sem <- errorsarlm(var ~ score_0.5 +  + dt_dist, data = data_borough, listw = ny.6_borough, zero.policy = TRUE)
+    
+    return(sem)
+  }
+  
+  models <- lapply(exposures, get_sem)
+  
+  return(models)
+}
+
+sem_strat <- lapply(countyfp, get_sem_strat) %>% 
+  # flatten list of 25 models - PM2.5, O3, NO2, NDVI, temp, for 5 boroughs
+  un(recursive = FALSE)
+
+qq_sem_strat <- lapply(sem_strat, get_qq_plot)
+
+# Bronx
+grid.arrange(qq_sem_strat[[1]], qq_sem_strat[[2]], qq_sem_strat[[3]], qq_sem_strat[[4]], qq_sem_strat[[5]])
+# Brooklyn
+grid.arrange(qq_sem_strat[[6]], qq_sem_strat[[7]], qq_sem_strat[[8]], qq_sem_strat[[9]], qq_sem_strat[[10]])
+# Manhattan
+grid.arrange(qq_sem_strat[[11]], qq_sem_strat[[12]], qq_sem_strat[[13]], qq_sem_strat[[14]], qq_sem_strat[[15]])
+# Queens
+grid.arrange(qq_sem_strat[[16]], qq_sem_strat[[17]], qq_sem_strat[[18]], qq_sem_strat[[19]], qq_sem_strat[[20]])
+# Staten Island
+grid.arrange(qq_sem_strat[[21]], qq_sem_strat[[22]], qq_sem_strat[[23]], qq_sem_strat[[24]], qq_sem_strat[[25]])
+```
+
+```{r}
+# Spatial Error Model with shifted data
+library(spatialreg)
+
+# Find minimum value and shift data to positive
+min_pm <- min(all_data_inc$pm_change)
+shift_value <- abs(min_pm) + 1  # add 1 to ensure all positive values
+pm_shifted <- all_data_inc$pm_change + shift_value
+
+# Create model matrix for initial regression
+X <- model.matrix(~ score_0.5 + med_income_ranked, data = all_data_inc)
+
+# Perform Box-Cox transformation on shifted data
+bc <- boxcox(lm(pm_shifted ~ X - 1), 
+             lambda = seq(-2, 2, by = 0.1),
+             plotit = TRUE)
+lambda <- bc$x[which.max(bc$y)]
+
+# Transform the shifted dependent variable
+if(abs(lambda) < 0.01) {
+    pm_transformed <- log(pm_shifted)
+    transform_type <- "log of shifted data"
+} else {
+    pm_transformed <- (pm_shifted^lambda - 1)/lambda
+    transform_type <- paste("Box-Cox with lambda =", round(lambda, 3), "on shifted data")
+}
+
+# Fit spatial error model
+spatial_error <- errorsarlm(pm_transformed ~ 
+                           score_0.5 + 
+                           med_income_ranked,
+                           data = all_data_inc,
+                           listw = listw,
+                           zero.policy = TRUE)
+
+# Function to back-transform predictions
+back_transform <- function(pred) {
+    if(abs(lambda) < 0.01) {
+        return(exp(pred) - shift_value)
+    } else {
+        return((pred * lambda + 1)^(1/lambda) - shift_value)
+    }
+}
+
+# Check residuals
+residuals_sem <- residuals(spatial_error)
+listw <- nb2listw(nb, style="W", zero.policy=TRUE)
+moran_sem <- moran.test(residuals_sem, listw, zero.policy=TRUE)
+print("SEM Moran's I test:")
+print(moran_sem)
+
+
+# Print summaries
+print("Data transformation details:")
+print(paste("Minimum PM change value:", min_pm))
+print(paste("Shift applied:", shift_value))
+print(paste("Transformation type:", transform_type))
+print("\nSpatial Error Model Summary:")
+print(summary(spatial_error))
+
+# Function for spatial error model diagnostics
+spatial_diagnostics <- function(model, data) {
+    # Extract residuals and fitted values safely
+    resids <- residuals(model)  # Simplified residuals extraction
+    fitted_vals <- fitted(model)
+    
+    par(mfrow=c(2,2))
+    
+    # 1. Residuals vs Fitted
+    plot(fitted_vals, resids,
+         xlab="Fitted values",
+         ylab="Residuals",
+         main="Residuals vs Fitted",
+         type="n")  # Set up empty plot first
+    points(fitted_vals, resids, pch=19)  # Add points
+    abline(h=0, col="red", lty=2)
+    lines(lowess(fitted_vals, resids), col="blue")
+    
+    # 2. Normal Q-Q plot (simplified)
+    qqnorm(resids, main="Normal Q-Q Plot")  # Basic Q-Q plot
+    qqline(resids, col="red")
+    
+    # 3. Scale-Location plot
+    sqrt_abs_resids <- sqrt(abs(resids))
+    plot(fitted_vals, sqrt_abs_resids,
+         xlab="Fitted values",
+         ylab=expression(sqrt("|Standardized residuals|")),
+         main="Scale-Location",
+         type="n")  # Set up empty plot first
+    points(fitted_vals, sqrt_abs_resids, pch=19)  # Add points
+    lines(lowess(fitted_vals, sqrt_abs_resids), col="blue")
+    
+    # 4. Residual distribution plot
+    hist(resids, 
+         main="Distribution of Residuals",
+         xlab="Residuals",
+         breaks=30,
+         probability=TRUE)
+    lines(density(resids), col="blue", lwd=2)
+}
+
+# Generate predictions first
+spatial_preds <- back_transform(fitted(spatial_error))
+
+# Now create all plots
+# Spatial Error model diagnostics
+par(mfrow=c(2,2))
+spatial_diagnostics(spatial_error, all_data_inc)
+mtext("Spatial Error Model Diagnostics", side=3, line=-2, outer=TRUE)
+
+
+# Plot Spatial Error predictions
+plot(all_data_inc$pm_change, spatial_preds,
+     main="Spatial Error: Observed vs Predicted",
+     xlab="Observed", ylab="Predicted",
+     type="n")  # Set up empty plot first
+points(all_data_inc$pm_change, spatial_preds, pch=19)  # Add points
+abline(0,1, col="red")
+lines(lowess(all_data_inc$pm_change, spatial_preds), col="blue")
+
+# Reset plotting parameters
+par(mfrow=c(1,1))
+
+# Print some summary statistics of the predictions
+cat("\nSummary of Spatial Error predictions:\n")
+print(summary(spatial_preds))
+```
+###############################
+######################LOOK AT QQ PLOTS FOR SEM MODELS (RN JUST THE NORMAL MODEL QQPLOT BEFORE SEM)
+```{r}
+# Function to perform spatial error analysis with Box-Cox transformation
+spatial_error_analysis <- function(var_name, data, listw) {
+    dependent_var <- data[[var_name]]
+    
+    # Find minimum value and shift data to positive
+    min_val <- min(dependent_var)
+    shift_value <- abs(min_val) + 1  # add 1 to ensure all positive values
+    shifted_data <- dependent_var + shift_value
+    
+    # Create temporary data frame for Box-Cox
+    temp_data <- data.frame(
+        y = shifted_data,
+        score_0.5 = data$score_0.5,
+        med_income_ranked = data$med_income_ranked
+    )
+    
+    # Perform Box-Cox transformation on shifted data
+    bc <- boxcox(y ~ score_0.5 + med_income_ranked, 
+                 data = temp_data,
+                 lambda = seq(-2, 2, by = 0.1),
+                 plotit = FALSE)
+    lambda <- bc$x[which.max(bc$y)]
+    
+    # Transform the shifted dependent variable
+    if(abs(lambda) < 0.01) {
+        transformed_data <- log(shifted_data)
+        transform_type <- "log of shifted data"
+    } else {
+        transformed_data <- (shifted_data^lambda - 1)/lambda
+        transform_type <- paste("Box-Cox with lambda =", round(lambda, 3), "on shifted data")
+    }
+    
+    # Create data frame with transformed response
+    model_data <- data
+    model_data$transformed_response <- transformed_data
+    
+    # Fit spatial error model
+    spatial_error <- errorsarlm(transformed_response ~ score_0.5 + med_income_ranked,
+                               data = model_data,
+                               listw = listw,
+                               zero.policy = TRUE)
+    
+    # Calculate residuals and perform Moran's I test
+    residuals_sem <- residuals(spatial_error)
+    moran_sem <- moran.test(residuals_sem, listw, zero.policy=TRUE)
+    
+    # Back-transform predictions
+    if(abs(lambda) < 0.01) {
+        predictions <- exp(fitted(spatial_error)) - shift_value
+    } else {
+        predictions <- (fitted(spatial_error) * lambda + 1)^(1/lambda) - shift_value
+    }
+    
+    # Create diagnostic plots
+    par(mfrow=c(2,2))
+    
+    # Residuals vs Fitted
+    plot(fitted(spatial_error), residuals_sem,
+         xlab="Fitted values", ylab="Residuals",
+         main="Residuals vs Fitted")
+    abline(h=0, col="red", lty=2)
+    lines(lowess(fitted(spatial_error), residuals_sem), col="blue")
+    
+    # Normal Q-Q plot
+    qqnorm(residuals_sem)
+    qqline(residuals_sem, col="red")
+    
+    # Scale-Location plot
+    sqrt_abs_resids <- sqrt(abs(residuals_sem))
+    plot(fitted(spatial_error), sqrt_abs_resids,
+         xlab="Fitted values",
+         ylab=expression(sqrt("|Standardized residuals|")),
+         main="Scale-Location")
+    lines(lowess(fitted(spatial_error), sqrt_abs_resids), col="blue")
+    
+    # Residual distribution
+    hist(residuals_sem, 
+         main="Distribution of Residuals",
+         xlab="Residuals",
+         breaks=30,
+         probability=TRUE)
+    lines(density(residuals_sem), col="blue", lwd=2)
+    
+    # Results list
+    results <- list(
+        model = spatial_error,
+        predictions = predictions,
+        moran_test = moran_sem,
+        transform_info = list(
+            min_value = min_val,
+            shift_value = shift_value,
+            lambda = lambda,
+            transform_type = transform_type
+        )
+    )
+    
+    return(results)
+}
+
+# Make sure required packages are loaded
+library(spatialreg)
+library(MASS)  # for boxcox function
+
+# Run analysis for each variable
+variables <- c("pm_change", "o3_change", "no2_change", "ndvi_change", "mean_temp")
+results_list <- list()
+
+for(var in variables) {
+    cat("\n\n=== Analysis for", var, "===\n")
+    
+    # Run analysis
+    results_list[[var]] <- spatial_error_analysis(
+        var_name = var,
+        data = all_data_inc,
+        listw = listw
+    )
+    
+    # Print summaries
+    cat("\nTransformation details:\n")
+    print(results_list[[var]]$transform_info)
+    cat("\nModel Summary:\n")
+    print(summary(results_list[[var]]$model))
+    cat("\nMoran's I test for residuals:\n")
+    print(results_list[[var]]$moran_test)
+    
+    # Add title to current plot
+    mtext(paste("Diagnostic Plots for", var), side=3, line=-2, outer=TRUE)
+    
+    # Create observed vs predicted plot
+    par(mfrow=c(1,1))
+    plot(all_data_inc[[var]], results_list[[var]]$predictions,
+         main=paste(var, ": Observed vs Predicted"),
+         xlab="Observed", ylab="Predicted")
+    abline(0,1, col="red")
+    lines(lowess(all_data_inc[[var]], results_list[[var]]$predictions), col="blue")
+}
+
+# Reset plotting parameters
+par(mfrow=c(1,1))
+```
+
+################################################
+#################################################
 Create model functions (NEW FOR MRF ONLY)
 ```{r}
 # Create exposure list
