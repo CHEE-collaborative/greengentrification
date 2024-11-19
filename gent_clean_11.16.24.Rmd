@@ -230,7 +230,9 @@ all_data_inc <- all_data %>%
   mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
   mutate(COUNTYFP10 = factor(COUNTYFP10))
 
-# 
+#ranking median income for use in GAM models
+all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)
+
 # #temporary df using med_income_2000, removing missing tracts
 # all_data_inc_na <- na.omit(all_data_inc)
 
@@ -378,18 +380,612 @@ all_data_inc <- all_data_inc %>%
 
 ################################# try mrf_income first to test k and concurvity with county
 
-
+Neighbor relationships for MRF smooth model
 ```{r}
+# Establish neighbor relationships for MRF model
 nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
 names(nb) <- attr(nb, "region.id") 
+```
 
-#ranking median income (can't do it directly in gam formula?)
-all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)  
+PM2.5 MRF smooth model
+```{r}
+mrf_income_pm <- gam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #changing the k, whether or not income has a spline/log/nothing affects sig of score_0.5; k needs to be at least 15 for residuals etc to be okay (k=15 highest sig but maybe not best diagnostic plots); k needs to be at least ~400 for Moran's I to be insignificant
 
+summary(mrf_income_pm)
+gam.check(mrf_income_pm)
+concurvity(mrf_income_pm, full = TRUE)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_pm)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+# Create Moran's I plot
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+
+```
+O3 MRF smooth model
+```{r}
+mrf_income_o3 <- gam(o3_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #when k is upped to 450, it takes too long to run
+
+summary(mrf_income_o3)
+gam.check(mrf_income_o3)
+concurvity(mrf_income_o3, full = TRUE)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_o3)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+# Create Moran's I plot
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+NO2 MRF smooth model
+```{r}
+mrf_income_no2 <- gam(no2_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #at k=5 is significant but residuals weird, when k increases, residuals and stuff still patterned-ish but better overall and no longer sig
+summary(mrf_income_no2)
+gam.check(mrf_income_no2)
+concurvity(mrf_income_no2, full = TRUE)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_no2)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+# Create Moran's I plot
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+
+NDVI MRF smooth model
+```{r}
+mrf_income_ndvi <- gam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+summary(mrf_income_ndvi)
+gam.check(mrf_income_ndvi)
+concurvity(mrf_income_ndvi, full = TRUE) #K NEEDS TO BE 300 FOR MORANS I TO BE INSIGNIFICANT
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_ndvi)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+# Create Moran's I plot
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+
+2016 Mean Temp MRF smooth model
+```{r}
+mrf_income_temp <- gam(mean_temp ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")  #terrible residual plots
+summary(mrf_income_temp)
+gam.check(mrf_income_temp)
+concurvity(mrf_income_temp, full = TRUE)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_ndvi)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+# Create Moran's I plot
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+Creating composite z-score
+```{r}
+# Calculate z-scores for each variable
+all_data_inc$pm_z <- scale(all_data_inc$pm_change)
+all_data_inc$o3_z <- scale(all_data_inc$o3_change)
+all_data_inc$no2_z <- scale(all_data_inc$no2_change)
+all_data_inc$ndvi_z <- scale(all_data_inc$ndvi_change)
+all_data_inc$temp_z <- scale(all_data_inc$mean_temp)
+
+# Create composite z-score (average of all z-scores)
+all_data_inc$composite_z <- rowMeans(
+  cbind(
+    all_data_inc$pm_z,
+    all_data_inc$o3_z,
+    all_data_inc$no2_z,
+    all_data_inc$ndvi_z,
+    all_data_inc$temp_z
+  ),
+  na.rm = TRUE
+)
+
+# Create new GAM model with composite z-score
+mrf_income_composite <- gam(
+  composite_z ~ score_0.5 + med_income_ranked + 
+    s(GEOID, bs='mrf', k=100, xt=list(nb=nb)),
+  family = scat,
+  data = all_data_inc,
+  method = "REML"
+) #sig when k = 100 but Moran's I is 0.265, insig when k = 300, Moran's I is 0.074 but p is sig
+ 
+summary(mrf_income_composite)
+gam.check(mrf_income_composite)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_composite)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+# Create Moran's I plot
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+
+```
+
+Testing k vs Moran's I for MRF composite model
+```{r}
+# Function to get number of unique locations
+n_locations <- length(unique(all_data_inc$GEOID))
+
+# Calculate minimum suggested k
+k_min <- ceiling(n_locations^(1/3))  # cube root rule of thumb
+
+# Define sequence of k values to test
+k_values <- seq(k_min, 350, by = 50)
+
+# Function to run k.check for multiple k values
+test_k_values <- function(data, k_values) {
+  results <- data.frame(
+    k = numeric(),
+    edf = numeric(),
+    k_index = numeric(),
+    p_value = numeric(),
+    gcv = numeric()
+  )
+  
+  for(k in k_values) {
+    cat(sprintf("\nTesting k = %d\n", k))
+    
+    # Fit model with current k
+    tryCatch({
+      test_model <- gam(
+        composite_z ~ score_0.5 + med_income_ranked + 
+          s(GEOID, bs='mrf', k=k, xt=list(nb=nb)),
+        family = scat,
+        data = data,
+        method = "REML"
+      )
+      
+      # Extract model summary
+      model_summary <- summary(test_model)
+      
+      # Get basic diagnostics that don't depend on gam.check
+      new_row <- data.frame(
+        k = k,
+        edf = sum(model_summary$edf),
+        k_index = NA,  # Will be filled if gam.check works
+        p_value = NA,  # Will be filled if gam.check works
+        gcv = test_model$gcv.ubre
+      )
+      
+      # Try to get gam.check results
+      tryCatch({
+        check <- gam.check(test_model)
+        new_row$k_index <- check$k.index
+        new_row$p_value <- check$s.table[4]
+      }, error = function(e) {
+        cat(sprintf("Warning: Could not compute gam.check for k=%d\n", k))
+      })
+      
+      results <- rbind(results, new_row)
+      
+    }, error = function(e) {
+      cat(sprintf("Error fitting model for k=%d: %s\n", k, e$message))
+    })
+  }
+  return(results)
+}
+
+# Print minimum suggested k
+cat(sprintf("Minimum suggested k based on number of locations: %d\n", k_min))
+
+# Test k values
+k_results <- test_k_values(all_data_inc, k_values)
+
+# Print results
+print(k_results)
+
+# Plot available results
+par(mfrow=c(2,2))
+
+# Only plot if we have results
+if(nrow(k_results) > 0) {
+  # P-value plot (if available)
+  if(!all(is.na(k_results$p_value))) {
+    plot(k_results$k, k_results$p_value, type="b", 
+         main="P-value vs k", xlab="k", ylab="p-value")
+  }
+  
+  # GCV plot
+  plot(k_results$k, k_results$gcv, type="b", 
+       main="GCV Score vs k", xlab="k", ylab="GCV")
+  
+  # EDF plot
+  plot(k_results$k, k_results$edf, type="b", 
+       main="EDF vs k", xlab="k", ylab="Effective Degrees of Freedom")
+  
+  # k-index plot (if available)
+  if(!all(is.na(k_results$k_index))) {
+    plot(k_results$k, k_results$k_index, type="b", 
+         main="k-index vs k", xlab="k", ylab="k-index")
+  }
+}
+
+# Function to get Moran's I for model residuals
+check_spatial_autocorr <- function(model, nb) {
+  residuals <- residuals(model)
+  moran_test <- spdep::moran.test(residuals, 
+                                 spdep::nb2listw(nb, zero.policy=TRUE),
+                                 zero.policy=TRUE)
+  return(c(
+    moran_i = moran_test$estimate[1],
+    p_value = moran_test$p.value
+  ))
+}
+
+# First, let's check which areas have no neighbors
+n_neighbors <- sapply(nb, length)
+isolated_areas <- which(n_neighbors == 0)
+if(length(isolated_areas) > 0) {
+  cat("Areas with no neighbors:\n")
+  print(isolated_areas)
+}
+
+# Function to get Moran's I for model residuals
+check_spatial_autocorr <- function(model, nb) {
+  residuals <- residuals(model)
+  moran_test <- spdep::moran.test(residuals, 
+                                 spdep::nb2listw(nb, zero.policy=TRUE),
+                                 zero.policy=TRUE)
+  return(moran_test)  # Return the full test object
+}
+
+# Calculate Moran's I for raw composite z-score
+raw_moran <- spdep::moran.test(all_data_inc$composite_z, 
+                              spdep::nb2listw(nb, zero.policy=TRUE),
+                              zero.policy=TRUE)
+cat(sprintf("\nRaw data Moran's I:\n"))
+cat(sprintf("Moran's I statistic: %.3f\n", raw_moran$estimate["Moran I statistic"]))
+cat(sprintf("p-value: %.3e\n", raw_moran$p.value))
+
+# Test k values and check both model fit and spatial autocorrelation
+test_k_values <- function(data, k_values, raw_moran) {
+  results <- data.frame()
+  
+  # Store raw Moran's I value
+  raw_moran_i <- raw_moran$estimate["Moran I statistic"]
+  
+  for(k in k_values) {
+    cat(sprintf("\nTesting k = %d\n", k))
+    
+    # Fit model
+    test_model <- gam(
+      composite_z ~ score_0.5 + med_income_ranked + 
+        s(GEOID, bs='mrf', k=k, xt=list(nb=nb)),
+      family = scat,
+      data = data,
+      method = "REML"
+    )
+    
+    # Get model summary
+    model_summary <- summary(test_model)
+    
+    # Get Moran's I results
+    moran_results <- check_spatial_autocorr(test_model, nb)
+    residual_moran_i <- moran_results$estimate["Moran I statistic"]
+    
+    # Calculate reduction in Moran's I
+    moran_reduction <- ((raw_moran_i - residual_moran_i) / abs(raw_moran_i)) * 100
+    
+    # Store results
+    results <- rbind(results,
+      data.frame(
+        k = k,
+        edf = sum(model_summary$edf),
+        score = test_model$gcv.ubre,
+        moran_i = residual_moran_i,
+        moran_p = moran_results$p.value,
+        moran_reduction = moran_reduction
+      )
+    )
+    
+    # Print current results
+    cat(sprintf("EDF: %.1f\n", sum(model_summary$edf)))
+    cat(sprintf("Score: %.3f\n", test_model$gcv.ubre))
+    cat(sprintf("Residual Moran's I: %.3f (p=%.3e)\n", 
+                residual_moran_i, moran_results$p.value))
+    cat(sprintf("Reduction in Moran's I: %.1f%%\n", moran_reduction))
+  }
+  return(results)
+}
+
+# Test reasonable k values
+k_values <- c(113, 163, 213, 263)
+k_results <- test_k_values(all_data_inc, k_values, raw_moran)
+
+# Print final comparison table
+cat("\nSummary Results:\n")
+print(data.frame(
+  k = k_results$k,
+  EDF = round(k_results$edf, 1),
+  Score = round(k_results$score, 3),
+  Morans_I = round(k_results$moran_i, 3),
+  Moran_p = format(k_results$moran_p, scientific = TRUE),
+  Reduction = sprintf("%.1f%%", k_results$moran_reduction)
+))
+
+# Plot results
+par(mfrow=c(2,3))
+
+# Score vs k
+plot(k_results$k, k_results$score, type="b", 
+     main="Score vs k", xlab="k", ylab="Score")
+
+# EDF vs k
+plot(k_results$k, k_results$edf, type="b", 
+     main="EDF vs k", xlab="k", ylab="Effective Degrees of Freedom")
+
+# Moran's I vs k
+plot(k_results$k, k_results$moran_i, type="b", 
+     main="Moran's I vs k", xlab="k", ylab="Moran's I")
+abline(h=raw_moran$estimate["Moran I statistic"], col="red", lty=2)
+text(k_values[1], raw_moran$estimate["Moran I statistic"], 
+     "Raw Data Moran's I", pos=3, col="red")
+
+# Moran's p-value vs k
+plot(k_results$k, k_results$moran_p, type="b", 
+     main="Moran's I p-value vs k", xlab="k", ylab="p-value")
+abline(h=0.05, col="red", lty=2)
+
+# Reduction in Moran's I
+plot(k_results$k, k_results$moran_reduction, type="b",
+     main="% Reduction in Moran's I",
+     xlab="k", 
+     ylab="Percent Reduction")
+```
+```{r}
+hurricane <- st_read(here("data", "hurricane_evacuation_zones.shp"))
+
+mrf_income_composite_residuals <- residuals(mrf_income_composite)
+
+aov_result <- aov(mrf_income_composite_residuals ~ hurricane_, data = hurricane)
+
+
+#probably need to separate out the hurricane polygons - give each tract a score - then do residual analysis
+```
+
+```{r}
+```
+
+```{r}
+```
+
+#########################################
+########################################
+code scraps for mrf smooth
+```{r}
 #testing ranking baseline exposure
 all_data_inc$pm_baseline_rank <- rank(all_data_inc$pm_2002)
-
-mrf_income_pm <- gam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #changing the k, whether or not income has a spline/log/nothing affects sig of score_0.5; k needs to be at least 15 for residuals etc to be okay (k=15 highest sig but maybe not best diagnostic plots)
 
 mrf_income_pm_county <- gam(pm_change ~ score_0.5 + med_income_ranked + s(COUNTYFP10, bs='re')+ s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
 summary(mrf_income_pm_county)
@@ -398,10 +994,6 @@ gam.check(mrf_income_pm_county)
 mrf_income_pm_baseline <- gam(pm_change ~ score_0.5 + med_income_ranked +pm_baseline_rank + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
 
 mrf_income_pm_flood <- gam(pm_change ~ score_0.5 + med_income_ranked + flood_hazard + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #K=400, NO LONGER HAS SPATIAL AUTOCORRELATION.
-
-summary(mrf_income_pm)
-gam.check(mrf_income_pm)
-concurvity(mrf_income_pm, full = TRUE)
 
 summary(mrf_income_pm_flood)
 gam.check(mrf_income_pm_flood)
@@ -423,7 +1015,6 @@ mrf_income_pm_county_dt_300 <- gam(pm_change ~ score_0.5 + med_income_ranked + s
 
 
 #ozone
-
 mrf_income_o3 <- gam(o3_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
 
 mrf_income_o3_flood_hazard <- gam(o3_change ~ score_0.5 + med_income_ranked + flood_hazard + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
@@ -431,9 +1022,7 @@ mrf_income_o3_flood_hazard <- gam(o3_change ~ score_0.5 + med_income_ranked + fl
 
 mrf_income_o3_county <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs='re') + med_income_ranked + s(GEOID, bs='mrf', k=15, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
 
-summary(mrf_income_o3)
-gam.check(mrf_income_o3)
-concurvity(mrf_income_o3, full = TRUE)
+
 summary(mrf_income_o3_flood_hazard)
 gam.check(mrf_income_o3_flood_hazard)
 
@@ -451,11 +1040,6 @@ gam.check(mrf_income_o3_baseline) #curve is worse
 concurvity(mrf_income_o3, full = TRUE)
 
 
-#no2
-mrf_income_no2 <- gam(no2_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") #at k=5 is significant but residuals weird, when k increases, residuals and stuff still patterned-ish but better overall and no longer sig
-summary(mrf_income_no2)
-gam.check(mrf_income_no2)
-concurvity(mrf_income_no2, full = TRUE)
 
 all_data_inc$no2_baseline_rank <- rank(all_data_inc$no2_2000)
 
@@ -471,11 +1055,6 @@ gam.check(mrf_income_no2_15)
 
 
 #ndvi
-mrf_income_ndvi <- gam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
-summary(mrf_income_ndvi)
-gam.check(mrf_income_ndvi)
-concurvity(mrf_income_ndvi, full = TRUE) #K NEEDS TO BE 300 FOR MORANS I TO BE INSIGNIFICANT
-
 
 all_data_inc$ndvi_baseline_rank <- rank(all_data_inc$ndvi_2000)
 mrf_income_ndvi_baseline <- gam(ndvi_change ~ score_0.5 + med_income_ranked + ndvi_baseline_rank + s(GEOID, bs='mrf', k=5, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
@@ -486,11 +1065,6 @@ mrf_income_ndvi_15 <- gam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID,
 summary(mrf_income_ndvi_15)
 gam.check(mrf_income_ndvi_15)
 
-#temp
-mrf_income_temp <- gam(mean_temp ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")  #terrible residual plots
-summary(mrf_income_temp)
-gam.check(mrf_income_temp)
-concurvity(mrf_income_temp, full = TRUE)
 
 ```
 
