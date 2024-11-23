@@ -673,10 +673,20 @@ all_data_inc$composite_z <- rowMeans(
   na.rm = TRUE
 )
 
+summary(all_data_inc$composite_z)
+hist(all_data_inc$composite_z)
+shapiro.test(all_data_inc$composite_z)
+
+qqnorm(all_data_inc$composite_z)
+
+
+```
+
+```{r}
 # Create new GAM model with composite z-score
-mrf_income_composite <- gam(
+mrf_income_composite <- bam(
   composite_z ~ score_0.5 + med_income_ranked + 
-    s(GEOID, bs='mrf', k=100, xt=list(nb=nb)),
+    s(GEOID, bs='mrf', k=563, xt=list(nb=nb)),
   family = scat,
   data = all_data_inc,
   method = "REML"
@@ -741,7 +751,7 @@ n_locations <- length(unique(all_data_inc$GEOID))
 k_min <- ceiling(n_locations^(1/3))  # cube root rule of thumb
 
 # Define sequence of k values to test
-k_values <- seq(k_min, 350, by = 50)
+k_values <- seq(k_min, 500, by = 50)
 
 # Function to run k.check for multiple k values
 test_k_values <- function(data, k_values) {
@@ -758,7 +768,7 @@ test_k_values <- function(data, k_values) {
     
     # Fit model with current k
     tryCatch({
-      test_model <- gam(
+      test_model <- bam(
         composite_z ~ score_0.5 + med_income_ranked + 
           s(GEOID, bs='mrf', k=k, xt=list(nb=nb)),
         family = scat,
@@ -920,8 +930,11 @@ test_k_values <- function(data, k_values, raw_moran) {
 }
 
 # Test reasonable k values
-k_values <- c(113, 163, 213, 263)
+k_values <- c(113, 163, 213, 263, 313, 363, 413, 463, 513, 563)
+k_values_2 <- c(613, 663, 713, 763, 813)
 k_results <- test_k_values(all_data_inc, k_values, raw_moran)
+k_results_2 <- test_k_values(all_data_inc, k_values_2, raw_moran)
+
 
 # Print final comparison table
 cat("\nSummary Results:\n")
@@ -963,15 +976,160 @@ plot(k_results$k, k_results$moran_reduction, type="b",
      xlab="k", 
      ylab="Percent Reduction")
 ```
+
+Hurricane evacuation zones
 ```{r}
-hurricane <- st_read(here("data", "hurricane_evacuation_zones.shp"))
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(spdep)
+library(mgcv)
 
-mrf_income_composite_residuals <- residuals(mrf_income_composite)
+# 1. Extract residuals and prepare data
+all_data_inc$mrf_residuals <- residuals(mrf_income_composite)
 
-aov_result <- aov(mrf_income_composite_residuals ~ hurricane_, data = hurricane)
+# Clean geometries
+hurricane_clean <- hurricane %>%
+  st_make_valid() %>%
+  st_buffer(0) %>%
+  st_transform(st_crs(all_data_inc))
 
+all_data_inc_clean <- all_data_inc %>%
+  st_make_valid() %>%
+  st_buffer(0)
 
-#probably need to separate out the hurricane polygons - give each tract a score - then do residual analysis
+# 2. Use centroids for spatial join
+tract_centroids <- all_data_inc_clean %>%
+  st_centroid() %>%
+  select(GEOID, mrf_residuals)
+
+# Spatial join with hurricane zones
+combined_data <- st_join(
+  tract_centroids,
+  hurricane_clean %>% select(hurricane_),
+  join = st_intersects
+) %>%
+  filter(!is.na(hurricane_))
+
+# 3. Statistical Analysis
+
+# ANOVA test
+anova_result <- aov(mrf_residuals ~ hurricane_, data = combined_data)
+anova_summary <- summary(anova_result)
+
+# Kruskal-Wallis test
+kw_result <- kruskal.test(mrf_residuals ~ hurricane_, data = combined_data)
+
+# Summary statistics by zone - fixed version
+zone_summary <- combined_data %>%
+  st_drop_geometry() %>%
+  group_by(hurricane_) %>%
+  summarise(
+    count = length(mrf_residuals),
+    mean_residual = mean(mrf_residuals, na.rm = TRUE),
+    median_residual = median(mrf_residuals, na.rm = TRUE),
+    sd_residual = sd(mrf_residuals, na.rm = TRUE),
+    extreme_count = sum(abs(mrf_residuals) > 2*sd(mrf_residuals, na.rm = TRUE), na.rm = TRUE)
+  ) %>%
+  mutate(
+    extreme_percentage = (extreme_count / count) * 100
+  )
+
+# 4. Visualization
+
+# Box plot
+residual_plot <- ggplot(combined_data %>% st_drop_geometry(), 
+                       aes(x = factor(hurricane_), y = mrf_residuals)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  theme_minimal() +
+  labs(
+    title = "MRF Model Residuals by Hurricane Evacuation Zone",
+    x = "Hurricane Zone",
+    y = "Residuals"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Spatial visualization
+viz_data <- all_data_inc_clean %>%
+  left_join(
+    combined_data %>% 
+      st_drop_geometry() %>%
+      select(GEOID, hurricane_),
+    by = "GEOID"
+  )
+
+spatial_plot <- ggplot() +
+  geom_sf(data = viz_data, aes(fill = hurricane_)) +
+  scale_fill_viridis_d(na.value = "grey80") +
+  theme_minimal() +
+  labs(
+    title = "Hurricane Evacuation Zones with MRF Model Residuals",
+    fill = "Hurricane Zone"
+  )
+
+# Enhanced scatter plot with mean lines
+scatter_plot <- ggplot(combined_data %>% st_drop_geometry(), 
+                      aes(x = factor(hurricane_), y = mrf_residuals)) +
+  geom_jitter(alpha = 0.5, width = 0.2) +
+  stat_summary(fun = mean, geom = "point", color = "red", size = 3) +
+  stat_summary(fun = mean, geom = "line", color = "red", group = 1) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +
+  theme_minimal() +
+  labs(
+    title = "Residuals Distribution by Hurricane Zone",
+    subtitle = "Red points and line show mean values",
+    x = "Hurricane Zone",
+    y = "Residuals"
+  )
+
+# 5. Additional Statistical Analysis
+
+# Test for normality within each zone
+normality_tests <- combined_data %>%
+  st_drop_geometry() %>%
+  group_by(hurricane_) %>%
+  summarise(
+    sample_size = length(mrf_residuals),
+    shapiro_p_value = if(length(mrf_residuals) >= 3 && 
+                        length(mrf_residuals) <= 5000) {
+      shapiro.test(mrf_residuals)$p.value
+    } else {
+      NA
+    }
+  )
+
+# Print results
+cat("\nSummary Statistics by Hurricane Zone:\n")
+print(zone_summary)
+
+cat("\nANOVA Results:\n")
+print(anova_summary)
+
+cat("\nKruskal-Wallis Test Results:\n")
+print(kw_result)
+
+cat("\nNormality Test Results by Zone:\n")
+print(normality_tests)
+
+# Calculate effect size (Eta-squared)
+ss_total <- sum((combined_data$mrf_residuals - mean(combined_data$mrf_residuals))^2)
+eta_squared <- anova_summary[[1]]$"Sum Sq"[1] / ss_total
+
+cat("\nEffect Size (Eta-squared):", round(eta_squared, 4), "\n")
+
+# Display plots
+print(residual_plot)
+print(spatial_plot)
+print(scatter_plot)
+
+# Store all results in a list
+results <- list(
+  summary_stats = zone_summary,
+  anova_results = anova_summary,
+  kruskal_wallis = kw_result,
+  normality_tests = normality_tests,
+  effect_size = eta_squared
+)
 ```
 
 ```{r}
@@ -1138,6 +1296,7 @@ points(all_data_inc_na$long[influential],
        col = "red", pch = 16)
 
 ```
+
 ```{r}
 # Plot the smooth effect for GEOID
 plot(mrf_income_pm, select = 1, scale = 0, main = "MRF Smooth for GEOID")
