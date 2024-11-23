@@ -1133,6 +1133,63 @@ results <- list(
 ```
 
 ```{r}
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(rstatix)
+library(dunn.test)
+library(effsize)
+
+# Perform pairwise t-tests with multiple comparison adjustment
+pairwise_tests <- pairwise.t.test(
+  combined_data$mrf_residuals,
+  combined_data$hurricane_,
+  p.adjust.method = "bonferroni"
+)
+
+pairwise_tests
+
+# Perform Dunn test (non-parametric alternative)
+dunn_test <- dunn.test(
+  combined_data$mrf_residuals,
+  combined_data$hurricane_,
+  method = "bonferroni"
+)
+
+# Create pairwise comparison visualization using ggplot2
+# Convert matrix to long format for plotting
+p_value_matrix <- as.matrix(pairwise_tests$p.value)
+p_value_df <- as.data.frame(p_value_matrix) %>%
+  mutate(group1 = rownames(.)) %>%
+  pivot_longer(
+    cols = -group1,
+    names_to = "group2",
+    values_to = "p_value"
+  ) %>%
+  filter(!is.na(p_value))
+
+# Create heatmap
+ggplot(p_value_df, aes(x = group1, y = group2, fill = -log10(p_value))) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", p_value)), size = 3) +
+  scale_fill_gradient2(
+    low = "white",
+    high = "red",
+    mid = "pink",
+    midpoint = -log10(0.05),
+    name = "-log10(p-value)"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Pairwise Comparisons of Hurricane Zone Residuals",
+    subtitle = "Bonferroni-adjusted p-values",
+    x = "Zone",
+    y = "Zone"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#interpret???
 ```
 
 ```{r}
