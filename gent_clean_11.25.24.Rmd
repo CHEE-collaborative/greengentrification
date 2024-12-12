@@ -34,6 +34,8 @@ library(spatialreg) # for spatial lag and error models
 library(gridExtra) # for viewing plots side-by-side
 library(qgam) 
 library(dplyr)
+library(INLA)
+library(ggregplot) #INLA compatible plotting library
 ```
 
 Load and clean data
@@ -284,14 +286,72 @@ all_data_inc$dt_dist <- as.numeric(distances)
 ```
 INLA
 ```{r}
-# # Set INLA repository 
+# # Set INLA repository
 # options(repos = c(getOption("repos"),
 #    INLA="https://inla.r-inla-download.org/R/stable"))
 # 
 # # Install INLA and dependencies (from CRAN)
 # install.packages("INLA", dep = TRUE)
 
-library(INLA)
+#need older version of INLA to be compatible with R version
+ # remotes::install_version("INLA", version="22.05.07",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/testing"), dep=TRUE)
+
+# Install an even older version of INLA for GLIBC compatibility
+
+# remotes::install_version("INLA", 
+#                          version="21.02.23", 
+#                          repos=c(getOption("repos"),
+#                                  INLA="https://inla.r-inla-download.org/R/stable"), 
+#                          dep=TRUE)
+
+
+######INLA PM2.5 MODELS #####
+IM_pm_1  <- inla(pm_change ~ score_0.5 + med_income_ranked,
+               family = "gaussian", 
+               data = all_data_inc, verbose = TRUE) 
+
+IM_pm_2 <- inla(pm_change ~ score_0.5 + med_income_ranked + f(COUNTYFP10, model = "iid"),
+                family = "gaussian", 
+                data = all_data_inc, verbose = TRUE)
+
+IM_pm_3 <- inla(pm_change ~ score_0.5 + med_income_ranked + f(COUNTYFP10, model = "iid") + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+IM_pm_4 <- inla(pm_change ~ score_0.5 + med_income_ranked + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+IM_pm_5 <- inla(pm_change ~ score_0.5, family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+IM_pm_6 <- inla(pm_change ~ score_0.5 + f(COUNTYFP10, model = "iid"), family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+
+# plotting INLA 2.5 models
+Efxplot(list(IM_pm_1, IM_pm_2, IM_pm_3, IM_pm_4, IM_pm_5, IM_pm_6))
+
+############SPATIAL ANALYSIS#############
+
+# Create mesh using tract centroids
+Locations <- as.matrix(cbind(
+  as.numeric(nyc_weighted_centroids$Longitude_weighted),
+  as.numeric(nyc_weighted_centroids$Latitude_weighted)
+))
+
+#not sure if specifying it correctly
+mesh <- inla.mesh.2d(
+  loc = Locations,
+  max.edge = c(5, 10),  # Adjust based on data's spatial scale
+  cutoff = 1,           # Minimum distance between points
+  offset = c(5, 10)     # Boundary extension
+)
+#what about jitter
+
+# Visualize
+plot(mesh)
+plot(nyc_tracts$geometry, add = TRUE)
+points(Locations, col = "red", pch = 19)
+
+
+#Convert mesh to stack
+
+#Add mesh to model
 ```
 
 Neighbor relationships for MRF smooth model
