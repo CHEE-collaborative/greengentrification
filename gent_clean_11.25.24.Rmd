@@ -36,6 +36,7 @@ library(qgam)
 library(dplyr)
 library(INLA)
 library(ggregplot) #INLA compatible plotting library
+library(ggfields) # for plotting spatial field
 ```
 
 Load and clean data
@@ -325,10 +326,14 @@ IM_pm_6 <- inla(pm_change ~ score_0.5 + f(COUNTYFP10, model = "iid"), family = "
 
 # plotting INLA 2.5 models
 Efxplot(list(IM_pm_1, IM_pm_2, IM_pm_3, IM_pm_4, IM_pm_5, IM_pm_6))
+```
+
+```{r}
 
 ############SPATIAL ANALYSIS#############
 
 # Create mesh using tract centroids
+
 Locations <- as.matrix(cbind(
   as.numeric(nyc_weighted_centroids$Longitude_weighted),
   as.numeric(nyc_weighted_centroids$Latitude_weighted)
@@ -343,16 +348,108 @@ mesh <- inla.mesh.2d(
 )
 #what about jitter
 
+MeshA <- inla.mesh.2d(jitter(Locations), max.edge = c(20, 40))
+MeshB <- inla.mesh.2d(Locations, max.edge = c(20, 40))
+MeshC <- inla.mesh.2d(Locations, max.edge = c(10, 20))
+
 # Visualize
 plot(mesh)
 plot(nyc_tracts$geometry, add = TRUE)
 points(Locations, col = "red", pch = 19)
 
+plot(MeshA)
+points(Locations, col = "red", pch = 2)
 
-#Convert mesh to stack
+plot(MeshB)
+points(Locations, col = "red", pch = 2)
 
-#Add mesh to model
+plot(MeshC)
+points(Locations, col = "red", pch = 2)
+
+
+# "Generally, the mesh function automatically creates a mesh like mesh A, where closer-together sampling locations produce smaller triangles. The sampling locations in this dataset are so evenly spaced that I had to jitter them to show this in mesh A. When exploring/setting up preliminary analyses, use a mesh like mesh B. for analyses to be reported in a paper, use a mesh like mesh C. Be careful of edges, and try to allow some space around your sampling area for INLA to estimate. The edge triangles can be bigger to reduce computing power."
+
+Mesh <- MeshB
+
+# Making the A matrix (JH - A matrix is not the same as MeshA, this is using MeshB)
+
+Matrix_A <- inla.spde.make.A(Mesh, loc = Locations) # Making A matrix
+Hosts.spde = inla.spde2.pcmatern(mesh = Mesh, prior.range = c(10, 0.5), prior.sigma = c(.5, .5)) # Making SPDE ##JH- NOT SURE ABOUT PRIOR RANGE THIS WAS FROM THE TUTORIAL
+w.Host <- inla.spde.make.index('w', n.spde = Hosts.spde$n.spde) # making the w
+
+# Making the model matrix #### 
+
+# make the model matrix using the final model selection formula without a response variable
+#trying with IM_PM_1 specifications
+X0 <- model.matrix(~ score_0.5 + med_income_ranked, family = "gaussian", data = all_data_inc) 
+# convert to a data frame. Eliminate the base level of the first categorical variable if applicable (you will manually specify an intercept below)  (JH - not applicable?)
+X <- as.data.frame(X0) 
+
+head(X)
+
+# Making the stack #### #did not add county as random effect here. if want to, need to first update X to include it. column names in X need to match effect names when specifying the stack and the vector length of A.
+
+N <- nrow(all_data_inc)
+
+Stack <- inla.stack(
+  data = list(y = all_data_inc$pm_change), # specify the response variable
+  
+  A = list(1, 1, Matrix_A), # Vector of Multiplication factors for random and fixed effects              
+  
+  effects = list(
+    
+    Intercept = rep(1, N), # specify the manual intercept!
+    
+    X = X, # attach the model matrix
+    
+    w = w.Host)) # attach the w 
+
+
+# adding stack to model
+f1 <- as.formula(paste0("y ~ -1 + Intercept + ", paste0(colnames(X), collapse = " + ")))
+
+IM1 <- inla(f1, # Base model (no random effects)
+            family = "gaussian",
+            data = inla.stack.data(Stack),
+            control.compute = list(dic = TRUE),
+            control.predictor = list(A = inla.stack.A(Stack))
+)
+
+Efxplot(list(IM1))
+summary(IM1)
+
 ```
+code from a different tutorial
+```{r}
+A<-inla.spde.make.A(mesh=Mesh,loc=as.matrix(Locations));dim(A)
+spde <- inla.spde2.matern(Mesh, alpha=2) #they fix alpha as 2
+iset <- inla.spde.make.index(name = "spatial.field", spde$n.spde)
+
+stk <- inla.stack(data=list(y=all_data_inc$pm_change), #the response, not 100% sure if specifying n here correctly
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list(covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 median_income_ranked = all_data_inc$median_income_ranked,
+                                    dt_dist=all_data_inc$dt_dist,
+                                    COUNTYFP10 = all_data_inc$COUNTYFP10)
+                  ), 
+                  
+                  #this is a quick name so you can call upon easily
+                  tag='dat')
+
+#error.
+
+```
+
+```{r}
+ggField(IM1, Mesh, Groups = 1) +
+  scale_fill_brewer(palette = "Blues") 
+
+#error
+```
+
 
 Neighbor relationships for MRF smooth model
 ```{r}
