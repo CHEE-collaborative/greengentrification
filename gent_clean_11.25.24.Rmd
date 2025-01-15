@@ -37,6 +37,7 @@ library(dplyr)
 library(INLA)
 library(ggregplot) #INLA compatible plotting library
 library(ggfields) # for plotting spatial field
+library(lattice) # for levelplot
 ```
 
 Load and clean data
@@ -326,6 +327,7 @@ IM_pm_6 <- inla(pm_change ~ score_0.5 + f(COUNTYFP10, model = "iid"), family = "
 
 # plotting INLA 2.5 models
 Efxplot(list(IM_pm_1, IM_pm_2, IM_pm_3, IM_pm_4, IM_pm_5, IM_pm_6))
+#credible intervals?
 ```
 
 ```{r}
@@ -339,18 +341,24 @@ Locations <- as.matrix(cbind(
   as.numeric(nyc_weighted_centroids$Latitude_weighted)
 ))
 
-#not sure if specifying it correctly
-mesh <- inla.mesh.2d(
-  loc = Locations,
-  max.edge = c(5, 10),  # Adjust based on data's spatial scale
-  cutoff = 1,           # Minimum distance between points
-  offset = c(5, 10)     # Boundary extension
-)
-#what about jitter
+# #not sure if specifying it correctly
+# mesh <- inla.mesh.2d(
+#   loc = Locations,
+#   max.edge = c(5, 10),  # Adjust based on data's spatial scale
+#   cutoff = 1,           # Minimum distance between points
+#   offset = c(5, 10)     # Boundary extension
+# )
+# #what about jitter
 
 MeshA <- inla.mesh.2d(jitter(Locations), max.edge = c(20, 40))
 MeshB <- inla.mesh.2d(Locations, max.edge = c(20, 40))
-MeshC <- inla.mesh.2d(Locations, max.edge = c(10, 20))
+MeshC <- inla.mesh.2d(Locations, max.edge = c(50, 100))
+mesh_simple <- inla.mesh.create(Locations)
+
+r <- nrow(all_data_inc) 
+mesh <- inla.mesh.2d(Locations, cutoff=r/10,
+max.edge=c(r/4, r/2), offset=c(r/2, r))
+plot(mesh, asp=1); points(Locations, col='red')
 
 # Visualize
 plot(mesh)
@@ -370,11 +378,74 @@ points(Locations, col = "red", pch = 2)
 # "Generally, the mesh function automatically creates a mesh like mesh A, where closer-together sampling locations produce smaller triangles. The sampling locations in this dataset are so evenly spaced that I had to jitter them to show this in mesh A. When exploring/setting up preliminary analyses, use a mesh like mesh B. for analyses to be reported in a paper, use a mesh like mesh C. Be careful of edges, and try to allow some space around your sampling area for INLA to estimate. The edge triangles can be bigger to reduce computing power."
 
 Mesh <- MeshB
+###########################################
+# find_mesh_for_nodes <- function(Locations, target_nodes, max_iter = 100, tolerance = 20) {
+#   # Set a reasonable initial range for max.edge
+#   min_edge <- 5
+#   max_edge <- 200
+#   
+#   iter <- 0
+#   found <- FALSE
+#   while (iter < max_iter && !found) {
+#     # Start by calculating the midpoint for max.edge range
+#     mid_edge <- (min_edge + max_edge) / 2
+#     
+#     # Create mesh with the current max.edge
+#     MeshB <- inla.mesh.2d(Locations, max.edge = c(mid_edge, mid_edge))
+#     
+#     # Get the number of nodes in the mesh
+#     num_nodes <- length(MeshB$loc)
+#     
+#     # Check if the number of nodes is close to the target (tolerance window)
+#     if (abs(num_nodes - target_nodes) <= tolerance) {
+#       found <- TRUE
+#       return(list(mesh = MeshB, num_nodes = num_nodes))
+#     }
+#     
+#     # Adjust the range based on the current number of nodes
+#     if (num_nodes < target_nodes) {
+#       min_edge <- mid_edge  # Increase max.edge
+#     } else {
+#       max_edge <- mid_edge  # Decrease max.edge
+#     }
+#     
+#     iter <- iter + 1
+#   }
+#   
+#   # Return the result if found
+#   if (found) {
+#     return(list(mesh = MeshB, num_nodes = length(MeshB$loc)))
+#   } else {
+#     stop("Could not find mesh with the target number of nodes.")
+#   }
+# }
+# 
+# # Define your target number of nodes (same as number of observations)
+# target_nodes <- 2095
+# 
+# # Call the function to find a mesh with the desired number of nodes
+# result <- find_mesh_for_nodes(Locations, target_nodes)
+# 
+# # Get the mesh and the number of nodes
+# MeshB <- result$mesh
+# num_nodes <- result$num_nodes
+# 
+# cat("Found mesh with", num_nodes, "nodes\n")
 
+
+############################################
 # Making the A matrix (JH - A matrix is not the same as MeshA, this is using MeshB)
 
 Matrix_A <- inla.spde.make.A(Mesh, loc = Locations) # Making A matrix
 Hosts.spde = inla.spde2.pcmatern(mesh = Mesh, prior.range = c(10, 0.5), prior.sigma = c(.5, .5)) # Making SPDE ##JH- NOT SURE ABOUT PRIOR RANGE THIS WAS FROM THE TUTORIAL
+
+Matrix_A_no_prior <- inla.spde.make.A(Mesh, loc = Locations) # Making A matrix
+
+
+# use frequentist results to inform the priors for the inla - range of effect estimates from gam
+#using the priors as a starting point for simulations 
+#try a few different priors to see how stable results are in the posteriors --? pick a few different parameterizations of models and use them as the starting points.
+
 w.Host <- inla.spde.make.index('w', n.spde = Hosts.spde$n.spde) # making the w
 
 # Making the model matrix #### 
@@ -387,24 +458,35 @@ X <- as.data.frame(X0)
 
 head(X)
 
-# Making the stack #### #did not add county as random effect here. if want to, need to first update X to include it. column names in X need to match effect names when specifying the stack and the vector length of A.
+# Making the stack #### 
+#did not add county as random effect here. if want to, need to first update X to include it. column names in X need to match effect names when specifying the stack and the vector length of A.
 
 N <- nrow(all_data_inc)
 
+# this code used to work?? but now gets an error.
+# Stack <- inla.stack(
+#   data = list(y = all_data_inc$pm_change), # specify the response variable
+#   
+#   A = list(1, 1, Matrix_A), # Vector of Multiplication factors for random and fixed effects              
+#   
+#   effects = list(
+#     
+#     Intercept = rep(1, N), # specify the manual intercept!
+#     
+#     X = X, # attach the model matrix
+#     
+#     w = w.Host)) # attach the w 
+
+#revised above code that runs as o 16.12.24
 Stack <- inla.stack(
-  data = list(y = all_data_inc$pm_change), # specify the response variable
-  
-  A = list(1, 1, Matrix_A), # Vector of Multiplication factors for random and fixed effects              
-  
+  data = list(y = all_data_inc$pm_change),
+  A = list(1, 1, Matrix_A_no_prior),
   effects = list(
-    
-    Intercept = rep(1, N), # specify the manual intercept!
-    
-    X = X, # attach the model matrix
-    
-    w = w.Host)) # attach the w 
-
-
+    Intercept = rep(1, N),
+    X = X[, c("score_0.5", "med_income_ranked")],  # Exclude intercept column
+    spatial = w.Host$w
+  )
+)
 # adding stack to model
 f1 <- as.formula(paste0("y ~ -1 + Intercept + ", paste0(colnames(X), collapse = " + ")))
 
@@ -418,36 +500,252 @@ IM1 <- inla(f1, # Base model (no random effects)
 Efxplot(list(IM1))
 summary(IM1)
 
+##look into the warnings.
+
+#look into diagnostics e.g., convergence plots, measure of conversion  rhat - but don't rely on it - see if it's a thing in INLA
+
 ```
+
+
+```{r}
+
+```
+
 code from a different tutorial
 ```{r}
-A<-inla.spde.make.A(mesh=Mesh,loc=as.matrix(Locations));dim(A)
+A <- inla.spde.make.A(Mesh, loc = Locations) # Making A matrix 
+
 spde <- inla.spde2.matern(Mesh, alpha=2) #they fix alpha as 2
+
 iset <- inla.spde.make.index(name = "spatial.field", spde$n.spde)
 
-stk <- inla.stack(data=list(y=all_data_inc$pm_change), #the response, not 100% sure if specifying n here correctly
+
+stk <- inla.stack(
+  data=list(y=all_data_inc$pm_change),
+                  #the response, not 100% sure if specifying n here correctly
                   A=list(A,1),  #the A matrix; the 1 is included to make the list(covariates)
                   effects=list(c(list(Intercept=1), #the Intercept
                                  iset),  #the spatial index
                                #the covariates
                                list(
-                                 median_income_ranked = all_data_inc$median_income_ranked,
-                                    dt_dist=all_data_inc$dt_dist,
-                                    COUNTYFP10 = all_data_inc$COUNTYFP10)
-                  ), 
-                  
-                  #this is a quick name so you can call upon easily
-                  tag='dat')
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_ranked = all_data_inc$med_income_ranked,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                               dt_dist = all_data_inc$dt_dist)))
 
-#error.
+
+
+### Model fitting
+
+#maybe not supposed to include score_0.5 here??
+#model0 not accounting for stack/covariates
+formula0<- y ~ -1 + Intercept + f(spatial.field, model=spde) 
+
+
+model0 <- inla(formula0,
+               data = list (y = all_data_inc$pm_change,
+                            Intercept = rep(1,spde$n.spde),
+                            spatial.field = 1:spde$n.spde),
+               control.predictor = list (A = A, compute = T),
+               control.compute = list (cpo = T))
+
+round(model0$summary.fixed,3)
+round(model0$summary.hyperpar[1,],3)
+
+
+# model0<-inla(formula0, #the formula
+#              data= inla.stack.data(stk,spde=spde),  #the data stack
+#              family= 'gaussian',   #which family the data comes from
+#              control.predictor=list(A=inla.stack.A(stk),compute=TRUE),  #compute gives you the marginals of the linear predictor
+#              control.compute = list(dic = TRUE, waic = TRUE, config = TRUE), #model diagnostics and config = TRUE gives you the GMRF
+#              verbose = FALSE) #can include verbose=TRUE to see the log of the model runs
+
+model0$summary.fix
+
+model0$summary.hyperpar
+
+model0.res<-inla.spde2.result(model0, 'spatial.field', spde, do.transf=TRUE)
+model0.res$summary.log.range.nominal
+model0.res$summary.log.variance.nominal
+
+Efxplot(list(model0))
+
+##### Model selection 
+###model selection with WAIC (other criteria can be used)
+
+# Create a vector of fixed effect covariates
+covariates <- c("med_income_ranked", "dt_dist")
+
+for(i in 1:length(covariates)) {
+  
+  # Build formula with random effect for county
+  f1 <- as.formula(paste0("y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + f(COUNTYFP10, model='iid') + ",
+                         paste0(covariates[1:i], collapse = " + ")))
+  
+  model1 <- inla(f1, 
+                 data = inla.stack.data(stk, spde=spde),
+                 family = 'gaussian',
+                 control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
+                 control.compute = list(dic = TRUE, cpo=TRUE, waic = TRUE))
+  
+  # Store model selection results
+  model_selection <- if(i==1) {
+    rbind(c(model = paste(covariates[1:i]), waic = model1$waic$waic))
+  } else {
+    rbind(model_selection, 
+          c(model = paste(covariates[1:i], collapse = " + "), 
+            waic = model1$waic$waic))
+  }
+}
+
+model_selection
+
+
+#refit for best model:
+formula<-y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_ranked + dt_dist 
+model1<-inla(formula, data=inla.stack.data(stk,spde=spde),family= 'gaussian', 
+             control.predictor=list(A=inla.stack.A(stk),compute=TRUE), 
+             control.compute = list(dic = TRUE, waic = TRUE, config = TRUE), 
+             verbose = FALSE) 
+
+
+model1$summary.fix
+model1$summary.hyperpar
+
+par(mfrow=c(2,2))
+plot(model1$marginals.fixed[[1]], ty = "l", xlab = expression(beta[0]), ylab = "Density")
+plot(model1$marginals.fixed[[2]], ty = "l", xlab = expression(beta[score_0.5]), ylab = "Density") 
+plot(model1$marginals.fixed[[3]], ty = "l", xlab = expression(beta[med_income_ranked]), ylab = "Density") 
+plot(model1$marginals.fixed[[4]], ty = "l", xlab = expression(beta[dt_dist]), ylab = "Density") 
+
+model1.res<-inla.spde2.result(model0, 'spatial.field', spde, do.transf=TRUE)
+model1.res$summary.log.range.nominal
+model1.res$summary.log.variance.nominal
+
+#observe the plots for hyper parameters
+par(mfrow=c(1,3))
+plot(model1.res$marginals.var[[1]], ty = "l", xlab = expression(sigma[randomfield]^2), ylab = "Density") 
+plot(model1.res$marginals.kap[[1]], type = "l", xlab = expression(kappa), ylab = "Density")
+plot(model1.res$marginals.range[[1]], type = "l", xlab = "range nominal", ylab = "Density")
+
+#looking at the spatial field and what it looks like
+gproj <- inla.mesh.projector(Mesh,  dims = c(300, 300))
+g.mean <- inla.mesh.project(gproj, model1$summary.random$spatial.field$mean)
+g.sd <- inla.mesh.project(gproj, model1$summary.random$spatial.field$sd)
+
+grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
+             levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)), nrow=1)
+
+Efxplot(list(model1))
+
+plot(model1, single = TRUE)
+
+## trying to set priors using GAM model results
+formula <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_ranked + dt_dist 
+
+# Using the estimates and standard errors to inform priors
+model2 <- inla(formula, 
+               data = inla.stack.data(stk, spde=spde),
+               family = 'gaussian', 
+               control.fixed = list(
+                 mean = list(Intercept = -5.954,
+                           score_0.5 = -7.859e-4,
+                           med_income_ranked = 1.002e-6,
+                           dt_dist = 0),  # No prior info for dt_dist from GAM
+                 prec = list(Intercept = 1/(8.170e-04)^2,
+                           score_0.5 = 1/(5.793e-04)^2,
+                           med_income_ranked = 1/(7.453e-07)^2,
+                           dt_dist = 1)  # Using default precision for dt_dist
+               ),
+               control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
+               verbose = FALSE)
+
+Efxplot(list(model2))
+plot(model2, single = TRUE)
+
+model1$summary.fix
+model1$summary.hyperpar
+model2$summary.fix
+model2$summary.hyperpar
+
+#plot credible intervals without using efxplot
+# Convert fixed effects to data frame
+fixed_df <- as.data.frame(fixed_effects)
+fixed_df$Parameter <- rownames(fixed_effects)
+
+ggplot(fixed_df, aes(y = Parameter)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = mean)) +
+  geom_errorbarh(aes(xmin = `0.025quant`, xmax = `0.975quant`), height = 0.2) +
+  theme_bw() +
+  labs(x = "Estimate", y = "") +
+  theme(axis.text.y = element_text(hjust = 1))
+
+# Check the ranges of your predictors
+
+############################
+#TO FIX STACKS HAVING 2095 NA VALUES WHICH RESULTS IN 0 ESTIMATE AND NO CREDIBLE INTERVALS
+## CODE BELOW DOES NOT WORK.
+
+# Corrected stack construction
+# Create components
+A <- inla.spde.make.A(Mesh, loc = Locations)
+spde <- inla.spde2.matern(Mesh, alpha=2)
+iset <- inla.spde.make.index(name = "spatial.field", spde$n.spde)
+
+# First create a stack for the SPDE model
+stack.spde <- inla.stack(
+  data = list(y = all_data_inc$pm_change),
+  A = list(A),
+  effects = list(iset)
+)
+
+# Then create a stack for the fixed effects
+stack.fixed <- inla.stack(
+  data = list(y = all_data_inc$pm_change),
+  A = list(1),
+  effects = list(data.frame(
+    Intercept = 1,
+    score_0.5 = all_data_inc$score_0.5,
+    med_income_ranked = all_data_inc$med_income_ranked,
+    COUNTYFP10 = all_data_inc$COUNTYFP10,
+    dt_dist = all_data_inc$dt_dist
+  ))
+)
+
+# Combine the stacks
+stk <- inla.stack(stack.spde, stack.fixed)
+
+
 
 ```
 
 ```{r}
-ggField(IM1, Mesh, Groups = 1) +
-  scale_fill_brewer(palette = "Blues") 
+formula1 <- y ~ -1 + Intercept + score_0.5 +
+  med_income_ranked + 
+  dt_dist +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid")
+ 
+  #rw1 and rw2 don't work for the covariates, not sure how else to smooth
 
-#error
+model1<-inla(formula1, 
+             data = inla.stack.data(stk, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
+
+# This time we will have more effects to examine in the fixed and random effect summaries
+round(model1$summary.fixed,3) #med_income_ranked and dt_dist still come out out as all zeroes --> rounded...
+round(model1$summary.hyperpar,3)
+model1$summary
+
+model1$summary.fix
+model1$summary.hyperpar
+Efxplot(list(model1))
+
+
 ```
 
 
@@ -461,7 +759,7 @@ names(nb) <- attr(nb, "region.id")
 PM 2.5 MRF smooth model
 ```{r}
 # MRF smooth model for pm 2.5
-mrf_income_pm <- bam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+mrf_income_pm <- bam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=200, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
 
 mrf_income_pm_15 <- bam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
 
