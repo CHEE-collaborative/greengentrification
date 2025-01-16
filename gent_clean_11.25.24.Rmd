@@ -438,7 +438,7 @@ round(model1$summary.fixed,3) #med_income_ranked and dt_dist still come out out 
 round(model1$summary.hyperpar,3)
 
 # "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
-model1.res<-inla.spde2.result(model0, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+model1.res<-inla.spde2.result(model1, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
 
 model1.res$summary.log.range.nominal
 model1.res$summary.log.variance.nominal
@@ -550,11 +550,321 @@ model2$summary.hyperpar
 
 
 ```
-INLA model steps for another variable (try NDVI first)
+
+INLA stack (NDVI)
 ```{r}
+# Create stack
+stk_ndvi <- inla.stack(
+  data=list(y=all_data_inc$ndvi_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_ranked = all_data_inc$med_income_ranked,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                               dt_dist = all_data_inc$dt_dist)))
+
+
+#"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
+```
+
+
+INLA - model fitting (no priors) for 
+```{r}
+# Specify formula
+formula1_ndvi <- y ~ -1 + Intercept + score_0.5 +
+  med_income_ranked + 
+  dt_dist +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+  #rw1 and rw2 don't work for the covariates, not sure how else to smooth, so right now just linear?? 
+
+# Specify model
+model1_ndvi<-inla(formula1_ndvi, 
+             data = inla.stack.data(stk_ndvi, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_ndvi),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
 
 ```
 
+INLA model results for NDVI
+```{r}
+###  Model results
+# Posterior distribution summary of the fixed effects
+model1_ndvi$summary.fix
+
+# Posterior distribution summary of the hyper parameters (spatial field parameters)
+model1_ndvi$summary.hyperpar
+
+# Rounded summaries
+round(model1_ndvi$summary.fixed,3) #med_income_ranked and dt_dist still come out out as all zeroes --> rounded...
+round(model1_ndvi$summary.hyperpar,3)
+
+# "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
+model1_ndvi.res<-inla.spde2.result(model1_ndvi, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+
+model1_ndvi.res$summary.log.range.nominal
+model1_ndvi.res$summary.log.variance.nominal
+
+# Plot effect estimate and credible intervals
+graphics.off()
+Efxplot(list(model1_ndvi))
+
+# Plot for fixed parameters for insight into the effect of covariates
+par(mfrow=c(2,2))
+plot(model1_ndvi$marginals.fixed[[1]], ty = "l", xlab = expression(beta[0]), ylab = "Density")
+plot(model1_ndvi$marginals.fixed[[2]], ty = "l", xlab = expression(beta[score_0.5]), ylab = "Density") 
+plot(model1_ndvi$marginals.fixed[[3]], ty = "l", xlab = expression(beta[med_income_ranked]), ylab = "Density") 
+plot(model1_ndvi$marginals.fixed[[4]], ty = "l", xlab = expression(beta[dt_dist]), ylab = "Density") 
+
+# Plots for hyper parameters for insight into the effect of the structure of the spatial field
+par(mfrow=c(1,3))
+plot(model1_ndvi.res$marginals.var[[1]], ty = "l", xlab = expression(sigma[randomfield]^2), ylab = "Density") 
+plot(model1_ndvi.res$marginals.kap[[1]], type = "l", xlab = expression(kappa), ylab = "Density")
+plot(model1_ndvi.res$marginals.range[[1]], type = "l", xlab = "range nominal", ylab = "Density")
+
+
+# Plot spatial field 
+gproj <- inla.mesh.projector(Mesh,  dims = c(300, 300))
+g.mean <- inla.mesh.project(gproj, model1_ndvi$summary.random$spatial.field$mean)
+g.sd <- inla.mesh.project(gproj, model1_ndvi$summary.random$spatial.field$sd)
+
+grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
+             levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
+             nrow=1)
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+
+# Other model plots
+plot(model1_ndvi, single = TRUE) # look into how to interpret?
+
+```
+
+INLA - model selection of covariates for NDVI
+```{r}
+### Model selection 
+# Model selection with WAIC (other criteria can be used)
+
+# Create a vector of fixed effect covariates
+covariates <- c("med_income_ranked", "dt_dist")
+
+for(i in 1:length(covariates)) {
+  
+  # Build formula with random effect for county
+  f1 <- as.formula(paste0("y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + f(COUNTYFP10, model='iid') + ",
+                         paste0(covariates[1:i], collapse = " + ")))
+  
+  model1 <- inla(f1, 
+                 data = inla.stack.data(stk_ndvi, spde=spde),
+                 family = 'gaussian',
+                 control.predictor = list(A=inla.stack.A(stk_ndvi), compute=TRUE),
+                 control.compute = list(dic = TRUE, cpo=TRUE, waic = TRUE))
+  
+  # Store model selection results
+  model_selection <- if(i==1) {
+    rbind(c(model = paste(covariates[1:i]), waic = model1$waic$waic))
+  } else {
+    rbind(model_selection, 
+          c(model = paste(covariates[1:i], collapse = " + "), 
+            waic = model1$waic$waic))
+  }
+}
+
+model_selection
+```
+
+INLA - setting priors in the model for NDVI
+```{r}
+## trying to set priors using GAM model results
+formula2_ndvi <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_ranked + dt_dist 
+
+# Using the estimates and standard errors to inform priors
+model2_ndvi <- inla(formula2_ndvi, 
+               data = inla.stack.data(stk_ndvi, spde=spde),
+               family = 'gaussian', 
+               control.fixed = list(
+                 mean = list(Intercept = -2.422e-02,
+                           score_0.5 = -2.128e-04,
+                           med_income_ranked = -2.896e-06,
+                           dt_dist = 0),  # No prior info for dt_dist
+                 prec = list(Intercept = 1/(1.297e-03)^2,
+                           score_0.5 = 1/(8.675e-04)^2,
+                           med_income_ranked = 1/(1.179e-06)^2,
+                           dt_dist = 1)  # Using default precision for dt_dist
+               ),
+               control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
+               verbose = FALSE)
+
+
+# Plot effect estimates and credible intervals
+Efxplot(list(model2_ndvi)) # not statistically significant compared to without priors
+Efxplot(list(model1_ndvi))
+
+plot(model2_ndvi, single = TRUE) #don't know what this plot is and don't know why output is different from model 1
+
+# Compare model 1 (no priors) and model 2 (priors) results
+model1_ndvi$summary.fix
+model1_ndvi$summary.hyperpar
+
+model2_ndvi$summary.fix
+model2_ndvi$summary.hyperpar
+
+```
+
+INLA model functions for all variables
+```{r}
+run_spatial_model <- function(response_var, data, spde, Mesh) {
+  # Create stack
+  stk <- inla.stack(
+    data = list(y = data[[response_var]]),
+    A = list(A, 1),
+    effects = list(
+      c(list(Intercept = 1), iset),
+      list(
+        score_0.5 = data$score_0.5,
+        med_income_ranked = data$med_income_ranked,
+        COUNTYFP10 = data$COUNTYFP10,
+        dt_dist = data$dt_dist
+      )
+    )
+  )
+  
+  # Formula
+  formula <- y ~ -1 + Intercept + score_0.5 +
+    med_income_ranked + 
+    dt_dist +
+    f(spatial.field, model = spde) +
+    f(COUNTYFP10, model = "iid")
+  
+  # Fit model
+  model <- inla(formula, 
+                data = inla.stack.data(stk, spde = spde),
+                family = 'gaussian', 
+                control.predictor = list(A = inla.stack.A(stk), compute = TRUE), 
+                control.compute = list(cpo = TRUE, dic = TRUE, waic = TRUE))
+  
+  # Create spatial field results
+  model.res <- inla.spde2.result(model, 'spatial.field', spde, do.transf = TRUE)
+  
+  # Return model results
+  return(list(
+    model = model,
+    fixed_effects = round(model$summary.fixed, 3),
+    hyperpar = round(model$summary.hyperpar, 3),
+    range = model.res$summary.log.range.nominal,
+    variance = model.res$summary.log.variance.nominal,
+    waic = model$waic$waic,
+    response = response_var
+  ))
+} # waic doesn't mean much here bc not doing model selection, would need to do that separately
+
+# Run models for all response variables
+response_vars <- c("pm_change", "o3_change", "no2_change", "ndvi_change", "mean_temp")
+
+results <- map(response_vars, ~run_spatial_model(
+  response_var = .x,
+  data = all_data_inc,
+  spde = spde,
+  Mesh = Mesh
+)) %>%
+  setNames(response_vars)
+
+# Print summarized results
+print_model_results <- function(results_list) {
+  for(var in names(results_list)) {
+    cat("\n\n=== Results for", var, "===\n")
+    cat("\nFixed Effects:\n")
+    print(results_list[[var]]$fixed_effects)
+    cat("\nHyper Parameters:\n")
+    print(results_list[[var]]$hyperpar)
+    cat("\nRange:\n")
+    print(results_list[[var]]$range)
+    cat("\nVariance:\n")
+    print(results_list[[var]]$variance)
+    cat("\nWAIC:\n")
+    print(results_list[[var]]$waic)
+    cat("\n----------------------------------------\n")
+  }
+}
+
+# Print results
+print_model_results(results)
+
+
+### Effect estimate and credible interval plots
+
+# For PM2.5 change
+graphics.off()
+Efxplot(list(results$pm_change$model))
+
+# For O3 change
+graphics.off()
+Efxplot(list(results$o3_change$model))
+
+# For NO2 change
+graphics.off()
+Efxplot(list(results$no2_change$model))
+
+# For NDVI change
+graphics.off()
+Efxplot(list(results$ndvi_change$model))
+
+# For mean temperature
+graphics.off()
+Efxplot(list(results$mean_temp$model))
+```
+
+INLA - setting priors in the model for NO2
+```{r}
+# Create stack
+stk_no2<- inla.stack(
+  data=list(y=all_data_inc$no2_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_ranked = all_data_inc$med_income_ranked,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                               dt_dist = all_data_inc$dt_dist)))
+
+formula2_no2 <- y ~ -1 + Intercept + score_0.5 +
+  med_income_ranked + 
+  dt_dist +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+
+model2_no2 <- inla(
+  formula2_no2, 
+  data = inla.stack.data(stk_no2, spde=spde), 
+  family = 'gaussian',
+  control.fixed = list(
+    mean = list(
+      Intercept = -14.54,
+      score_0.5 = -0.01881,
+      med_income_ranked = -0.0001338,
+      dt_dist = 0  # Keeping as is since no prior info
+    ),
+    prec = list(
+      Intercept = 1/(0.03376)^2,
+      score_0.5 = 1/(0.02485)^2,
+      med_income_ranked = 1/(0.00003092)^2,
+      dt_dist = 1  # Keeping default precision
+    )
+  ),
+  control.predictor = list(A=inla.stack.A(stk_no2), compute=TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
+  verbose = FALSE
+)
+
+Efxplot(list(model2_no2))
+
+```
 
 Old INLA code 
 ```{r}
@@ -794,7 +1104,7 @@ ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
 NO2 MRF smooth model
 ```{r}
 #MRF smooth model for NO2
-mrf_income_no2 <- bam(no2_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+mrf_income_no2 <- bam(no2_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
 
 #at k=5 is significant but residuals weird, when k increases, residuals and stuff still patterned-ish but better overall and no longer sig
 
@@ -851,7 +1161,20 @@ ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
 NDVI MRF smooth model
 ```{r}
 #MRF smooth model for NDVI
-mrf_income_ndvi <- bam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+# Create clean dataset without 8 NA values (follow up)
+all_data_inc_clean <- all_data_inc[is.finite(all_data_inc$ndvi_change), ]
+
+# Create new neighborhood structure from cleaned data
+nb_clean <- poly2nb(all_data_inc_clean)
+names(nb_clean) <- all_data_inc_clean$GEOID
+
+mrf_income_ndvi <- bam(ndvi_change ~ score_0.5 + med_income_ranked + 
+                      s(GEOID, bs='mrf', k=300, xt=list(nb=nb_clean)), 
+                      family = scat, data = all_data_inc_clean, method = "REML")
+
+
+# 
+# mrf_income_ndvi <- bam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
 
 summary(mrf_income_ndvi)
 gam.check(mrf_income_ndvi)
