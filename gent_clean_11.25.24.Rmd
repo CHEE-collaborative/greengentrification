@@ -35,9 +35,10 @@ library(gridExtra) # for viewing plots side-by-side
 library(qgam) 
 library(dplyr)
 library(INLA)
-library(ggregplot) #INLA compatible plotting library
+library(ggregplot) #INLA compatible plotting library (efxplot)
 library(ggfields) # for plotting spatial field
 library(lattice) # for levelplot
+library(inlatools) # for INLA diagnostics 
 ```
 
 Load and clean data
@@ -238,6 +239,20 @@ all_data_inc <- all_data %>%
 # Ranking median income for use in GAM models
 all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)
 
+
+# Converting median income to quantiles and scaling
+# Create deciles
+# First create the decile groups (1-10)
+income_quantiles <- quantile(all_data_inc$med_income_2000_impute, probs = seq(0, 1, by = 0.1))
+all_data_inc$med_income_decile <- findInterval(all_data_inc$med_income_2000_impute, 
+                                             income_quantiles,
+                                             rightmost.closed = TRUE)
+
+# Then create the scaled version (1-10 continuous)
+all_data_inc$med_income_decile_scale <- (all_data_inc$med_income_2000_impute - min(all_data_inc$med_income_2000_impute)) / 
+  (max(all_data_inc$med_income_2000_impute) - min(all_data_inc$med_income_2000_impute)) * 9 + 1
+
+
 ############# Distance to downtown #########
 # Load nyc roads
 downtown_st <- roads(state = "NY", county = "New York", year = 2011)
@@ -312,17 +327,17 @@ INLA PM2.5 models without spatial aspect
 ```{r}
 ######INLA PM2.5 MODELS #####
 
-IM_pm_1  <- inla(pm_change ~ score_0.5 + med_income_ranked,
+IM_pm_1  <- inla(pm_change ~ score_0.5 + med_income_decile,
                family = "gaussian", 
                data = all_data_inc, verbose = TRUE) 
 
-IM_pm_2 <- inla(pm_change ~ score_0.5 + med_income_ranked + f(COUNTYFP10, model = "iid"),
+IM_pm_2 <- inla(pm_change ~ score_0.5 + med_income_decile + f(COUNTYFP10, model = "iid"),
                 family = "gaussian", 
                 data = all_data_inc, verbose = TRUE)
 
-IM_pm_3 <- inla(pm_change ~ score_0.5 + med_income_ranked + f(COUNTYFP10, model = "iid") + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
+IM_pm_3 <- inla(pm_change ~ score_0.5 + med_income_decile + f(COUNTYFP10, model = "iid") + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
 
-IM_pm_4 <- inla(pm_change ~ score_0.5 + med_income_ranked + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
+IM_pm_4 <- inla(pm_change ~ score_0.5 + med_income_decile + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
 
 IM_pm_5 <- inla(pm_change ~ score_0.5, family = "gaussian", data = all_data_inc, verbose = TRUE)
 
@@ -333,7 +348,6 @@ IM_pm_6 <- inla(pm_change ~ score_0.5 + f(COUNTYFP10, model = "iid"), family = "
 # plotting INLA 2.5 models
 Efxplot(list(IM_pm_1, IM_pm_2, IM_pm_3, IM_pm_4, IM_pm_5, IM_pm_6))
 
-#effect estimate for median income and distance to downtown all zero.
 ```
 INLA - Mesh creation
 ```{r}
@@ -394,7 +408,7 @@ stk <- inla.stack(
                                #the covariates
                                list(
                                  score_0.5 = all_data_inc$score_0.5,
-                                 med_income_ranked = all_data_inc$med_income_ranked,
+                                 med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10,
                                dt_dist = all_data_inc$dt_dist)))
 
@@ -407,7 +421,7 @@ INLA - model fitting (no priors) for PM2.5
 ```{r}
 # Specify formula
 formula1 <- y ~ -1 + Intercept + score_0.5 +
-  med_income_ranked + 
+  med_income_decile + 
   dt_dist +
   f(spatial.field, model = spde) +
   f(COUNTYFP10, model = "iid") #random effect
@@ -419,7 +433,7 @@ model1<-inla(formula1,
              data = inla.stack.data(stk, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(cpo = TRUE, config = TRUE))
 
 ```
 
@@ -434,7 +448,7 @@ model1$summary.fix
 model1$summary.hyperpar
 
 # Rounded summaries
-round(model1$summary.fixed,3) #med_income_ranked and dt_dist still come out out as all zeroes --> rounded...
+round(model1$summary.fixed,3) 
 round(model1$summary.hyperpar,3)
 
 # "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
@@ -483,7 +497,7 @@ INLA - model selection of covariates for PM2.5
 # Model selection with WAIC (other criteria can be used)
 
 # Create a vector of fixed effect covariates
-covariates <- c("med_income_ranked", "dt_dist")
+covariates <- c("med_income_decile", "dt_dist")
 
 for(i in 1:length(covariates)) {
   
@@ -514,7 +528,7 @@ model_selection
 INLA - setting priors in the model for PM2.5
 ```{r}
 ## trying to set priors using GAM model results
-formula2 <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_ranked + dt_dist 
+formula2 <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_decile + dt_dist 
 
 # Using the estimates and standard errors to inform priors
 model2 <- inla(formula2, 
@@ -523,20 +537,23 @@ model2 <- inla(formula2,
                control.fixed = list(
                  mean = list(Intercept = -5.954,
                            score_0.5 = -7.859e-4,
-                           med_income_ranked = 1.002e-6,
+                           med_income_decile = 1.002e-6, # This was using med_income_ranked in the GAM
                            dt_dist = 0),  # No prior info for dt_dist from GAM
                  prec = list(Intercept = 1/(8.170e-04)^2,
                            score_0.5 = 1/(5.793e-04)^2,
-                           med_income_ranked = 1/(7.453e-07)^2,
+                           med_income_decile = 1/(7.453e-07)^2,
                            dt_dist = 1)  # Using default precision for dt_dist
                ),
                control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
                control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
                verbose = FALSE)
 
-dev.off()
+
 # Plot effect estimates and credible intervals
+graphics.off()
 Efxplot(list(model2))
+Efxplot(list(model1))
+
 
 plot(model2, single = TRUE) #don't know what this plot is and don't know why output is different from model 1
 
@@ -562,7 +579,7 @@ stk_ndvi <- inla.stack(
                                #the covariates
                                list(
                                  score_0.5 = all_data_inc$score_0.5,
-                                 med_income_ranked = all_data_inc$med_income_ranked,
+                                 med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10,
                                dt_dist = all_data_inc$dt_dist)))
 
@@ -575,7 +592,7 @@ INLA - model fitting (no priors) for
 ```{r}
 # Specify formula
 formula1_ndvi <- y ~ -1 + Intercept + score_0.5 +
-  med_income_ranked + 
+  med_income_decile + 
   dt_dist +
   f(spatial.field, model = spde) +
   f(COUNTYFP10, model = "iid") #random effect
@@ -661,7 +678,8 @@ for(i in 1:length(covariates)) {
                  data = inla.stack.data(stk_ndvi, spde=spde),
                  family = 'gaussian',
                  control.predictor = list(A=inla.stack.A(stk_ndvi), compute=TRUE),
-                 control.compute = list(dic = TRUE, cpo=TRUE, waic = TRUE))
+                 control.compute = list(dic = TRUE, cpo=TRUE, waic = TRUE, config = TRUE))
+
   
   # Store model selection results
   model_selection <- if(i==1) {
@@ -679,7 +697,7 @@ model_selection
 INLA - setting priors in the model for NDVI
 ```{r}
 ## trying to set priors using GAM model results
-formula2_ndvi <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_ranked + dt_dist 
+formula2_ndvi <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_decile + dt_dist 
 
 # Using the estimates and standard errors to inform priors
 model2_ndvi <- inla(formula2_ndvi, 
@@ -688,11 +706,11 @@ model2_ndvi <- inla(formula2_ndvi,
                control.fixed = list(
                  mean = list(Intercept = -2.422e-02,
                            score_0.5 = -2.128e-04,
-                           med_income_ranked = -2.896e-06,
+                           med_income_decile = -2.896e-06,
                            dt_dist = 0),  # No prior info for dt_dist
                  prec = list(Intercept = 1/(1.297e-03)^2,
                            score_0.5 = 1/(8.675e-04)^2,
-                           med_income_ranked = 1/(1.179e-06)^2,
+                           med_income_decile = 1/(1.179e-06)^2,
                            dt_dist = 1)  # Using default precision for dt_dist
                ),
                control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
@@ -701,6 +719,7 @@ model2_ndvi <- inla(formula2_ndvi,
 
 
 # Plot effect estimates and credible intervals
+graphics.off()
 Efxplot(list(model2_ndvi)) # not statistically significant compared to without priors
 Efxplot(list(model1_ndvi))
 
@@ -726,7 +745,7 @@ run_spatial_model <- function(response_var, data, spde, Mesh) {
       c(list(Intercept = 1), iset),
       list(
         score_0.5 = data$score_0.5,
-        med_income_ranked = data$med_income_ranked,
+        med_income_decile = data$med_income_decile,
         COUNTYFP10 = data$COUNTYFP10,
         dt_dist = data$dt_dist
       )
@@ -735,7 +754,7 @@ run_spatial_model <- function(response_var, data, spde, Mesh) {
   
   # Formula
   formula <- y ~ -1 + Intercept + score_0.5 +
-    med_income_ranked + 
+    med_income_decile + 
     dt_dist +
     f(spatial.field, model = spde) +
     f(COUNTYFP10, model = "iid")
@@ -829,12 +848,12 @@ stk_no2<- inla.stack(
                                #the covariates
                                list(
                                  score_0.5 = all_data_inc$score_0.5,
-                                 med_income_ranked = all_data_inc$med_income_ranked,
+                                 med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10,
                                dt_dist = all_data_inc$dt_dist)))
 
 formula2_no2 <- y ~ -1 + Intercept + score_0.5 +
-  med_income_ranked + 
+  med_income_decile + 
   dt_dist +
   f(spatial.field, model = spde) +
   f(COUNTYFP10, model = "iid") #random effect
@@ -861,8 +880,29 @@ model2_no2 <- inla(
   control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
   verbose = FALSE
 )
-
+graphics.off()
 Efxplot(list(model2_no2))
+
+```
+
+INLA tools set up
+```{r}
+# ip <- rownames(installed.packages())
+# if (!"remotes" %in% ip) {
+#   install.packages("remotes")
+# }
+# if (!"INLA" %in% ip) {
+#   install.packages(
+#     "INLA", 
+#     repos = c(getOption("repos"), "https://inla.r-inla-download.org/R/stable")
+#   )
+# }
+# remotes::install_github("inbo/inlatools")
+```
+INLA diagnostics
+```{r}
+distribution_check(model1, nsim = 1000)
+
 
 ```
 
