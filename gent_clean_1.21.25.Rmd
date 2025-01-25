@@ -240,7 +240,6 @@ all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)
 
 # Converting median income to quantiles and scaling
 # Create deciles
-# First create the decile groups (1-10)
 income_quantiles <- quantile(all_data_inc$med_income_2000_impute, probs = seq(0, 1, by = 0.1))
 all_data_inc$med_income_decile <- findInterval(all_data_inc$med_income_2000_impute, 
                                              income_quantiles,
@@ -379,7 +378,7 @@ model1_pm<-inla(formula1_pm,
              data = inla.stack.data(stk_pm, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_pm),compute = TRUE), 
-             control.compute = list(cpo = TRUE, config = TRUE))
+             control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE))
 
 ```
 
@@ -390,6 +389,7 @@ INLA model results for PM2.5
 # Posterior distribution summary of the fixed effects
 model1_pm$summary.fix
 
+
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
 model1_pm$summary.hyperpar
 
@@ -398,7 +398,7 @@ round(model1_pm$summary.fixed,3)
 round(model1_pm$summary.hyperpar,3)
 
 # "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
-model1_pm.res<-inla.spde2.result(model1, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+model1_pm.res<-inla.spde2.result(model1_pm, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
 
 model1_pm.res$summary.log.range.nominal
 model1_pm.res$summary.log.variance.nominal
@@ -429,12 +429,109 @@ g.sd <- inla.mesh.project(gproj, model1_pm$summary.random$spatial.field$sd)
 grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
              levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
              nrow=1)
-# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." 
 
 # Other model plots
-plot(model1_pm, single = TRUE) # look into how to interpret?
+plot(model1_pm, single = TRUE) 
+
+# Model selection (not relevant right now with just one model)
+model1_pm$dic  # Deviance Information Criterion
+model1_pm$waic # Watanabe-Akaike Information Criterion
+
+# Conditional Predictive Ordinate (CPO) diagnostics
+summary(model1_pm$cpo)  # Predictive performance 
+1 - mean(model1_pm$cpo$failure)  # Model fit success rate
+
+
+# Posterior predictive checks
+# posterior_samples <- inla.posterior.sample(n = 1000, result = model1_pm)
+
+# Residual Analysis
+par(mfrow=c(2,2))
+plot(model1_pm$summary.random$spatial.field$mean, type="l")
+qqnorm(model1_pm$summary.random$spatial.field$mean)
+hist(model1_pm$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model1_pm$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model1_pm$summary.random$spatial.field$mean)
+boxplot(model1_pm$summary.random$spatial.field$mean)
 
 ```
+Additional diagnostics? 
+```{r}
+# inlatools setting a prior https://inlatools.netlify.app/articles/prior - not sure how to apply this
+str(x <- simulate_iid(sigma = 1))
+plot(x)
+plot(x, link = "log")
+plot(x, link = "logit")
+
+plot(model1_pm)
+
+# https://www.paulamoraga.com/book-geospatial/sec-inla.html#control-variables-to-compute-approximations
+alpha <- model1_pm$marginals.fixed[[1]]
+ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
+  geom_line() +
+  theme_bw()
+
+quant <- inla.qmarginal(0.05, alpha)
+quant
+
+inla.pmarginal(quant, alpha)
+
+ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
+  geom_line() +
+  geom_area(data = subset(data.frame(inla.smarginal(alpha)),
+                                     x < quant),
+            fill = "black") +
+  theme_bw()
+
+inla.dmarginal(-6.3, alpha)
+
+ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
+  geom_line() +
+  geom_vline(xintercept = -6.3, linetype = "dashed") +
+  theme_bw()
+
+
+marg.variance <- inla.tmarginal(function(x) 1/x, 
+model1_pm$marginals.hyperpar[[1]])
+
+ggplot(data.frame(inla.smarginal(marg.variance)), aes(x, y)) +
+  geom_line() +
+  theme_bw()
+
+m <- inla.emarginal(function(x) x, marg.variance)
+m
+
+mm <- inla.emarginal(function(x) x^2, marg.variance)
+sqrt(mm - m^2)
+
+inla.qmarginal(c(0.025, 0.5, 0.975), marg.variance)
+
+inla.zmarginal(marg.variance)
+
+# Extract fitted values marginals
+list_marginals <- model1_pm$marginals.fitted.values
+
+# Convert to dataframe
+marginals <- data.frame(do.call(rbind, list_marginals))
+
+# Add identifier column (modify as needed)
+marginals$location <- rep(names(list_marginals), 
+                          times = sapply(list_marginals, nrow))
+
+```
+
 
 
 INLA - setting priors in the model for PM2.5
@@ -464,8 +561,6 @@ model2_pm <- inla(
 )
 
 
-
-
 # Comparing results for models with and without setting priors from MRF model
 # Plot effect estimates and credible intervals
 graphics.off()
@@ -476,11 +571,31 @@ Efxplot(list(model1_pm)) # without priors
 plot(model2_pm, single = TRUE) #don't know what this plot is and don't know why output is different from model 1
 
 # Compare model 1 (no priors) and model 2 (priors) results
-model1$summary.fix
-model1$summary.hyperpar
+model1_pm$summary.fix
+model1_pm$summary.hyperpar
 
-model2$summary.fix
-model2$summary.hyperpar
+model2_pm$summary.fix
+model2_pm$summary.hyperpar
+
+# Residual Analysis
+par(mfrow=c(2,2))
+plot(model2_pm$summary.random$spatial.field$mean, type="l")
+qqnorm(model2_pm$summary.random$spatial.field$mean)
+hist(model2_pm$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model2_pm$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model2_pm$summary.random$spatial.field$mean)
+boxplot(model2_pm$summary.random$spatial.field$mean)
 
 
 ```
@@ -564,10 +679,32 @@ g.sd <- inla.mesh.project(gproj, model1_ndvi$summary.random$spatial.field$sd)
 grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
              levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
              nrow=1)
-# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." 
 
 # Other model plots
-plot(model1_ndvi, single = TRUE) # look into how to interpret?
+plot(model1_ndvi, single = TRUE) 
+
+# Residual Analysis
+par(mfrow=c(2,2))
+plot(model1_ndvi$summary.random$spatial.field$mean, type="l")
+qqnorm(model1_ndvi$summary.random$spatial.field$mean)
+hist(model1_ndvi$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model1_ndvi$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model1_ndvi$summary.random$spatial.field$mean)
+boxplot(model1_ndvi$summary.random$spatial.field$mean)
+
+
 
 ```
 
@@ -613,6 +750,28 @@ model1_ndvi$summary.hyperpar
 
 model2_ndvi$summary.fix
 model2_ndvi$summary.hyperpar
+
+# Residual Analysis
+graphics.off()
+par(mfrow=c(2,2))
+plot(model2_ndvi$summary.random$spatial.field$mean, type="l")
+qqnorm(model2_ndvi$summary.random$spatial.field$mean)
+hist(model2_ndvi$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model2_ndvi$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model2_ndvi$summary.random$spatial.field$mean)
+boxplot(model2_ndvi$summary.random$spatial.field$mean)
+
 
 ```
 
@@ -697,15 +856,33 @@ g.sd <- inla.mesh.project(gproj, model1_o3$summary.random$spatial.field$sd)
 grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
              levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
              nrow=1)
-# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." 
 
 # Other model plots
-plot(model1_o3, single = TRUE) # look into how to interpret?
+plot(model1_o3, single = TRUE) 
 
+# Residual Analysis
+par(mfrow=c(2,2))
+plot(model1_o3$summary.random$spatial.field$mean, type="l")
+qqnorm(model1_o3$summary.random$spatial.field$mean)
+hist(model1_o3$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model1_o3$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model1_o3$summary.random$spatial.field$mean)
+boxplot(model1_o3$summary.random$spatial.field$mean)
 ```
 
-TO DO - INLA - setting priors for O3
-
+INLA - setting priors for O3
 ```{r}
 # MRF smooth model for o3
 mrf_income_o3 <- bam(o3_change ~ score_0.5 + med_income_decile + s(GEOID, bs='mrf', k=200, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
@@ -743,6 +920,27 @@ model1_o3$summary.hyperpar
 
 model2_o3$summary.fix
 model2_o3$summary.hyperpar
+
+# Residual Analysis
+graphics.off()
+par(mfrow=c(2,2))
+plot(model2_o3$summary.random$spatial.field$mean, type="l")
+qqnorm(model2_o3$summary.random$spatial.field$mean)
+hist(model2_o3$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model2_o3$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model2_o3$summary.random$spatial.field$mean)
+boxplot(model2_o3$summary.random$spatial.field$mean)
 
 ```
 
@@ -832,11 +1030,30 @@ g.sd <- inla.mesh.project(gproj, model1_no2$summary.random$spatial.field$sd)
 grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
              levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
              nrow=1)
-# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." 
 
 # Other model plots
-plot(model1_no2, single = TRUE) # look into how to interpret?
+plot(model1_no2, single = TRUE)
 
+# Residual Analysis
+par(mfrow=c(2,2))
+plot(model1_no2$summary.random$spatial.field$mean, type="l")
+qqnorm(model1_no2$summary.random$spatial.field$mean)
+hist(model1_no2$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model1_no2$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model1_no2$summary.random$spatial.field$mean)
+boxplot(model1_no2$summary.random$spatial.field$mean)
 ```
 
 INLA - Setting priors in the model for NO2
@@ -850,7 +1067,7 @@ formula2_no2 <- y ~ -1 + Intercept + score_0.5 +
   f(COUNTYFP10, model = "iid") #random effect
 
 priors_no2 <- simple_extract(mrf_income_no2)
-model_no2 <- inla(
+model2_no2 <- inla(
   formula2_no2,
   data = inla.stack.data(stk_no2, spde=spde),
   family = 'gaussian',
@@ -873,6 +1090,27 @@ model1_no2$summary.hyperpar
 
 model2_no2$summary.fix
 model2_no2$summary.hyperpar
+
+# Residual Analysis
+graphics.off()
+par(mfrow=c(2,2))
+plot(model2_no2$summary.random$spatial.field$mean, type="l")
+qqnorm(model2_no2$summary.random$spatial.field$mean)
+hist(model2_no2$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model2_no2$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model2_no2$summary.random$spatial.field$mean)
+boxplot(model2_no2$summary.random$spatial.field$mean)
 
 ```
 
@@ -957,11 +1195,30 @@ g.sd <- inla.mesh.project(gproj, model1_temp$summary.random$spatial.field$sd)
 grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
              levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
              nrow=1)
-# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." 
 
 # Other model plots
-plot(model1_temp, single = TRUE) # look into how to interpret?
+plot(model1_temp, single = TRUE) 
 
+# Residual Analysis
+par(mfrow=c(2,2))
+plot(model1_temp$summary.random$spatial.field$mean, type="l")
+qqnorm(model1_temp$summary.random$spatial.field$mean)
+hist(model1_temp$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model1_temp$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model1_temp$summary.random$spatial.field$mean)
+boxplot(model1_temp$summary.random$spatial.field$mean)
 ```
 INLA - setting priors for temp model
 ```{r}
@@ -999,6 +1256,27 @@ model1_temp$summary.hyperpar
 
 model2_temp$summary.fix
 model2_temp$summary.hyperpar
+
+# Residual Analysis
+graphics.off()
+par(mfrow=c(2,2))
+plot(model2_temp$summary.random$spatial.field$mean, type="l")
+qqnorm(model2_temp$summary.random$spatial.field$mean)
+hist(model2_temp$summary.random$spatial.field$mean)
+
+# QQ Plot to check normality
+residuals <- model2_temp$summary.random$spatial.field$mean
+qqnorm(residuals)
+
+# Shapiro-Wilk Test for Normality
+shapiro.test(residuals)
+
+# Kolmogorov-Smirnov test against normal distribution
+ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
+
+# Check for outliers
+plot(model2_temp$summary.random$spatial.field$mean)
+boxplot(model2_temp$summary.random$spatial.field$mean)
 
 ```
 
