@@ -41,7 +41,7 @@ library(lattice) # for levelplot
 library(inlatools) # for INLA diagnostics 
 ```
 
-Load and clean data
+Load and clean data (note: takes approximately 12 mins)
 ```{r}
 # Check if 'data' directory exists; if not, create it
 if (!dir.exists(here("data"))) {
@@ -245,6 +245,51 @@ all_data_inc$med_income_decile <- findInterval(all_data_inc$med_income_2000_impu
                                              income_quantiles,
                                              rightmost.closed = TRUE)
 ```
+Backing up data (writing data frames as csv files)
+```{r}
+###################### BACKING UP NYC TRACTS INFO ######################
+# # Convert geometry to WKT format
+# nyc_tracts$geometry <- st_as_text(nyc_tracts$geometry)
+# # Save to CSV (now including geometry as text)
+# write.csv(nyc_tracts, "nyc_tracts_with_geometry.csv", row.names = FALSE)
+# nyc_tracts_with_geometry <- read.csv(here("nyc_tracts_with_geometry.csv"))
+# nyc_tracts <- st_as_sf(nyc_tracts_with_geometry, wkt = "geometry") %>%
+#   mutate(
+#     lat = as.numeric(INTPTLAT10),
+#     long = as.numeric(INTPTLON10),
+#     tractid = GEOID10,
+#     tractid = as.character(tractid)  
+#   ) %>%
+#   filter(tractid %in% nyc_fips)
+# 
+# ############## BACKING UP NYC WEIGHTED CENTROIDS ######################
+# write.csv(nyc_weighted_centroids, "nyc_weighted_centroids.csv",row.names=FALSE)
+# nyc_weighted_centroids_copy <- read_csv(here("nyc_weighted_centroids.csv"))
+# 
+# #################### BACKING UP all_data_inc as csv ######################
+# # Convert geometry to WKT format and save as CSV
+# all_data_inc_csv <- all_data_inc %>%
+#   mutate(geometry = st_as_text(geometry))
+# 
+# write.csv(all_data_inc_csv, "all_data_inc_csv.csv", row.names = FALSE)
+# 
+# #################### BACKING UP all_data_inc_clean as csv (for NDVI MRF smooth) ######################
+# this runs only when #323 is already run to then save the output
+# all_data_inc_clean_csv <- all_data_inc %>%
+#   mutate(geometry = st_as_text(geometry))
+# 
+# write.csv(all_data_inc_clean_csv, "all_data_inc_clean_csv.csv", row.names = FALSE)
+
+```
+
+Read in backed up data (alternative to code chunk 2 - lines 45-247)
+```{r}
+# # read in as data frame 
+# all_data_inc <- read.csv("here"("all_data_inc_csv.csv"))
+# 
+# all_data_inc_clean <- read.csv("here"("all_data_inc_clean_csv.csv"))
+
+```
 
 INLA set up
 ```{r}
@@ -332,6 +377,7 @@ spde <- inla.spde2.matern(Mesh, alpha=2) #they fix alpha as 2
 # Create all the required indexes for the SPDE model, naming the spatial field as “spatial.field”, which facilitates the extraction of the estimated values of the spatial field after the fitting process.
 iset <- inla.spde.make.index(name = "spatial.field", spde$n.spde)
 ```
+
 Function for setting priors from GAM models for later use
 ```{r}
 # Function to extract priors from GAM 
@@ -389,7 +435,6 @@ INLA model results for PM2.5
 # Posterior distribution summary of the fixed effects
 model1_pm$summary.fix
 
-
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
 model1_pm$summary.hyperpar
 
@@ -398,7 +443,7 @@ round(model1_pm$summary.fixed,3)
 round(model1_pm$summary.hyperpar,3)
 
 # "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
-model1_pm.res<-inla.spde2.result(model1_pm, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+model1_pm.res<-inla.spde2.result(model1_pm, 'spatial.field', spde, do.transf=TRUE) # do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
 
 model1_pm.res$summary.log.range.nominal
 model1_pm.res$summary.log.variance.nominal
@@ -456,9 +501,6 @@ hist(model1_pm$summary.random$spatial.field$mean)
 residuals <- model1_pm$summary.random$spatial.field$mean
 qqnorm(residuals)
 
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
-
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 
@@ -467,72 +509,70 @@ plot(model1_pm$summary.random$spatial.field$mean)
 boxplot(model1_pm$summary.random$spatial.field$mean)
 
 ```
-Additional diagnostics? 
+Additional diagnostics? (have not figured it out)
 ```{r}
-# inlatools setting a prior https://inlatools.netlify.app/articles/prior - not sure how to apply this
-str(x <- simulate_iid(sigma = 1))
-plot(x)
-plot(x, link = "log")
-plot(x, link = "logit")
-
-plot(model1_pm)
-
-# https://www.paulamoraga.com/book-geospatial/sec-inla.html#control-variables-to-compute-approximations
-alpha <- model1_pm$marginals.fixed[[1]]
-ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
-  geom_line() +
-  theme_bw()
-
-quant <- inla.qmarginal(0.05, alpha)
-quant
-
-inla.pmarginal(quant, alpha)
-
-ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
-  geom_line() +
-  geom_area(data = subset(data.frame(inla.smarginal(alpha)),
-                                     x < quant),
-            fill = "black") +
-  theme_bw()
-
-inla.dmarginal(-6.3, alpha)
-
-ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
-  geom_line() +
-  geom_vline(xintercept = -6.3, linetype = "dashed") +
-  theme_bw()
-
-
-marg.variance <- inla.tmarginal(function(x) 1/x, 
-model1_pm$marginals.hyperpar[[1]])
-
-ggplot(data.frame(inla.smarginal(marg.variance)), aes(x, y)) +
-  geom_line() +
-  theme_bw()
-
-m <- inla.emarginal(function(x) x, marg.variance)
-m
-
-mm <- inla.emarginal(function(x) x^2, marg.variance)
-sqrt(mm - m^2)
-
-inla.qmarginal(c(0.025, 0.5, 0.975), marg.variance)
-
-inla.zmarginal(marg.variance)
-
-# Extract fitted values marginals
-list_marginals <- model1_pm$marginals.fitted.values
-
-# Convert to dataframe
-marginals <- data.frame(do.call(rbind, list_marginals))
-
-# Add identifier column (modify as needed)
-marginals$location <- rep(names(list_marginals), 
-                          times = sapply(list_marginals, nrow))
+# # inlatools setting a prior https://inlatools.netlify.app/articles/prior - not sure how to apply this
+# str(x <- simulate_iid(sigma = 1))
+# plot(x)
+# plot(x, link = "log")
+# plot(x, link = "logit")
+# 
+# plot(model1_pm)
+# 
+# # https://www.paulamoraga.com/book-geospatial/sec-inla.html#control-variables-to-compute-approximations
+# alpha <- model1_pm$marginals.fixed[[1]]
+# ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
+#   geom_line() +
+#   theme_bw()
+# 
+# quant <- inla.qmarginal(0.05, alpha)
+# quant
+# 
+# inla.pmarginal(quant, alpha)
+# 
+# ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
+#   geom_line() +
+#   geom_area(data = subset(data.frame(inla.smarginal(alpha)),
+#                                      x < quant),
+#             fill = "black") +
+#   theme_bw()
+# 
+# inla.dmarginal(-6.3, alpha)
+# 
+# ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) +
+#   geom_line() +
+#   geom_vline(xintercept = -6.3, linetype = "dashed") +
+#   theme_bw()
+# 
+# 
+# marg.variance <- inla.tmarginal(function(x) 1/x, 
+# model1_pm$marginals.hyperpar[[1]])
+# 
+# ggplot(data.frame(inla.smarginal(marg.variance)), aes(x, y)) +
+#   geom_line() +
+#   theme_bw()
+# 
+# m <- inla.emarginal(function(x) x, marg.variance)
+# m
+# 
+# mm <- inla.emarginal(function(x) x^2, marg.variance)
+# sqrt(mm - m^2)
+# 
+# inla.qmarginal(c(0.025, 0.5, 0.975), marg.variance)
+# 
+# inla.zmarginal(marg.variance)
+# 
+# # Extract fitted values marginals
+# list_marginals <- model1_pm$marginals.fitted.values
+# 
+# # Convert to dataframe
+# marginals <- data.frame(do.call(rbind, list_marginals))
+# 
+# # Add identifier column (modify as needed)
+# marginals$location <- rep(names(list_marginals), 
+#                           times = sapply(list_marginals, nrow))
 
 ```
-
-
 
 INLA - setting priors in the model for PM2.5
 ```{r}
@@ -560,7 +600,6 @@ model2_pm <- inla(
   verbose = FALSE
 )
 
-
 # Comparing results for models with and without setting priors from MRF model
 # Plot effect estimates and credible intervals
 graphics.off()
@@ -586,9 +625,6 @@ hist(model2_pm$summary.random$spatial.field$mean)
 # QQ Plot to check normality
 residuals <- model2_pm$summary.random$spatial.field$mean
 qqnorm(residuals)
-
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
 
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
@@ -694,17 +730,12 @@ hist(model1_ndvi$summary.random$spatial.field$mean)
 residuals <- model1_ndvi$summary.random$spatial.field$mean
 qqnorm(residuals)
 
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
-
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 
 # Check for outliers
 plot(model1_ndvi$summary.random$spatial.field$mean)
 boxplot(model1_ndvi$summary.random$spatial.field$mean)
-
-
 
 ```
 
@@ -762,8 +793,6 @@ hist(model2_ndvi$summary.random$spatial.field$mean)
 residuals <- model2_ndvi$summary.random$spatial.field$mean
 qqnorm(residuals)
 
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
 
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
@@ -871,9 +900,6 @@ hist(model1_o3$summary.random$spatial.field$mean)
 residuals <- model1_o3$summary.random$spatial.field$mean
 qqnorm(residuals)
 
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
-
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 
@@ -931,9 +957,6 @@ hist(model2_o3$summary.random$spatial.field$mean)
 # QQ Plot to check normality
 residuals <- model2_o3$summary.random$spatial.field$mean
 qqnorm(residuals)
-
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
 
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
@@ -1045,9 +1068,6 @@ hist(model1_no2$summary.random$spatial.field$mean)
 residuals <- model1_no2$summary.random$spatial.field$mean
 qqnorm(residuals)
 
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
-
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 
@@ -1082,7 +1102,7 @@ graphics.off()
 Efxplot(list(model2_no2)) 
 Efxplot(list(model1_no2))
 
-plot(model2_no2, single = TRUE) #don't know what this plot is and don't know why output is different from model 1
+#plot(model2_no2, single = TRUE) #don't know what this plot is and don't know why output is different from model 1
 
 # Compare model 1 (no priors) and model 2 (priors) results
 model1_no2$summary.fix
@@ -1101,9 +1121,6 @@ hist(model2_no2$summary.random$spatial.field$mean)
 # QQ Plot to check normality
 residuals <- model2_no2$summary.random$spatial.field$mean
 qqnorm(residuals)
-
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
 
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
@@ -1210,9 +1227,6 @@ hist(model1_temp$summary.random$spatial.field$mean)
 residuals <- model1_temp$summary.random$spatial.field$mean
 qqnorm(residuals)
 
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
-
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 
@@ -1220,6 +1234,7 @@ ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 plot(model1_temp$summary.random$spatial.field$mean)
 boxplot(model1_temp$summary.random$spatial.field$mean)
 ```
+
 INLA - setting priors for temp model
 ```{r}
 #MRF smooth model for 2016 mean temp
@@ -1267,9 +1282,6 @@ hist(model2_temp$summary.random$spatial.field$mean)
 # QQ Plot to check normality
 residuals <- model2_temp$summary.random$spatial.field$mean
 qqnorm(residuals)
-
-# Shapiro-Wilk Test for Normality
-shapiro.test(residuals)
 
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
