@@ -102,6 +102,13 @@ ndvi_2016 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>%
 ndvi_2000 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
   exact_extract(nyc_tracts, fun = "mean")
 
+# For both mean and standard deviation
+ndvi_2000_stats <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = c("mean", "stdev"))
+
+ndvi_2016_stats <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = c("mean", "stdev"))
+
 # PM2.5 data
 # Download data from URL
 download_data <- function() {
@@ -122,6 +129,7 @@ pm_tract_2002 <- read.delim(gzfile(here("data", "2002_pm25_daily_average.txt.gz"
   ## Calculate annual average by tract using population weighted centroid
   group_by(FIPS) %>%
   summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+            pm_sd_2002 = sd(pm25_daily_average.ug.m3.),
             Longitude = first(Longitude_weighted),
             Latitude = first(Latitude_weighted))
 
@@ -135,7 +143,8 @@ pm_tract_2016 <- read.delim(gzfile(here("data", "2016_pm25_daily_average.txt.gz"
   left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
   ## calculate annual average by tract using population weighted centroid
   group_by(Loc_Label1) %>%
-  summarize(pm_mean_2016 = mean(Prediction), 
+  summarize(pm_mean_2016 = mean(Prediction),
+            pm_sd_2016 = sd(Prediction),
             Longitude = first(Longitude_weighted),
             Latitude = first(Latitude_weighted))
   
@@ -172,6 +181,7 @@ o3_tract_2002 <- read.delim(gzfile(here("data", "2002_ozone_daily_8hour_maximum.
   ## calculate annual average by tract using population weighted centroid
   group_by(FIPS) %>%
   summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+            o3_sd_2002 = sd(ozone_daily_8hour_maximum.ppb.),
             Longitude = first(Longitude_weighted),
             Latitude = first(Latitude_weighted))
 
@@ -186,6 +196,7 @@ o3_tract_2016 <- read.delim(gzfile(here("data", "2016_ozone_daily_8hour_maximum.
   ## calculate annual average by tract using  population weighted centroid
   group_by(Loc_Label1) %>%
   summarize(o3_mean_2016 = mean(Prediction),
+            o3_sd_2016 = sd(Prediction),
             Longitude = first(Longitude_weighted),
             Latitude = first(Latitude_weighted))
 
@@ -200,11 +211,12 @@ all_data <- nyc_tracts %>%
   left_join(pm_tract, by = c("GEOID" = "FIPS"))  %>% 
   mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016-pm_2002) %>% 
   left_join(o3_tract, by = c("GEOID" = "FIPS"))  %>% 
-  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002) %>% 
+  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002, o3_sd_2016 = o3_sd_2016, o3_sd_2002 = o3_sd_2002) %>% 
   left_join(no2_caces, by = c("GEOID" = "fips")) %>% 
   mutate(no2_change = no2_2016-no2_2000) %>% 
   mutate(ndvi_2016 = ndvi_2016, ndvi_2000 = ndvi_2000, ndvi_change = ndvi_2016-ndvi_2000) %>% 
   left_join(temp, by = "GEOID")
+
 
 ############ Median income ###############################
 # Find median household income variable in 2000 decennial census
@@ -405,6 +417,31 @@ stk_pm <- inla.stack(
                                  med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10)))
 
+stk_pm_sd <- inla.stack(
+  data=list(y=all_data_inc$pm_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 pm_sd_2002 = all_data_inc$pm_sd_2002,
+                                 pm_sd_2016 = all_data_inc$pm_sd_2016)))
+
+stk_pm_sd_2002 <- inla.stack(
+  data=list(y=all_data_inc$pm_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 pm_sd_2002 = all_data_inc$pm_sd_2002)))
+
 
 #"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
 ```
@@ -425,6 +462,38 @@ model1_pm<-inla(formula1_pm,
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_pm),compute = TRUE), 
              control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE))
+
+```
+PM with std dev. 
+```{r}
+# Specify formula - using both years' sd
+formula_pm_sd <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  pm_sd_2002 + 
+  pm_sd_2016 +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model - using both years' sd
+model_pm_sd <-inla(formula_pm_sd, 
+             data = inla.stack.data(stk_pm_sd, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_pm_sd),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
+
+# Specify formula - using 2002 sd
+formula_pm_sd_2002 <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  pm_sd_2002 + 
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model - using 2002 sd
+model_pm_sd_2002 <-inla(formula_pm_sd_2002, 
+             data = inla.stack.data(stk_pm_sd_2002, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_pm_sd_2002),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
 
 ```
 
@@ -507,8 +576,123 @@ ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 # Check for outliers
 plot(model1_pm$summary.random$spatial.field$mean)
 boxplot(model1_pm$summary.random$spatial.field$mean)
+plot(model_pm_sd$summary.random$spatial.field$mean)
+boxplot(model_pm_sd$summary.random$spatial.field$mean)
+plot(model_pm_sd_2002$summary.random$spatial.field$mean)
+boxplot(model_pm_sd_2002$summary.random$spatial.field$mean)
+
 
 ```
+Checking Moran's I FOR pm
+```{r}
+# Function to calculate Moran's I for model residuals
+calculate_morans_i <- function(model, observed_values, coords, k = 5) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Calculate Moran's I
+  moran_result <- moran.test(residuals, lw)
+  
+  return(moran_result)
+}
+
+# Calculate for original model
+moran_pm_original <- calculate_morans_i(model1_pm, all_data_inc$o3_change, Locations)
+
+# Calculate for model_o3_sd
+moran_model_pm_sd <- calculate_morans_i(model_pm_sd, all_data_inc$o3_change, Locations)
+
+# Calculate for model_o3_sd_2002
+moran_model_pm_sd_2002 <- calculate_morans_i(model_pm_sd_2002, all_data_inc$o3_change, Locations)
+
+# Create a comparison table
+comparison_table <- data.frame(
+  Model = c("model1_pm", "model_pm_sd", "model_pm_sd_2002"),
+  Morans_I = c(moran_pm_original$estimate[1], 
+               moran_model_pm_sd$estimate[1], 
+               moran_model_pm_sd_2002$estimate[1]),
+  p_value = c(moran_pm_original$p.value, 
+              moran_model_pm_sd$p.value, 
+              moran_model_pm_sd_2002$p.value),
+  z_score = c(moran_pm_original$statistic, 
+              moran_model_pm_sd$statistic, 
+              moran_model_pm_sd_2002$statistic)
+)
+
+print(comparison_table)
+
+# Plot comparison of Moran's I values
+ggplot(comparison_table, aes(x = Model, y = Morans_I)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(Morans_I, 4)), vjust = -0.5) +
+  labs(title = "Comparison of Moran's I Values Across Models",
+       y = "Moran's I") +
+  theme_minimal()
+```
+
+MORANS I SCATTER PLOT FOR PM2.5
+```{r}
+# Function to create a Moran's I scatter plot for model residuals
+create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Moran's I test
+  mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+  moran_i <- round(mi_test$estimate[1], 4)
+  p_value <- format.pval(mi_test$p.value, digits = 4)
+  z_score <- round(mi_test$statistic, 4)
+  
+  # Determine significance indicator
+  sig_indicator <- ifelse(mi_test$p.value < 0.001, "***", 
+                    ifelse(mi_test$p.value < 0.01, "**",
+                    ifelse(mi_test$p.value < 0.05, "*", "ns")))
+  
+  # Create Moran scatter plot
+  png(paste0("moran_plot_", gsub(" ", "_", title), ".png"), width = 800, height = 600)
+  mp <- moran.plot(residuals, lw, main = paste("Moran's I Scatter Plot -", title),
+                  xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+  
+  # Add regression line with the exact Moran's I slope
+  abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+  
+  # Add statistics to plot
+  legend_text <- c(
+    paste("Moran's I:", moran_i),
+    paste("p-value:", p_value, sig_indicator),
+    paste("z-score:", z_score)
+  )
+  
+  legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+  
+  dev.off()
+  
+  return(mp)
+}
+
+# Create scatter plots for all three models
+plot1 <- create_morans_plot(model1_pm, all_data_inc$pm_change, Locations, k = 5, "model1_pm")
+plot2 <- create_morans_plot(model_pm_sd, all_data_inc$pm_change, Locations, k = 5, "model_pm_sd")
+plot3 <- create_morans_plot(model_pm_sd_2002, all_data_inc$pm_change, Locations, k = 5, "model_pm_sd_2002")
+
+```
+
 Additional diagnostics? (have not figured it out)
 ```{r}
 # # inlatools setting a prior https://inlatools.netlify.app/articles/prior - not sure how to apply this
@@ -675,7 +859,7 @@ INLA model results for NDVI
 ```{r}
 ###  Model results
 # Posterior distribution summary of the fixed effects
-model1_ndvi$summary.fix
+model1_ndvi$summary.fix #crosses zero - insig
 
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
 model1_ndvi$summary.hyperpar
@@ -737,6 +921,82 @@ ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 plot(model1_ndvi$summary.random$spatial.field$mean)
 boxplot(model1_ndvi$summary.random$spatial.field$mean)
 
+```
+
+Moran's I for NDVI
+```{r}
+# Function to calculate Moran's I for model residuals
+calculate_morans_i <- function(model, observed_values, coords, k = 5) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Calculate Moran's I
+  moran_result <- moran.test(residuals, lw)
+  
+  return(moran_result)
+}
+
+# Calculate for original model
+moran_ndvi_original <- calculate_morans_i(model1_ndvi, all_data_inc$ndvi_change, Locations)
+
+moran_ndvi_original
+
+# Function to create a Moran's I scatter plot for model residuals
+create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Moran's I test
+  mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+  moran_i <- round(mi_test$estimate[1], 4)
+  p_value <- format.pval(mi_test$p.value, digits = 4)
+  z_score <- round(mi_test$statistic, 4)
+  
+  # Determine significance indicator
+  sig_indicator <- ifelse(mi_test$p.value < 0.001, "***", 
+                    ifelse(mi_test$p.value < 0.01, "**",
+                    ifelse(mi_test$p.value < 0.05, "*", "ns")))
+  
+  # Create Moran scatter plot
+  png(paste0("moran_plot_", gsub(" ", "_", title), ".png"), width = 800, height = 600)
+  mp <- moran.plot(residuals, lw, main = paste("Moran's I Scatter Plot -", title),
+                  xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+  
+  # Add regression line with the exact Moran's I slope
+  abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+  
+  # Add statistics to plot
+  legend_text <- c(
+    paste("Moran's I:", moran_i),
+    paste("p-value:", p_value, sig_indicator),
+    paste("z-score:", z_score)
+  )
+  
+  legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+  
+  dev.off()
+  
+  return(mp)
+}
+
+# Create scatter plots for all three models
+plot1 <- create_morans_plot(model1_ndvi,all_data_inc$ndvi_change, Locations, k = 5, "model1_ndvi")
 ```
 
 INLA - setting priors in the model for NDVI
@@ -807,6 +1067,9 @@ boxplot(model2_ndvi$summary.random$spatial.field$mean)
 
 INLA stack (O3)
 ```{r}
+# o3 change sd
+# all_data_inc$o3_change_sd <- sqrt(all_data_inc$o3_sd_2016^2 + all_data_inc$o3_sd_2002^2)
+
 # Create stack
 stk_o3 <- inla.stack(
   data=list(y=all_data_inc$o3_change), # the response
@@ -819,8 +1082,37 @@ stk_o3 <- inla.stack(
                                  med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10)))
 
+stk_o3_sd <- inla.stack(
+  data=list(y=all_data_inc$o3_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 o3_sd_2002 = all_data_inc$o3_sd_2002,
+                                 o3_sd_2016 = all_data_inc$o3_2016)))
+
+stk_o3_sd_2002 <- inla.stack(
+  data=list(y=all_data_inc$o3_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 o3_sd_2002 = all_data_inc$o3_sd_2002)))
+
+
+
 
 #"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
+
+
 
 ```
 
@@ -841,21 +1133,59 @@ model1_o3<-inla(formula1_o3,
 
 ```
 
+O3 with standard dev.
+```{r}
+# Specify formula - using both years' sd
+formula_o3_sd <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  o3_sd_2002 + 
+  o3_sd_2016 +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model - using both years' sd
+model_o3_sd <-inla(formula_o3_sd, 
+             data = inla.stack.data(stk_o3_sd, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_o3_sd),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
+
+# Specify formula - using 2002 sd
+formula_o3_sd_2002 <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  o3_sd_2002 + 
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model - using both years' sd
+model_o3_sd_2002 <-inla(formula_o3_sd_2002, 
+             data = inla.stack.data(stk_o3_sd_2002, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_o3_sd_2002),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
+
+```
+
 INLA model results for O3
 ```{r}
 ###  Model results
 # Posterior distribution summary of the fixed effects
 model1_o3$summary.fix
+model_o3_sd$summary.fix
 
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
 model1_o3$summary.hyperpar
+model_o3_sd$summary.fix
 
 # Rounded summaries
 round(model1_o3$summary.fixed,3) 
 round(model1_o3$summary.hyperpar,3)
 
+round(model_o3_sd$summary.fixed,3) 
+round(model_o3_sd$summary.hyperpar,3)
+
 # "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
-model1_o3.res<-inla.spde2.result(model1_ndvi, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+model1_o3.res<-inla.spde2.result(model1_o3, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
 
 model1_o3.res$summary.log.range.nominal
 model1_o3.res$summary.log.variance.nominal
@@ -863,6 +1193,8 @@ model1_o3.res$summary.log.variance.nominal
 # Plot effect estimate and credible intervals
 graphics.off()
 Efxplot(list(model1_o3))
+Efxplot(list(model_hetero_o3))
+
 
 # Plot for fixed parameters for insight into the effect of covariates
 par(mfrow=c(2,2))
@@ -905,7 +1237,264 @@ ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 
 # Check for outliers
 plot(model1_o3$summary.random$spatial.field$mean)
+plot(model_o3_sd$summary.random$spatial.field$mean)
 boxplot(model1_o3$summary.random$spatial.field$mean)
+boxplot(model_o3_sd$summary.random$spatial.field$mean)
+plot(model_o3_sd_2002$summary.random$spatial.field$mean)
+boxplot(model_o3_sd_2002$summary.random$spatial.field$mean)
+
+qqnorm(model1_o3$summary.random$spatial.field$mean)
+qqnorm(model_o3_sd$summary.random$spatial.field$mean)
+qqnorm(model_o3_sd_2002$summary.random$spatial.field$mean)
+
+
+```
+Checking Moran's I FOR O3
+```{r}
+# Function to calculate Moran's I for model residuals
+calculate_morans_i <- function(model, observed_values, coords, k = 5) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Calculate Moran's I
+  moran_result <- moran.test(residuals, lw)
+  
+  return(moran_result)
+}
+
+# Calculate for original model
+moran_original <- calculate_morans_i(model1_o3, all_data_inc$o3_change, Locations)
+
+# Calculate for model_o3_sd
+moran_model_o3_sd <- calculate_morans_i(model_o3_sd, all_data_inc$o3_change, Locations)
+
+# Calculate for model_o3_sd_2002
+moran_model_o3_sd_2002 <- calculate_morans_i(model_o3_sd_2002, all_data_inc$o3_change, Locations)
+
+# Create a comparison table
+comparison_table <- data.frame(
+  Model = c("model1_o3", "model_o3_sd", "model_o3_sd_2002"),
+  Morans_I = c(moran_original$estimate[1], 
+               moran_model_o3_sd$estimate[1], 
+               moran_model_o3_sd_2002$estimate[1]),
+  p_value = c(moran_original$p.value, 
+              moran_model_o3_sd$p.value, 
+              moran_model_o3_sd_2002$p.value),
+  z_score = c(moran_original$statistic, 
+              moran_model_o3_sd$statistic, 
+              moran_model_o3_sd_2002$statistic)
+)
+
+print(comparison_table)
+
+# Plot comparison of Moran's I values
+ggplot(comparison_table, aes(x = Model, y = Morans_I)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(Morans_I, 4)), vjust = -0.5) +
+  labs(title = "Comparison of Moran's I Values Across Models",
+       y = "Moran's I") +
+  theme_minimal()
+```
+MORANS I SCATTER PLOT FOR O3
+```{r}
+# Function to create a Moran's I scatter plot for model residuals
+create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Moran's I test
+  mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+  moran_i <- round(mi_test$estimate[1], 4)
+  p_value <- format.pval(mi_test$p.value, digits = 4)
+  z_score <- round(mi_test$statistic, 4)
+  
+  # Determine significance indicator
+  sig_indicator <- ifelse(mi_test$p.value < 0.001, "***", 
+                    ifelse(mi_test$p.value < 0.01, "**",
+                    ifelse(mi_test$p.value < 0.05, "*", "ns")))
+  
+  # Create Moran scatter plot
+  png(paste0("moran_plot_", gsub(" ", "_", title), ".png"), width = 800, height = 600)
+  mp <- moran.plot(residuals, lw, main = paste("Moran's I Scatter Plot -", title),
+                  xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+  
+  # Add regression line with the exact Moran's I slope
+  abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+  
+  # Add statistics to plot
+  legend_text <- c(
+    paste("Moran's I:", moran_i),
+    paste("p-value:", p_value, sig_indicator),
+    paste("z-score:", z_score)
+  )
+  
+  legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+  
+  dev.off()
+  
+  return(mp)
+}
+
+# Create scatter plots for all three models
+plot1 <- create_morans_plot(model1_o3, all_data_inc$o3_change, Locations, k = 5, "model1_o3")
+plot2 <- create_morans_plot(model_o3_sd, all_data_inc$o3_change, Locations, k = 5, "model_o3_sd")
+plot3 <- create_morans_plot(model_o3_sd_2002, all_data_inc$o3_change, Locations, k = 5, "model_o3_sd_2002")
+
+```
+LISA VISUALIZATIONS FOR O3
+```{r}
+# Function to create and save LISA cluster maps
+visualize_lisa_results <- function(model, observed_values, coords, title, k = 5) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Calculate local Moran's I
+  local_moran <- localmoran(residuals, lw)
+  
+  # Create cluster categories
+  quadrant <- vector(mode="numeric", length=nrow(local_moran))
+  
+  # Center the residuals and lagged residuals on their means
+  m.residuals <- residuals - mean(residuals)
+  m.lag <- lag.listw(lw, residuals) - mean(lag.listw(lw, residuals))
+  
+  # Build quadrants
+  # HH (high values surrounded by high values)
+  quadrant[m.residuals >= 0 & m.lag >= 0] <- 1
+  # LL (low values surrounded by low values)
+  quadrant[m.residuals <= 0 & m.lag <= 0] <- 2
+  # HL (high values surrounded by low values)
+  quadrant[m.residuals >= 0 & m.lag <= 0] <- 3
+  # LH (low values surrounded by high values)
+  quadrant[m.residuals <= 0 & m.lag >= 0] <- 4
+  
+  # Only mark significant clusters (p < 0.05)
+  quadrant[local_moran[,5] > 0.05] <- 0
+  
+  # Create a data frame with coordinates and LISA results
+  lisa_df <- data.frame(
+    x = coords[,1],
+    y = coords[,2],
+    residual = residuals,
+    lag_residual = lag.listw(lw, residuals),
+    local_i = local_moran[,1],
+    p_value = local_moran[,5],
+    cluster = factor(quadrant, levels = 0:4, 
+                     labels = c("Not Significant", "High-High", "Low-Low", 
+                               "High-Low", "Low-High"))
+  )
+  
+  # Plot local Moran's I values
+  png(paste0("local_moran_", gsub(" ", "_", title), ".png"), width = 800, height = 800)
+  
+  par(mfrow = c(2, 1))
+  
+  # Plot 1: Local Moran's I values
+  plot(lisa_df$x, lisa_df$y, pch = 19, cex = 0.8,
+       col = colorRampPalette(c("blue", "white", "red"))(10)[cut(lisa_df$local_i, breaks = 10)],
+       main = paste("Local Moran's I Values -", title),
+       xlab = "Longitude", ylab = "Latitude")
+  
+  # Plot 2: LISA Cluster Map
+  colors <- c("grey", "red", "blue", "lightpink", "lightblue")
+  plot(lisa_df$x, lisa_df$y, pch = 19, cex = 0.8,
+       col = colors[as.numeric(lisa_df$cluster)],
+       main = paste("LISA Cluster Map -", title),
+       xlab = "Longitude", ylab = "Latitude")
+  
+  # Add a legend
+  legend("bottomright", legend = levels(lisa_df$cluster),
+         col = colors, pch = 19, cex = 0.8, bty = "n")
+  
+  dev.off()
+  
+  # Also create a Moran scatter plot with quadrants labeled
+  png(paste0("moran_quadrant_", gsub(" ", "_", title), ".png"), width = 800, height = 800)
+  
+  # Moran scatter plot
+  plot(m.residuals, m.lag,
+       xlab = "Residuals", 
+       ylab = "Lagged Residuals",
+       main = paste("Moran Scatter Plot with Quadrants -", title),
+       pch = 19, col = colors[as.numeric(lisa_df$cluster)])
+  # Add horizontal and vertical lines at 0
+  abline(h = 0, v = 0, lty = 2)
+  # Add regression line
+  abline(lm(m.lag ~ m.residuals), col = "black")
+  # Add labels for quadrants
+  text(min(m.residuals) * 0.8, max(m.lag) * 0.8, "LH (4)", cex = 1.2)
+  text(max(m.residuals) * 0.8, max(m.lag) * 0.8, "HH (1)", cex = 1.2)
+  text(min(m.residuals) * 0.8, min(m.lag) * 0.8, "LL (2)", cex = 1.2)
+  text(max(m.residuals) * 0.8, min(m.lag) * 0.8, "HL (3)", cex = 1.2)
+  # Add legend
+  legend("bottomright", legend = levels(lisa_df$cluster),
+         col = colors, pch = 19, cex = 0.8, bty = "n")
+  
+  dev.off()
+  
+  # Return the data frame for further use
+  return(lisa_df)
+}
+
+# Create LISA visualizations for all three models
+lisa_df1 <- visualize_lisa_results(model1_o3, all_data_inc$o3_change, Locations, "model1_o3")
+lisa_df2 <- visualize_lisa_results(model_o3_sd, all_data_inc$o3_change, Locations, "model_o3_sd")
+lisa_df3 <- visualize_lisa_results(model_o3_sd_2002, all_data_inc$o3_change, Locations, "model_o3_sd_2002")
+
+# Summarize the number of significant clusters in each model
+summary_clusters <- data.frame(
+  Model = c("model1_o3", "model_o3_sd", "model_o3_sd_2002"),
+  Total_Observations = rep(nrow(Locations), 3),
+  Not_Significant = c(sum(lisa_df1$cluster == "Not Significant"),
+                      sum(lisa_df2$cluster == "Not Significant"),
+                      sum(lisa_df3$cluster == "Not Significant")),
+  High_High = c(sum(lisa_df1$cluster == "High-High"),
+                sum(lisa_df2$cluster == "High-High"),
+                sum(lisa_df3$cluster == "High-High")),
+  Low_Low = c(sum(lisa_df1$cluster == "Low-Low"),
+              sum(lisa_df2$cluster == "Low-Low"),
+              sum(lisa_df3$cluster == "Low-Low")),
+  High_Low = c(sum(lisa_df1$cluster == "High-Low"),
+               sum(lisa_df2$cluster == "High-Low"),
+               sum(lisa_df3$cluster == "High-Low")),
+  Low_High = c(sum(lisa_df1$cluster == "Low-High"),
+               sum(lisa_df2$cluster == "Low-High"),
+               sum(lisa_df3$cluster == "Low-High"))
+)
+
+# Calculate percentages
+summary_clusters$Percent_Significant <- with(summary_clusters, 
+                                            round(100 * (High_High + Low_Low + High_Low + Low_High) / 
+                                                   Total_Observations, 1))
+
+# Print summary
+print(summary_clusters)
+
+lisa_df1
 ```
 
 INLA - setting priors for O3
@@ -982,6 +1571,20 @@ stk_no2 <- inla.stack(
                                  med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10)))
 
+# Create stack - no no2 standard deviations, try to add in o3 std dev and see how that goes since they often have an inverse r/s?
+stk_no2_sd <- inla.stack(
+  data=list(y=all_data_inc$no2_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 o3_sd_2002 = all_data_inc$o3_sd_2002,
+                                 o3_sd_2016 = all_data_inc$o3_2016)))
+
 
 #"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
 
@@ -1006,6 +1609,21 @@ model1_no2<-inla(formula1_no2,
 # 	*** WARNING *** This have consequence for the accurancy of the hyperpar
 # 	*** WARNING *** Continue with a diagonal Hessian.
 
+# Specify formula using o3 std dev
+formula_no2_sd <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  o3_sd_2002 +
+  o3_sd_2016 +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model with o3 std dev
+model_no2_sd<-inla(formula_no2_sd, 
+             data = inla.stack.data(stk_no2_sd, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_no2_sd),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
+
 
 ```
 
@@ -1014,6 +1632,8 @@ INLA model results for NO2
 ###  Model results
 # Posterior distribution summary of the fixed effects
 model1_no2$summary.fix
+model_no2_sd$summary.fix
+
 
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
 model1_no2$summary.hyperpar
@@ -1023,7 +1643,7 @@ round(model1_no2$summary.fixed,3)
 round(model1_no2$summary.hyperpar,3)
 
 # "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
-model1_no2.res<-inla.spde2.result(model1_ndvi, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+model1_no2.res<-inla.spde2.result(model1_no2, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
 
 model1_no2.res$summary.log.range.nominal
 model1_no2.res$summary.log.variance.nominal
@@ -1067,6 +1687,8 @@ hist(model1_no2$summary.random$spatial.field$mean)
 # QQ Plot to check normality
 residuals <- model1_no2$summary.random$spatial.field$mean
 qqnorm(residuals)
+residuals_sd <- model_no2_sd$summary.random$spatial.field$mean
+qqnorm(residuals_sd)
 
 # Kolmogorov-Smirnov test against normal distribution
 ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
@@ -1074,6 +1696,86 @@ ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 # Check for outliers
 plot(model1_no2$summary.random$spatial.field$mean)
 boxplot(model1_no2$summary.random$spatial.field$mean)
+plot(model_no2_sd$summary.random$spatial.field$mean)
+boxplot(model_no2_sd$summary.random$spatial.field$mean)
+```
+
+Moran's I for NO2
+```{r}
+# Function to calculate Moran's I for model residuals
+calculate_morans_i <- function(model, observed_values, coords, k = 5) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Calculate Moran's I
+  moran_result <- moran.test(residuals, lw)
+  
+  return(moran_result)
+}
+
+# Calculate for original model
+moran_no2_original <- calculate_morans_i(model1_no2, all_data_inc$no2_change, Locations)
+
+moran_no2_original
+
+# Function to create a Moran's I scatter plot for model residuals
+create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Moran's I test
+  mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+  moran_i <- round(mi_test$estimate[1], 4)
+  p_value <- format.pval(mi_test$p.value, digits = 4)
+  z_score <- round(mi_test$statistic, 4)
+  
+  # Determine significance indicator
+  sig_indicator <- ifelse(mi_test$p.value < 0.001, "***", 
+                    ifelse(mi_test$p.value < 0.01, "**",
+                    ifelse(mi_test$p.value < 0.05, "*", "ns")))
+  
+  # Create Moran scatter plot
+  png(paste0("moran_plot_", gsub(" ", "_", title), ".png"), width = 800, height = 600)
+  mp <- moran.plot(residuals, lw, main = paste("Moran's I Scatter Plot -", title),
+                  xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+  
+  # Add regression line with the exact Moran's I slope
+  abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+  
+  # Add statistics to plot
+  legend_text <- c(
+    paste("Moran's I:", moran_i),
+    paste("p-value:", p_value, sig_indicator),
+    paste("z-score:", z_score)
+  )
+  
+  legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+  
+  dev.off()
+  
+  return(mp)
+}
+
+# Create scatter plots for all three models
+plot1 <- create_morans_plot(model1_no2, all_data_inc$no2_change, Locations, k = 5, "model1_no2") #significant residual SAC
+plot2 <- create_morans_plot(model_no2_sd, all_data_inc$no2_change, Locations, k = 5, "model_no2_sd") #not significant!
+
 ```
 
 INLA - Setting priors in the model for NO2
@@ -1130,6 +1832,7 @@ plot(model2_no2$summary.random$spatial.field$mean)
 boxplot(model2_no2$summary.random$spatial.field$mean)
 
 ```
+
 
 
 INLA stack (temp)
@@ -1233,6 +1936,83 @@ ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 # Check for outliers
 plot(model1_temp$summary.random$spatial.field$mean)
 boxplot(model1_temp$summary.random$spatial.field$mean)
+```
+
+Moran's I for temp
+```{r}
+# Function to calculate Moran's I for model residuals
+calculate_morans_i <- function(model, observed_values, coords, k = 5) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Calculate Moran's I
+  moran_result <- moran.test(residuals, lw)
+  
+  return(moran_result)
+}
+
+# Calculate for original model
+moran_temp_original <- calculate_morans_i(model1_temp, all_data_inc$mean_temp, Locations)
+
+moran_temp_original
+
+# Function to create a Moran's I scatter plot for model residuals
+create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
+  # Extract fitted values
+  fitted_values <- model$summary.fitted.values$mean
+  
+  # Calculate residuals
+  residuals <- observed_values - fitted_values[1:length(observed_values)]
+  
+  # Create neighbors list
+  knn <- knearneigh(coords, k = k)
+  nb <- knn2nb(knn)
+  lw <- nb2listw(nb, style = "W")
+  
+  # Moran's I test
+  mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+  moran_i <- round(mi_test$estimate[1], 4)
+  p_value <- format.pval(mi_test$p.value, digits = 4)
+  z_score <- round(mi_test$statistic, 4)
+  
+  # Determine significance indicator
+  sig_indicator <- ifelse(mi_test$p.value < 0.001, "***", 
+                    ifelse(mi_test$p.value < 0.01, "**",
+                    ifelse(mi_test$p.value < 0.05, "*", "ns")))
+  
+  # Create Moran scatter plot
+  png(paste0("moran_plot_", gsub(" ", "_", title), ".png"), width = 800, height = 600)
+  mp <- moran.plot(residuals, lw, main = paste("Moran's I Scatter Plot -", title),
+                  xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+  
+  # Add regression line with the exact Moran's I slope
+  abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+  
+  # Add statistics to plot
+  legend_text <- c(
+    paste("Moran's I:", moran_i),
+    paste("p-value:", p_value, sig_indicator),
+    paste("z-score:", z_score)
+  )
+  
+  legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+  
+  dev.off()
+  
+  return(mp)
+}
+
+# Create scatter plots for all three models
+plot1 <- create_morans_plot(model1_temp, all_data_inc$mean_temp, Locations, k = 5, "model1_temp") 
+
 ```
 
 INLA - setting priors for temp model
