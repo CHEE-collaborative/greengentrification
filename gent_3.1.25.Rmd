@@ -39,6 +39,10 @@ library(ggregplot) #INLA compatible plotting library (efxplot)
 library(ggfields) # for plotting spatial field
 library(lattice) # for levelplot
 library(inlatools) # for INLA diagnostics 
+library(kableExtra)
+library(gridExtra)
+library(lattice)
+
 ```
 
 Load and clean data (note: takes approximately 12 mins)
@@ -402,7 +406,7 @@ stk_pm_sd <- inla.stack(
                                  pm_sd_2002 = all_data_inc$pm_sd_2002,
                                  pm_sd_2016 = all_data_inc$pm_sd_2016)))
 
-# Create stack with standard deviations (2002 only)
+# Create stack with standard deviation (2002 only)
 stk_pm_sd_2002 <- inla.stack(
   data=list(y=all_data_inc$pm_change), # the response
                   A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
@@ -414,6 +418,19 @@ stk_pm_sd_2002 <- inla.stack(
                                  med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10,
                                  pm_sd_2002 = all_data_inc$pm_sd_2002)))
+
+# Create stack with baseline
+stk_pm_baseline <- inla.stack(
+  data=list(y=all_data_inc$pm_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 pm_mean_2002 = all_data_inc$pm_mean_2002)))
 
 
 #"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
@@ -437,7 +454,7 @@ model1_pm<-inla(formula1_pm,
 
 ```
 
-INLA - model fitting (no priors) for PM2.5 with std dev. as covariates
+INLA - model fitting (no priors) for PM2.5 with std dev. or baseline as covariates
 ```{r}
 # Specify formula - using both years' sd
 formula_pm_sd <- y ~ -1 + Intercept + score_0.5 +
@@ -452,7 +469,7 @@ model_pm_sd <-inla(formula_pm_sd,
              data = inla.stack.data(stk_pm_sd, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_pm_sd),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
 
 # Specify formula - using 2002 sd
 formula_pm_sd_2002 <- y ~ -1 + Intercept + score_0.5 +
@@ -466,7 +483,21 @@ model_pm_sd_2002 <-inla(formula_pm_sd_2002,
              data = inla.stack.data(stk_pm_sd_2002, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_pm_sd_2002),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
+
+# Specify formula - using baseline
+formula_pm_baseline <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  pm_mean_2002 + 
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model - using baseline
+model_pm_baseline <-inla(formula_pm_baseline, 
+             data = inla.stack.data(stk_pm_baseline, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_pm_baseline),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
 
 ```
 
@@ -552,6 +583,8 @@ plot(model_pm_sd$summary.random$spatial.field$mean)
 boxplot(model_pm_sd$summary.random$spatial.field$mean)
 plot(model_pm_sd_2002$summary.random$spatial.field$mean)
 boxplot(model_pm_sd_2002$summary.random$spatial.field$mean)
+plot(model_pm_baseline$summary.random$spatial.field$mean)
+boxplot(model_pm_baseline$summary.random$spatial.field$mean)
 
 ```
 
@@ -577,26 +610,32 @@ calculate_morans_i <- function(model, observed_values, coords, k = 5) {
 }
 
 # Calculate for original model
-moran_pm_original <- calculate_morans_i(model1_pm, all_data_inc$o3_change, Locations)
+moran_pm_original <- calculate_morans_i(model1_pm, all_data_inc$pm_change, Locations)
 
-# Calculate for model_o3_sd
-moran_model_pm_sd <- calculate_morans_i(model_pm_sd, all_data_inc$o3_change, Locations)
+# Calculate for model_pm_sd
+moran_model_pm_sd <- calculate_morans_i(model_pm_sd, all_data_inc$pm_change, Locations)
 
-# Calculate for model_o3_sd_2002
-moran_model_pm_sd_2002 <- calculate_morans_i(model_pm_sd_2002, all_data_inc$o3_change, Locations)
+# Calculate for model_pm_sd_2002
+moran_model_pm_sd_2002 <- calculate_morans_i(model_pm_sd_2002, all_data_inc$pm_change, Locations)
+
+# Calculate for model_pm_baseline
+moran_model_pm_baseline <- calculate_morans_i(model_pm_baseline, all_data_inc$pm_change, Locations)
 
 # Create a comparison table
 comparison_table <- data.frame(
-  Model = c("model1_pm", "model_pm_sd", "model_pm_sd_2002"),
+  Model = c("model1_pm", "model_pm_sd", "model_pm_sd_2002", "moran_model_pm_baseline"),
   Morans_I = c(moran_pm_original$estimate[1], 
                moran_model_pm_sd$estimate[1], 
-               moran_model_pm_sd_2002$estimate[1]),
+               moran_model_pm_sd_2002$estimate[1],
+               moran_model_pm_baseline$estimate[1]),
   p_value = c(moran_pm_original$p.value, 
               moran_model_pm_sd$p.value, 
-              moran_model_pm_sd_2002$p.value),
+              moran_model_pm_sd_2002$p.value,
+              moran_model_pm_baseline$p.value),
   z_score = c(moran_pm_original$statistic, 
               moran_model_pm_sd$statistic, 
-              moran_model_pm_sd_2002$statistic)
+              moran_model_pm_sd_2002$statistic,
+               moran_model_pm_baseline$statistic)
 )
 
 print(comparison_table)
@@ -662,6 +701,8 @@ create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
 plot1 <- create_morans_plot(model1_pm, all_data_inc$pm_change, Locations, k = 5, "model1_pm")
 plot2 <- create_morans_plot(model_pm_sd, all_data_inc$pm_change, Locations, k = 5, "model_pm_sd")
 plot3 <- create_morans_plot(model_pm_sd_2002, all_data_inc$pm_change, Locations, k = 5, "model_pm_sd_2002")
+plot4 <- create_morans_plot(model_pm_baseline, all_data_inc$pm_change, Locations, k = 5, "model_pm_baseline")
+
 
 ```
 
@@ -678,6 +719,19 @@ stk_ndvi <- inla.stack(
                                  score_0.5 = all_data_inc$score_0.5,
                                  med_income_decile = all_data_inc$med_income_decile,
                                  COUNTYFP10 = all_data_inc$COUNTYFP10)))
+
+# Create stack with baseline
+stk_ndvi_baseline <- inla.stack(
+  data=list(y=all_data_inc$ndvi_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 ndvi_2000 = ndvi_2000)))
 
 
 #"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
@@ -696,7 +750,21 @@ model1_ndvi<-inla(formula1_ndvi,
              data = inla.stack.data(stk_ndvi, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_ndvi),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
+
+# Specify formula with baseline
+formula_ndvi_baseline <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  ndvi_2000 +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model
+model_ndvi_baseline <-inla(formula_ndvi_baseline, 
+             data = inla.stack.data(stk_ndvi_baseline, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_ndvi_baseline),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
 
 ```
 
@@ -705,6 +773,8 @@ INLA model results for NDVI
 ###  Model results
 # Posterior distribution summary of the fixed effects
 model1_ndvi$summary.fix #crosses zero - insig
+model_ndvi_baseline$summary.fix #no longer crosses zero
+
 
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
 model1_ndvi$summary.hyperpar
@@ -765,6 +835,8 @@ ks.test(residuals, "pnorm", mean=mean(residuals), sd=sd(residuals))
 # Check for outliers
 plot(model1_ndvi$summary.random$spatial.field$mean)
 boxplot(model1_ndvi$summary.random$spatial.field$mean)
+plot(model_ndvi_baseline$summary.random$spatial.field$mean)
+boxplot(model_ndvi_baseline$summary.random$spatial.field$mean)
 
 ```
 
@@ -842,6 +914,7 @@ create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
 
 # Create scatter plots for all three models
 plot1 <- create_morans_plot(model1_ndvi,all_data_inc$ndvi_change, Locations, k = 5, "model1_ndvi")
+plot2 <- create_morans_plot(model_ndvi_baseline, all_data_inc$ndvi_change, Locations, k = 5, "model_ndvi_baseline") #adding in baseline makes it sig
 ```
 
 INLA stack (O3)
@@ -885,7 +958,19 @@ stk_o3_sd_2002 <- inla.stack(
                                  COUNTYFP10 = all_data_inc$COUNTYFP10,
                                  o3_sd_2002 = all_data_inc$o3_sd_2002)))
 
-#"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
+
+# Create stack with baseline
+stk_o3_baseline <- inla.stack(
+  data=list(y=all_data_inc$o3_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 o3_mean_2002 = all_data_inc$o3_mean_2002)))
 ```
 
 INLA - model fitting (no priors) for O3
@@ -901,7 +986,7 @@ model1_o3<-inla(formula1_o3,
              data = inla.stack.data(stk_o3, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_o3),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
 
 ```
 
@@ -920,7 +1005,7 @@ model_o3_sd <-inla(formula_o3_sd,
              data = inla.stack.data(stk_o3_sd, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_o3_sd),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
 
 # Specify formula - using 2002 sd
 formula_o3_sd_2002 <- y ~ -1 + Intercept + score_0.5 +
@@ -934,7 +1019,22 @@ model_o3_sd_2002 <-inla(formula_o3_sd_2002,
              data = inla.stack.data(stk_o3_sd_2002, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_o3_sd_2002),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
+
+# Specify formula - using baseline
+formula_o3_baseline <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  o3_mean_2002 + 
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model - using 2002 sd
+model_o3_baseline <-inla(formula_o3_baseline, 
+             data = inla.stack.data(stk_o3_baseline, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_o3_baseline),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
+
 
 ```
 
@@ -944,6 +1044,8 @@ INLA model results for O3
 # Posterior distribution summary of the fixed effects
 model1_o3$summary.fix
 model_o3_sd$summary.fix
+model_o3_baseline$summary.fix
+
 
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
 model1_o3$summary.hyperpar
@@ -1050,18 +1152,24 @@ moran_model_o3_sd <- calculate_morans_i(model_o3_sd, all_data_inc$o3_change, Loc
 # Calculate for model_o3_sd_2002
 moran_model_o3_sd_2002 <- calculate_morans_i(model_o3_sd_2002, all_data_inc$o3_change, Locations)
 
+# Calculate for model_o3_baseline
+moran_model_o3_baseline <- calculate_morans_i(model_o3_baseline, all_data_inc$o3_change, Locations)
+
 # Create a comparison table
 comparison_table <- data.frame(
-  Model = c("model1_o3", "model_o3_sd", "model_o3_sd_2002"),
+  Model = c("model1_o3", "model_o3_sd", "model_o3_sd_2002", "model_o3_baseline"),
   Morans_I = c(moran_original$estimate[1], 
                moran_model_o3_sd$estimate[1], 
-               moran_model_o3_sd_2002$estimate[1]),
+               moran_model_o3_sd_2002$estimate[1],
+               moran_model_o3_baseline$estimate[1]),
   p_value = c(moran_original$p.value, 
               moran_model_o3_sd$p.value, 
-              moran_model_o3_sd_2002$p.value),
+              moran_model_o3_sd_2002$p.value,
+              moran_model_o3_baseline$p.value),
   z_score = c(moran_original$statistic, 
               moran_model_o3_sd$statistic, 
-              moran_model_o3_sd_2002$statistic)
+              moran_model_o3_sd_2002$statistic,
+              moran_model_o3_baseline$statistic)
 )
 
 print(comparison_table)
@@ -1127,6 +1235,7 @@ create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
 plot1 <- create_morans_plot(model1_o3, all_data_inc$o3_change, Locations, k = 5, "model1_o3")
 plot2 <- create_morans_plot(model_o3_sd, all_data_inc$o3_change, Locations, k = 5, "model_o3_sd")
 plot3 <- create_morans_plot(model_o3_sd_2002, all_data_inc$o3_change, Locations, k = 5, "model_o3_sd_2002")
+plot4 <- create_morans_plot(model_o3_baseline, all_data_inc$o3_change, Locations, k = 5, "model_o3_baseline")
 
 ```
 
@@ -1299,7 +1408,18 @@ stk_no2_sd <- inla.stack(
                                  o3_sd_2016 = all_data_inc$o3_2016)))
 
 
-#"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
+# Create stack with baseline
+stk_no2_baseline <- inla.stack(
+  data=list(y=all_data_inc$no2_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 no2_2000 = all_data_inc$no2_2000)))
 
 ```
 
@@ -1316,7 +1436,7 @@ model1_no2<-inla(formula1_no2,
              data = inla.stack.data(stk_no2, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_no2),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
 
 # Additional warnings:
 # *** WARNING *** Eigenvalue 1 of the Hessian is -2.1127 < 0
@@ -1336,9 +1456,21 @@ model_no2_sd<-inla(formula_no2_sd,
              data = inla.stack.data(stk_no2_sd, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_no2_sd),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
+             control.compute = list(dic = TRUE, cpo = TRUE))
 
-
+# Specify formula using no2 baseline
+formula_no2_baseline <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  no2_2000 +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model with o3 std dev
+model_no2_baseline <-inla(formula_no2_baseline, 
+             data = inla.stack.data(stk_no2_baseline, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_no2_baseline),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
 ```
 
 INLA model results for NO2
@@ -1347,6 +1479,7 @@ INLA model results for NO2
 # Posterior distribution summary of the fixed effects
 model1_no2$summary.fix
 model_no2_sd$summary.fix
+model_no2_baseline$summary.fix
 
 
 # Posterior distribution summary of the hyper parameters (spatial field parameters)
@@ -1489,6 +1622,7 @@ create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
 # Create scatter plots for all three models
 plot1 <- create_morans_plot(model1_no2, all_data_inc$no2_change, Locations, k = 5, "model1_no2") #significant residual SAC
 plot2 <- create_morans_plot(model_no2_sd, all_data_inc$no2_change, Locations, k = 5, "model_no2_sd") #not significant!
+plot3 <- create_morans_plot(model_no2_baseline, all_data_inc$no2_change, Locations, k = 5, "model_no2_baseline") #not significant!
 
 ```
 
@@ -1507,8 +1641,6 @@ stk_temp <- inla.stack(
                                  COUNTYFP10 = all_data_inc$COUNTYFP10)))
 
 
-#"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
-
 ```
 
 INLA - model fitting (no priors) for temp
@@ -1524,8 +1656,7 @@ model1_temp <-inla(formula1_temp,
              data = inla.stack.data(stk_temp, spde=spde),
              family= 'gaussian', 
              control.predictor=list(A = inla.stack.A(stk_temp),compute = TRUE), 
-             control.compute = list(cpo = TRUE))
-
+             control.compute = list(dic = TRUE, cpo = TRUE))
 ```
 
 INLA model results for mean temp
@@ -1670,4 +1801,600 @@ create_morans_plot <- function(model, observed_values, coords, k = 5, title) {
 # Create scatter plots for all three models
 plot1 <- create_morans_plot(model1_temp, all_data_inc$mean_temp, Locations, k = 5, "model1_temp") 
 
+```
+
+#################################
+#####################################
+
+RUNS
+```{r}
+# Function to calculate and visualize Moran's I for multiple models
+analyze_spatial_autocorrelation <- function(models, model_names, observed_values, coords, 
+                                           k = 5, output_dir) {
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Initialize results dataframe
+  results <- data.frame(
+    model = character(),
+    morans_i = numeric(),
+    p_value = numeric(),
+    z_score = numeric(),
+    significance = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each model
+  for (i in 1:length(models)) {
+    model <- models[[i]]
+    model_name <- model_names[i]
+    
+    # Extract fitted values
+    fitted_values <- model$summary.fitted.values$mean
+    
+    # Calculate residuals
+    residuals <- observed_values - fitted_values[1:length(observed_values)]
+    
+    # Create neighbors list
+    knn <- knearneigh(coords, k = k)
+    nb <- knn2nb(knn)
+    lw <- nb2listw(nb, style = "W")
+    
+    # Moran's I test
+    mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+    moran_i <- round(mi_test$estimate[1], 4)
+    p_value <- mi_test$p.value
+    z_score <- round(mi_test$statistic, 4)
+    
+    # Determine significance indicator
+    sig_indicator <- ifelse(p_value < 0.001, "***", 
+                     ifelse(p_value < 0.01, "**",
+                     ifelse(p_value < 0.05, "*", "ns")))
+    
+    # Create Moran scatter plot
+    png(file.path(output_dir, paste0("moran_plot_", gsub(" ", "_", model_name), ".png")), 
+        width = 800, height = 600)
+    mp <- moran.plot(residuals, lw, main = paste("Moran's I Scatter Plot -", model_name),
+                    xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+    
+    # Add regression line with the exact Moran's I slope
+    abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+    
+    # Add statistics to plot
+    legend_text <- c(
+      paste("Moran's I:", moran_i),
+      paste("p-value:", format.pval(p_value, digits = 4), sig_indicator),
+      paste("z-score:", z_score)
+    )
+    
+    legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+    
+    dev.off()
+    
+    # Add to results dataframe
+    results <- rbind(results, data.frame(
+      model = model_name,
+      morans_i = moran_i,
+      p_value = p_value,
+      z_score = z_score,
+      significance = sig_indicator,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Save results to CSV
+  write.csv(results, file.path(output_dir, "morans_i_results.csv"), row.names = FALSE)
+  
+  return(results)
+}
+
+# Run Moran's I analysis for all model sets
+# PM models
+pm_morans <- analyze_spatial_autocorrelation(
+  pm_models, 
+  pm_names, 
+  all_data_inc$pm_change, 
+  Locations, 
+  k = 5, 
+  output_dir = "inla_results_pm"
+)
+
+# O3 models
+o3_morans <- analyze_spatial_autocorrelation(
+  o3_models, 
+  o3_names, 
+  all_data_inc$o3_change, 
+  Locations, 
+  k = 5, 
+  output_dir = "inla_results_o3"
+)
+
+# NO2 models
+no2_morans <- analyze_spatial_autocorrelation(
+  no2_models, 
+  no2_names, 
+  all_data_inc$no2_change, 
+  Locations, 
+  k = 5, 
+  output_dir = "inla_results_no2"
+)
+
+# NDVI models
+ndvi_morans <- analyze_spatial_autocorrelation(
+  ndvi_models, 
+  ndvi_names, 
+  all_data_inc$ndvi_change, 
+  Locations, 
+  k = 5, 
+  output_dir = "inla_results_ndvi"
+)
+
+# Temperature models
+temp_morans <- analyze_spatial_autocorrelation(
+  temp_models, 
+  temp_names, 
+  all_data_inc$mean_temp, 
+  Locations, 
+  k = 5, 
+  output_dir = "inla_results_temp"
+)
+
+# Function to create summary table of all Moran's I results
+create_morans_summary <- function(results_list, model_type_names) {
+  combined_results <- data.frame()
+  
+  for (i in 1:length(results_list)) {
+    results <- results_list[[i]]
+    results$model_type <- model_type_names[i]
+    combined_results <- rbind(combined_results, results)
+  }
+  
+  # Reorder columns to put model_type first
+  combined_results <- combined_results[, c("model_type", "model", "morans_i", 
+                                          "p_value", "z_score", "significance")]
+  
+  # Save combined results
+  write.csv(combined_results, "all_morans_i_results.csv", row.names = FALSE)
+  
+  return(combined_results)
+}
+
+# Create summary of all results
+all_morans_summary <- create_morans_summary(
+  list(pm_morans, o3_morans, no2_morans, ndvi_morans, temp_morans),
+  c("PM", "O3", "NO2", "NDVI", "Temperature")
+)
+```
+
+```{r}
+# Function to analyze INLA models and compare them
+analyze_inla_models <- function(models, model_names = NULL, plot_results = TRUE, 
+                               include_spatial = TRUE, include_residuals = FALSE,  # Changed default to FALSE
+                               output_dir = "inla_model_results") {
+  
+  # Create output directory structure
+  dir.create(output_dir, showWarnings = FALSE)
+  plots_dir <- file.path(output_dir, "plots")
+  tables_dir <- file.path(output_dir, "tables")
+  dir.create(plots_dir, showWarnings = FALSE)
+  dir.create(tables_dir, showWarnings = FALSE)
+  
+  # Make sure model_names are available
+  if (is.null(model_names)) {
+    model_names <- paste0("Model", 1:length(models))
+  }
+  
+  if (length(model_names) != length(models)) {
+    warning("Number of model names doesn't match number of models. Using default names.")
+    model_names <- paste0("Model", 1:length(models))
+  }
+  
+  # Create result lists
+  results <- list()
+  
+  # Loop through each model
+  for (i in seq_along(models)) {
+    model <- models[[i]]
+    name <- model_names[i]
+    model_results <- list()
+    
+    # Handle NULL models gracefully
+    if (is.null(model)) {
+      results[[name]] <- list(
+        fixed_summary = NULL,
+        hyper_summary = NULL,
+        dic = NA
+      )
+      next
+    }
+    
+    # Fixed effects summary
+    model_results$fixed_summary <- round(model$summary.fixed, 3)
+    
+    # Hyperparameter summary
+    model_results$hyper_summary <- round(model$summary.hyperpar, 3)
+    
+    # DIC 
+    model_results$dic <- model$dic$dic
+    
+    
+    # Extract spatial field information if available
+    if (include_spatial && !is.null(model$summary.random$spatial.field)) {
+      # Check if we have a spatial model and can apply inla.spde2.result
+      if ("spde" %in% ls(.GlobalEnv) && !is.null(model$summary.random$spatial.field)) {
+        tryCatch({
+          spde_obj <- get("spde", envir = .GlobalEnv)
+          model.res <- inla.spde2.result(model, 'spatial.field', spde_obj, do.transf = TRUE)
+          model_results$spatial_range <- model.res$summary.log.range.nominal
+          model_results$spatial_variance <- model.res$summary.log.variance.nominal
+          model_results$marginals_var <- model.res$marginals.var
+          model_results$marginals_kap <- model.res$marginals.kap
+          model_results$marginals_range <- model.res$marginals.range
+        }, error = function(e) {
+          message(paste("Could not calculate spatial field parameters for model", name, "- Error:", e$message))
+        })
+      }
+      
+      # Extract spatial field mean and sd for residual analysis
+      model_results$spatial_field_mean <- model$summary.random$spatial.field$mean
+      model_results$spatial_field_sd <- model$summary.random$spatial.field$sd
+    }
+    
+    # Store results
+    results[[name]] <- model_results
+    
+    # Create plots
+    if (plot_results) {
+      # Create model-specific directory
+      model_plots_dir <- file.path(plots_dir, name)
+      dir.create(model_plots_dir, showWarnings = FALSE)
+      
+      # 1. Fixed effects parameter plots
+      pdf(file.path(model_plots_dir, "fixed_effects_parameters.pdf"), width = 10, height = 8)
+      par(mfrow = c(2, 2))
+      for (j in 1:min(nrow(model$summary.fixed), 4)) {
+        tryCatch({
+          plot(model$marginals.fixed[[j]], ty = "l", 
+               xlab = bquote(beta[.(rownames(model$summary.fixed)[j])]), 
+               ylab = "Density")
+        }, error = function(e) {
+          message(paste("Error plotting fixed effect", j, "for model", name))
+        })
+      }
+      dev.off()
+      
+      # 2. Spatial field plots 
+      if ("Mesh" %in% ls(.GlobalEnv) && !is.null(model_results$spatial_field_mean)) {
+        tryCatch({
+          # Spatial field mean and SD plots
+          pdf(file.path(model_plots_dir, "spatial_field.pdf"), width = 10, height = 5)
+          mesh_obj <- get("Mesh", envir = .GlobalEnv)
+          gproj <- inla.mesh.projector(mesh_obj, dims = c(300, 300))
+          g.mean <- inla.mesh.project(gproj, model_results$spatial_field_mean)
+          g.sd <- inla.mesh.project(gproj, model_results$spatial_field_sd)
+          
+          grid.arrange(
+            levelplot(g.mean, scales = list(draw = FALSE), 
+                     xlab = '', ylab = '', main = 'mean', 
+                     col.regions = heat.colors(16)),
+            levelplot(g.sd, scales = list(draw = FALSE), 
+                     xlab = '', ylab = '', main = 'sd', 
+                     col.regions = heat.colors(16)),
+            nrow = 1
+          )
+          dev.off()
+        }, error = function(e) {
+          message(paste("Could not create spatial field levelplot for model", name, "- Error:", e$message))
+        })
+      }
+      
+      # 3. Hyperparameter plots
+      if (!is.null(model_results$marginals_var)) {
+        pdf(file.path(model_plots_dir, "hyperparameters.pdf"), width = 10, height = 4)
+        par(mfrow = c(1, 3))
+        tryCatch({
+          # Plot variance, kappa, and range distributions
+          plot(model_results$marginals_var[[1]], ty = "l", 
+               xlab = expression(sigma[randomfield]^2), ylab = "Density") 
+          plot(model_results$marginals_kap[[1]], type = "l", 
+               xlab = expression(kappa), ylab = "Density")
+          plot(model_results$marginals_range[[1]], type = "l", 
+               xlab = "range nominal", ylab = "Density")
+        }, error = function(e) {
+          message(paste("Error creating hyperparameter plots for model", name, "- Error:", e$message))
+        })
+        dev.off()
+      }
+      
+      # 4. Residual analysis plots
+      if (!is.null(model_results$spatial_field_mean)) {
+        pdf(file.path(model_plots_dir, "residual_analysis.pdf"), width = 10, height = 8)
+        par(mfrow = c(2, 2))
+        
+        # Plot time series of residuals
+        plot(model_results$spatial_field_mean, type = "l", 
+             main = "Spatial Field Mean", xlab = "Index", ylab = "Value")
+        
+        # QQ plot
+        qqnorm(model_results$spatial_field_mean, main = "Normal Q-Q Plot")
+        qqline(model_results$spatial_field_mean)
+        
+        # Histogram
+        hist(model_results$spatial_field_mean, 
+             main = "Histogram of Spatial Field Mean", 
+             xlab = "Value")
+        
+        # Boxplot
+        boxplot(model_results$spatial_field_mean, 
+                main = "Boxplot of Spatial Field Mean")
+        
+        dev.off()
+      }
+    }
+  }
+  
+  # Create comparison tables
+  
+  # Fixed effects table
+  fixed_effects_list <- lapply(results, function(x) x$fixed_summary)
+  fixed_effects_table <- create_comparison_table(fixed_effects_list, model_names, "Fixed Effects")
+  
+  # Hyperparameters table
+  hyper_list <- lapply(results, function(x) x$hyper_summary)
+  hyper_table <- create_comparison_table(hyper_list, model_names, "Hyperparameters")
+  
+  # Spatial parameters table
+  spatial_range_list <- lapply(results, function(x) x$spatial_range)
+  spatial_var_list <- lapply(results, function(x) x$spatial_variance)
+  
+  # Model comparison metrics table
+  model_metrics <- data.frame(
+    Model = model_names,
+    DIC = sapply(results, function(x) {
+      if (is.null(x) || is.null(x$dic) || is.na(x$dic)) {
+        return("N/A")
+      } else {
+        return(round(x$dic, 3))
+      }
+    }),
+    stringsAsFactors = FALSE
+  )
+  
+  # Create spatial parameters table if any model has them
+  if (any(sapply(spatial_range_list, function(x) !is.null(x)))) {
+    spatial_params <- data.frame(
+      Model = model_names,
+      LogRange = sapply(spatial_range_list, function(x) 
+        ifelse(is.null(x), "N/A", paste0(round(x[,"mean"], 3), " (", round(x[,"sd"], 3), ")"))),
+      LogVariance = sapply(spatial_var_list, function(x) 
+        ifelse(is.null(x), "N/A", paste0(round(x[,"mean"], 3), " (", round(x[,"sd"], 3), ")")))
+    )
+    
+    spatial_table <- kableExtra::kbl(spatial_params, caption = "Spatial Field Parameters") %>%
+      kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+  } else {
+    spatial_table <- NULL
+  }
+  
+  metrics_table <- kableExtra::kbl(model_metrics, caption = "Model Comparison Metrics") %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+  
+  # Save tables to files
+  writeLines(as.character(fixed_effects_table), file.path(tables_dir, "fixed_effects.html"))
+  writeLines(as.character(hyper_table), file.path(tables_dir, "hyperparameters.html"))
+  writeLines(as.character(metrics_table), file.path(tables_dir, "model_metrics.html"))
+  if (!is.null(spatial_table)) {
+    writeLines(as.character(spatial_table), file.path(tables_dir, "spatial_parameters.html"))
+  }
+  
+  # Create a combined report
+  report_file <- file.path(output_dir, "analysis_report.html")
+  
+  report_content <- c(
+    "<!DOCTYPE html>",
+    "<html>",
+    "<head>",
+    "<title>INLA Model Analysis Report</title>",
+    "<style>",
+    "body { font-family: Arial, sans-serif; margin: 20px; }",
+    "h1, h2 { color: #2c3e50; }",
+    "table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }",
+    "th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }",
+    "th { background-color: #f2f2f2; }",
+    "tr:nth-child(even) { background-color: #f9f9f9; }",
+    ".model-section { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #eee; }",
+    "</style>",
+    "</head>",
+    "<body>",
+    "<h1>INLA Model Analysis Report</h1>",
+    paste0("<p>Generated on: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "</p>"),
+    "<h2>Model Comparison Metrics</h2>",
+    as.character(metrics_table),
+    "<h2>Fixed Effects</h2>",
+    as.character(fixed_effects_table),
+    "<h2>Hyperparameters</h2>",
+    as.character(hyper_table)
+  )
+  
+  if (!is.null(spatial_table)) {
+    report_content <- c(report_content,
+                        "<h2>Spatial Field Parameters</h2>",
+                        as.character(spatial_table))
+  }
+  
+  # Add links to individual model plots
+  report_content <- c(report_content, "<h2>Model Plots</h2>", "<ul>")
+  
+  for (name in model_names) {
+    model_plots_dir <- file.path("plots", name)
+    plot_files <- list.files(file.path(plots_dir, name), pattern = "\\.pdf$|\\.png$")
+    
+    if (length(plot_files) > 0) {
+      report_content <- c(report_content, paste0("<li><strong>", name, "</strong><ul>"))
+      
+      for (plot_file in plot_files) {
+        plot_path <- file.path(model_plots_dir, plot_file)
+        report_content <- c(report_content, 
+                           paste0("<li><a href='", plot_path, "'>", 
+                                 gsub("\\.(pdf|png)$", "", plot_file), "</a></li>"))
+      }
+      
+      report_content <- c(report_content, "</ul></li>")
+    }
+  }
+  
+  report_content <- c(report_content, "</ul>", "</body>", "</html>")
+  
+  writeLines(report_content, report_file)
+  
+  # Return all results and tables
+  return(list(
+    results = results,
+    fixed_effects_table = fixed_effects_table,
+    hyper_table = hyper_table,
+    metrics_table = metrics_table,
+    spatial_table = spatial_table,
+    output_directory = output_dir,
+    report_file = report_file
+  ))
+}
+
+# Helper function to create comparison tables
+create_comparison_table <- function(data_list, model_names, caption) {
+  # Check if we have data
+  if (length(data_list) == 0 || all(sapply(data_list, is.null))) {
+    return(kableExtra::kbl(data.frame(Message = "No data available"), caption = caption))
+  }
+  
+  # Get all row names from all models
+  all_rows <- unique(unlist(lapply(data_list, function(x) if (!is.null(x)) rownames(x) else NULL)))
+  
+  # If no rows found, return empty table
+  if (length(all_rows) == 0) {
+    return(kableExtra::kbl(data.frame(Message = "No parameters found"), caption = caption))
+  }
+  
+  # Create empty dataframe
+  result <- data.frame(Parameter = all_rows, stringsAsFactors = FALSE)
+  
+  # Get columns to extract (mean, sd, etc.)
+  first_valid_list <- NULL
+  for (dl in data_list) {
+    if (!is.null(dl) && nrow(dl) > 0) {
+      first_valid_list <- dl
+      break
+    }
+  }
+  
+  if (!is.null(first_valid_list)) {
+    cols_to_extract <- colnames(first_valid_list)
+  } else {
+    cols_to_extract <- c("mean", "sd", "0.025quant", "0.5quant", "0.975quant")
+  }
+  
+  # Add data for each model
+  for (i in seq_along(data_list)) {
+    model_data <- data_list[[i]]
+    model_name <- model_names[i]
+    
+    if (is.null(model_data) || nrow(model_data) == 0) {
+      # Skip this model if no data
+      next
+    }
+    
+    for (col in cols_to_extract) {
+      col_name <- paste0(model_name, "_", col)
+      result[[col_name]] <- NA
+      
+      for (row in rownames(model_data)) {
+        row_idx <- which(result$Parameter == row)
+        if (length(row_idx) > 0) {
+          result[row_idx, col_name] <- model_data[row, col]
+        }
+      }
+    }
+  }
+  
+  # Create kable table
+  table <- kableExtra::kbl(result, caption = caption) %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+  
+  # Try to add grouped headers, but handle potential errors
+  tryCatch({
+    groups <- sapply(model_names, function(name) {
+      cols <- grep(paste0("^", name, "_"), colnames(result), value = TRUE)
+      length(cols)
+    })
+    
+    if (all(groups > 0)) {
+      table <- table %>% 
+        kableExtra::add_header_above(c(" " = 1, setNames(groups, model_names)))
+    }
+  }, error = function(e) {
+    message("Could not add grouped headers to table: ", e$message)
+  })
+  
+  return(table)
+}
+
+# Function to run the analysis with a list of models
+compare_models <- function(model_list, names = NULL, plot = TRUE, 
+                          include_spatial = TRUE, include_residuals = FALSE,  # Changed default to FALSE
+                          output_dir = "inla_model_results") {
+  
+  # Filter out NULL models
+  valid_indices <- which(!sapply(model_list, is.null))
+  
+  if (length(valid_indices) == 0) {
+    message("No valid models to analyze!")
+    return(NULL)
+  }
+  
+  if (length(valid_indices) < length(model_list)) {
+    message("Some models are NULL and will be analyzed as such.")
+  }
+  
+  # Run the analysis
+  results <- analyze_inla_models(
+    models = model_list,
+    model_names = names,
+    plot_results = plot,
+    include_spatial = include_spatial,
+    include_residuals = include_residuals,
+    output_dir = output_dir
+  )
+  
+  # Print info about where results are stored
+  cat("\nAnalysis complete!\n")
+  cat(paste0("Results stored in directory: ", output_dir, "\n"))
+  cat(paste0("HTML report available at: ", results$report_file, "\n\n"))
+  
+  # Return the complete results
+  return(results)
+}
+```
+
+```{r}
+pm_models <- list(model1_pm, model_pm_sd, model_pm_sd_2002, model_pm_baseline)
+pm_names <- c("model1_pm", "model_pm_sd", "model_pm_sd_2002", "model_pm_baseline")
+
+o3_models <- list(model1_o3, model_o3_sd, model_o3_sd_2002, model_o3_baseline)
+o3_names <- c("model1_o3", "model_o3_sd", "model_o3_sd_2002", "model_o3_baseline")
+
+no2_models <- list(model1_no2, model_no2_sd, model_no2_baseline)
+no2_names <- c("model1_no2", "model_no2_sd", "model_no2_baseline")
+
+ndvi_models <- list(model1_ndvi, model_ndvi_baseline)
+ndvi_names <- c("model1_ndvi", "model_ndvi_baseline")
+
+temp_models <- list(model1_temp)
+temp_names <- c("model1_temp")
+
+pm_results <- compare_models(pm_models, pm_names, output_dir = "inla_results_pm")
+o3_results <- compare_models(o3_models, o3_names, output_dir = "inla_results_o3")
+no2_results <- compare_models(no2_models, no2_names, output_dir = "inla_results_no2")
+ndvi_results <- compare_models(ndvi_models, ndvi_names, output_dir = "inla_results_ndvi")
+temp_results <- compare_models(temp_models, temp_names, output_dir = "inla_results_temp")
 ```
