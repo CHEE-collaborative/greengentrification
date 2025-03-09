@@ -1,0 +1,683 @@
+---
+title: "gent_3.1.25"
+author: "Joyce Hu"
+date: "2025-1-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages (JH - check if any are unused after code cleaned)
+```{r}
+library(tidyverse)
+library(tigris)
+library(arrow)
+library(here)
+library(mgcv)
+library(fixest)
+library(lmtest)
+library(terra)
+library(exactextractr)
+library(tidyterra)
+library(sf)
+library(mgcViz)
+
+library(DHARMa)
+library(qqplotr)
+library(readxl) # for read_excel()
+library(spdep) # for moran.test()
+library(tidycensus) # for median income
+library(distr) # for qqbounds()
+library(spatialreg) # for spatial lag and error models
+library(gridExtra) # for viewing plots side-by-side
+library(qgam) 
+library(dplyr)
+library(INLA)
+library(ggregplot) #INLA compatible plotting library (efxplot)
+library(ggfields) # for plotting spatial field
+library(lattice) # for levelplot
+library(inlatools) # for INLA diagnostics 
+library(kableExtra)
+library(gridExtra)
+library(lattice)
+```
+
+Load and clean data (note: takes approximately 12 mins)
+```{r}
+# Check if 'data' directory exists; if not, create it
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+# Load gentrification score by tract
+gentrification <- read.csv(here("data", "Data_NYC_Gentrification_2000_16.csv")) %>% 
+  mutate(tractid = as.character(tractid)) %>% 
+  dplyr::select(tractid, score_0.5)
+
+# Load gentrification score if using xlsx file:
+# gentrification <- read_xlsx(here("Gentrification","Data_NYC_Gentrification_2000_16.xlsx")) %>%
+#   mutate(tractid = as.character(tractid)) %>%
+#   dplyr::select(tractid, score_0.5)
+
+# Pull NYC tract IDs/fips from gentrification index dataset for filtering
+nyc_fips <- gentrification$tractid
+
+# Load NYC tracts shapefile
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), year = 2010) %>%
+  # clean lat and long for Conley SEs
+  mutate(lat = as.numeric(INTPTLAT10), long = as.numeric(INTPTLON10), GEOID = GEOID10) %>% 
+  # filter for FIPS codes included in gentrification index dataset
+  filter(GEOID %in% nyc_fips)
+
+
+# Load NY tracts populatuion weighted centroid points from Census data
+nyc_weighted_centroids <- read.table("https://www2.census.gov/geo/docs/reference/cenpop2010/tract/CenPop2010_Mean_TR36.txt", 
+                         header = TRUE, sep = ",", stringsAsFactors = FALSE, 
+                         colClasses = c("character", "character", "character", "numeric", "numeric", "numeric")) %>%
+  mutate(FIPS = paste(STATEFP, COUNTYFP, TRACTCE, sep = "")) %>% 
+  ## filter for only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%  
+  rename(Longitude_weighted = LONGITUDE, 
+         Latitude_weighted = LATITUDE)
+
+# JH - 10/12/24 warning persists 10/13, 10/14 Warning: R metadata may have unsafe or invalid elements ℹ Type: "externalptr" options(arrow.unsafe_metadata = TRUE) #
+
+# Temperature data
+if(!file.exists(here("data","summarized_daily_temp_preds.parquet"))){download.file("https://zenodo.org/records/10557980/files/summarized_daily_temp_preds.parquet?download=1", 
+                                                                                   destfile = here("data","summarized_daily_temp_preds.parquet"))}
+
+# Temperature by tract
+temp <- read_parquet(here("data","summarized_daily_temp_preds.parquet")) %>%
+  filter(str_detect(date, "2016")) %>%
+  mutate(temp_c = mean_temp_daily_cK/100-273.15) %>% 
+  mutate(temp_f = temp_c*9/5+32) %>% 
+  group_by(GEOID, date) %>%
+  ungroup() %>% 
+  group_by(GEOID) %>% 
+  summarize(mean_temp = mean(mean_temp_daily_cK/100))
+
+# NDVI by tract (need to have it downloaded and stored locally)
+ndvi_mean_2016 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_mean_2000 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_sd_2016 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "stdev")
+
+ndvi_sd_2000 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "stdev")
+
+# PM2.5 data
+# Download data from URL
+download_data <- function() {
+  # set longer timeout
+  options(timeout = 7200)
+  if(!file.exists(here("data", "2016_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_pm25_daily_average.txt.gz", destfile = here("data", "2016_pm25_daily_average.txt.gz"))} #2016
+  if(!file.exists(here("data", "2002_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_pm25_daily_average.txt.gz", destfile = here("data", "2002_pm25_daily_average.txt.gz"))}} #2002
+download_data()
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2002
+pm_tract_2002 <- read.delim(gzfile(here("data", "2002_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## Include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## Calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+            pm_sd_2002 = sd(pm25_daily_average.ug.m3.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2016
+pm_tract_2016 <- read.delim(gzfile(here("data", "2016_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(pm_mean_2016 = mean(Prediction),
+            pm_sd_2016 = sd(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+  
+# Combine 2002 and 2016 pm data for nyc_tracts
+pm_tract <- pm_tract_2002 %>%
+  inner_join(pm_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# NO2 CACES
+no2_2016_caces <- read.csv(here("data", "2016_no2_caces.csv")) %>% 
+  mutate(no2_2016 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_2000_caces <- read.csv(here("data", "2000_no2_caces.csv")) %>% 
+  mutate(no2_2000 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_caces <- left_join(no2_2000_caces, no2_2016_caces, by = "fips") %>% 
+  select(no2_2000, no2_2016, fips)
+
+#O3 data download
+options(timeout = 7200)
+if(!file.exists(here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))} #2016
+if(!file.exists(here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))} #2002
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2002
+o3_tract_2002 <- read.delim(gzfile(here("data", "2002_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>% 
+  ## include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>% 
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+            o3_sd_2002 = sd(ozone_daily_8hour_maximum.ppb.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2016
+o3_tract_2016 <- read.delim(gzfile(here("data", "2016_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>% 
+  ## calculate annual average by tract using  population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(o3_mean_2016 = mean(Prediction),
+            o3_sd_2016 = sd(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+o3_tract <- o3_tract_2002 %>%
+  left_join(o3_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# Merge all exposure data
+all_data <- nyc_tracts %>% 
+  # join gentrification index by tract
+  right_join(gentrification, by = c("GEOID10" = "tractid")) %>%
+  left_join(pm_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016-pm_2002) %>% 
+  left_join(o3_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002, o3_sd_2016 = o3_sd_2016, o3_sd_2002 = o3_sd_2002) %>% 
+  left_join(no2_caces, by = c("GEOID" = "fips")) %>% 
+  mutate(no2_change = no2_2016-no2_2000) %>% 
+  mutate(ndvi_mean_2016 = ndvi_mean_2016, ndvi_mean_2000 = ndvi_mean_2000, ndvi_change = ndvi_mean_2016-ndvi_mean_2000) %>%
+  mutate(ndvi_sd_2016 = ndvi_sd_2016, ndvi_sd_2000 = ndvi_sd_2000) %>%
+  left_join(temp, by = "GEOID")
+
+
+############ Median income ###############################
+# Find median household income variable in 2000 decennial census
+all_vars_dec <- 
+  load_variables(year = 2000, dataset = "sf3")
+
+# Models adjusting for median income in 2000 (note: 2000 decennial census is 1999 data)
+income_2000 <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2000 = value)
+#results in 226 missing tracts in terms of 2010 tracts.
+
+# Find median household income variable in 2010 ACS
+income_2010 <- get_acs(variables = "B06011_001", year = 2010, state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2010 = estimate)
+
+# Joining both income sets with data and imputing 2010 data where 2000 data is missing
+all_data_inc <- all_data %>%
+  left_join(income_2000, by = "GEOID") %>%
+  left_join(income_2010, by = "GEOID") %>%
+  mutate(med_income_2000_impute = coalesce(med_income_2000, med_income_2010)) %>% 
+  # coerce GEOID to numeric then factor class to avoid error in MRF smooth
+  mutate(GEOID = as.numeric(GEOID)) %>% 
+  mutate(GEOID = factor(GEOID)) %>% 
+ # coerce COUNTYFP10 to numeric then factor class to avoid error ?
+  mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
+  mutate(COUNTYFP10 = factor(COUNTYFP10))
+
+# Ranking median income for use in GAM models
+all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)
+
+
+# Converting median income to quantiles and scaling
+# Create deciles
+income_quantiles <- quantile(all_data_inc$med_income_2000_impute, probs = seq(0, 1, by = 0.1))
+all_data_inc$med_income_decile <- findInterval(all_data_inc$med_income_2000_impute, 
+                                             income_quantiles,
+                                             rightmost.closed = TRUE)
+```
+
+Neighbor relationships for MRF smooth 
+```{r}
+# Establish neighbor relationships for MRF model
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+
+# # To facilitate MRF smooth model for NDVI
+# # Create clean dataset without 8 NA values (follow up)
+# all_data_inc_clean <- all_data_inc[is.finite(all_data_inc$ndvi_change), ]
+# 
+# # Create new neighborhood structure from cleaned data
+# nb_clean <- poly2nb(all_data_inc_clean)
+# names(nb_clean) <- all_data_inc_clean$GEOID
+
+```
+PM2.5 
+```{r}
+#Setting k = 100 - some still have RSAC, but edf in general too close to k; k = 300-350 gets about a 5 unit difference between them
+
+#PM2.5 gam
+gam_pm <- gam(pm_change ~ score_0.5 + med_income_decile + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#PM2.5 gam with standard deviation - both years
+gam_pm_sd <- gam(pm_change ~ score_0.5 + med_income_decile + pm_sd_2002 + pm_sd_2016 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#PM2.5 gam with standard deviation - 2002 
+gam_pm_sd_2002 <- gam(pm_change ~ score_0.5 + med_income_decile + pm_sd_2002 + s(GEOID, bs='mrf', k=350, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#PM2.5 gam with baseline
+gam_pm_baseline <- gam(pm_change ~ score_0.5 + med_income_decile + pm_mean_2002 + s(GEOID, bs='mrf', k=350, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#PM2.5 gam with baseline and std dev- both years
+gam_pm_baseline_sd <- gam(pm_change ~ score_0.5 + med_income_decile + pm_mean_2002 + pm_sd_2002 + pm_sd_2016 + s(GEOID, bs='mrf', k=350, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+# Get summary statistics and gamcheck
+models <- list(
+  "PM Base" = gam_pm,
+  "PM with SD (both years)" = gam_pm_sd,
+  "PM with SD (2002)" = gam_pm_sd_2002,
+  "PM with Baseline" = gam_pm_baseline,
+  "PM with Baseline and SD" = gam_pm_baseline_sd
+)
+
+# Loop through each model and run summary and gam.check
+for (model_name in names(models)) {
+  cat("\n\n========================================\n")
+  cat("MODEL:", model_name, "\n")
+  cat("========================================\n\n")
+  
+  # Print summary
+  cat("SUMMARY:\n")
+  print(summary(models[[model_name]]))
+  
+  # Add spacing for readability
+  cat("\n\nGAM CHECK:\n")
+  
+  # Print gam.check
+  print(gam.check(models[[model_name]]))
+}
+```
+O3 
+```{r}
+# Setting k = 300 gets about a 5 unit difference between them; insignificant
+
+#O3 gam
+gam_o3 <- gam(o3_change ~ score_0.5 + med_income_decile + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#o3 gam with standard deviation - both years
+gam_o3_sd <- gam(o3_change ~ score_0.5 + med_income_decile + o3_sd_2002 + o3_sd_2016 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#O3 gam with standard deviation - 2002 
+gam_o3_sd_2002 <- gam(o3_change ~ score_0.5 + med_income_decile + o3_sd_2002 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#O3  gam with baseline
+gam_o3_baseline <- gam(o3_change ~ score_0.5 + med_income_decile + o3_mean_2002 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#O3 gam with baseline and std dev- both years
+gam_o3_baseline_sd <- gam(o3_change ~ score_0.5 + med_income_decile + o3_mean_2002 + o3_sd_2002 + o3_sd_2016 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+# Get summary statistics and gamcheck
+models <- list(
+  "O3 Base" = gam_o3,
+  "O3 with SD (both years)" = gam_o3_sd,
+  "O3 with SD (2002)" = gam_o3_sd_2002,
+  "O3 with Baseline" = gam_o3_baseline,
+  "03 with Baseline and SD" = gam_o3_baseline_sd
+)
+
+# Loop through each model and run summary and gam.check
+for (model_name in names(models)) {
+  cat("\n\n========================================\n")
+  cat("MODEL:", model_name, "\n")
+  cat("========================================\n\n")
+  
+  # Print summary
+  cat("SUMMARY:\n")
+  print(summary(models[[model_name]]))
+  
+  # Add spacing for readability
+  cat("\n\nGAM CHECK:\n")
+  
+  # Print gam.check
+  print(gam.check(models[[model_name]]))
+}
+```
+NO2 
+```{r}
+# Setting k = 300 gets about a 20 unit difference between them; insignificant
+
+#no2 gam
+gam_no2 <- gam(no2_change ~ score_0.5 + med_income_decile + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#no2 gam with o3 standard deviation - both years (sd not avail for no2)
+gam_no2_sd <- gam(no2_change ~ score_0.5 + med_income_decile + o3_sd_2002 + o3_sd_2016 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#no2 gam with o3 standard deviation - 2002
+gam_no2_sd_2002 <- gam(no2_change ~ score_0.5 + med_income_decile + o3_sd_2002 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#no2 gam with baseline
+gam_no2_baseline <- gam(no2_change ~ score_0.5 + med_income_decile + no2_2000 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#no2 gam with baseline and o3 std dev- both years
+gam_no2_baseline_sd <- gam(no2_change ~ score_0.5 + med_income_decile + no2_2000 + o3_sd_2002 + o3_sd_2016 + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+# Get summary statistics and gamcheck
+models <- list(
+  "NO2 Base" = gam_no2,
+  "NO2 with SD (both years)" = gam_no2_sd,
+  "NO2 with SD (2002)" = gam_no2_sd_2002,
+  "NO2 with Baseline" = gam_no2_baseline,
+  "NO2 with Baseline and SD" = gam_no2_baseline_sd
+)
+
+# Loop through each model and run summary and gam.check
+for (model_name in names(models)) {
+  cat("\n\n========================================\n")
+  cat("MODEL:", model_name, "\n")
+  cat("========================================\n\n")
+  
+  # Print summary
+  cat("SUMMARY:\n")
+  print(summary(models[[model_name]]))
+  
+  # Add spacing for readability
+  cat("\n\nGAM CHECK:\n")
+  
+  # Print gam.check
+  print(gam.check(models[[model_name]]))
+}
+```
+
+NDVI
+```{r}
+# Setting k = 300 gets about a 80 unit difference between them - insignificant; setting k = 200 gets about a 50 unit difference between them - insignificant - only baseline model with insig Moran's; setting k = 100 gets about a 20 unit diff -  insig + Moran's I sig
+
+#NDVI gam
+gam_ndvi <- gam(ndvi_change ~ score_0.5 + med_income_decile + s(GEOID, bs='mrf', k=100, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#NDVI gam with o3 standard deviation - both years (sd not avail for no2)
+gam_ndvi_sd <- gam(ndvi_change ~ score_0.5 + med_income_decile + ndvi_sd_2000 + ndvi_sd_2016 + s(GEOID, bs='mrf', k=100, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#NDVI gam with o3 standard deviation - 2002
+gam_ndvi_sd_2000 <- gam(ndvi_change ~ score_0.5 + med_income_decile + ndvi_sd_2000 + s(GEOID, bs='mrf', k=100, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#NDVI gam with baseline
+gam_ndvi_baseline <- gam(ndvi_change ~ score_0.5 + med_income_decile + ndvi_mean_2000 + s(GEOID, bs='mrf', k=100, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+#NDVI gam with baseline and o3 std dev- both years
+gam_ndvi_baseline_sd <- gam(ndvi_change ~ score_0.5 + med_income_decile + ndvi_mean_2000 + ndvi_sd_2000 + ndvi_sd_2016 + s(GEOID, bs='mrf', k=100, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+# Get summary statistics and gamcheck
+models <- list(
+  "NDVI Base" = gam_ndvi,
+  "NDVI with SD (both years)" = gam_ndvi_sd,
+  "NDVI with SD (2002)" = gam_ndvi_sd_2000,
+  "NDVI with Baseline" = gam_ndvi_baseline,
+  "NDVI with Baseline and SD" = gam_ndvi_baseline_sd
+)
+
+# Loop through each model and run summary and gam.check
+for (model_name in names(models)) {
+  cat("\n\n========================================\n")
+  cat("MODEL:", model_name, "\n")
+  cat("========================================\n\n")
+  
+  # Print summary
+  cat("SUMMARY:\n")
+  print(summary(models[[model_name]]))
+  
+  # Add spacing for readability
+  cat("\n\nGAM CHECK:\n")
+  
+  # Print gam.check
+  print(gam.check(models[[model_name]]))
+}
+```
+
+Temp 
+```{r}
+# Setting k = 300 gets about a 18 unit difference between them- insignificant + moran's I insig, setting k = 200 gets about a 10 unit difference between them- insignnificant + moran's I sig
+
+#temp gam
+gam_temp_1 <- gam(mean_temp ~ score_0.5 + med_income_decile + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+gam_temp_2 <- gam(mean_temp ~ score_0.5 + med_income_decile + s(GEOID, bs='mrf', k=200, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")
+
+summary(gam_temp_1)
+gam.check(gam_temp_1)
+summary(gam_temp_2)
+gam.check(gam_temp_2)
+```
+
+
+Function to calculate Moran's I for models to assess residual spatial autocorrelation
+```{r}
+# Function to calculate and visualize Moran's I for GAM models
+analyze_spatial_autocorrelation_gam <- function(models, model_names, coords, 
+                                               k = 5, output_dir = "gam_results_moran") {
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Initialize results dataframe
+  results <- data.frame(
+    model = character(),
+    morans_i = numeric(),
+    p_value = numeric(),
+    z_score = numeric(),
+    significance = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each model
+  for (i in 1:length(models)) {
+    model <- models[[i]]
+    model_name <- model_names[i]
+    
+    # Extract residuals from GAM model
+    residuals <- residuals(model)
+    
+    # Create neighbors list
+    knn <- knearneigh(coords, k = k)
+    nb <- knn2nb(knn)
+    lw <- nb2listw(nb, style = "W")
+    
+    # Calculate Moran's I 
+    mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+    moran_i <- round(mi_test$estimate[1], 4)
+    p_value <- mi_test$p.value
+    z_score <- round(mi_test$statistic, 4)
+    
+    # Add significance 
+    sig_indicator <- ifelse(p_value < 0.001, "***", 
+                     ifelse(p_value < 0.01, "**",
+                     ifelse(p_value < 0.05, "*", "ns")))
+    
+    # Create Moran scatter plot
+    png(file.path(output_dir, paste0("moran_plot_", gsub(" ", "_", model_name), ".png")), 
+        width = 800, height = 600)
+    mp <- moran.plot(residuals, lw, main = paste("Moran's I Scatter Plot -", model_name),
+                    xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+    
+    # Add regression line with the Moran's I slope
+    abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+    
+    # Add stats to plot
+    legend_text <- c(
+      paste("Moran's I:", moran_i),
+      paste("p-value:", format.pval(p_value, digits = 4), sig_indicator),
+      paste("z-score:", z_score)
+    )
+    
+    legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+    
+    dev.off()
+    
+    # Add to results dataframe
+    results <- rbind(results, data.frame(
+      model = model_name,
+      morans_i = moran_i,
+      p_value = p_value,
+      z_score = z_score,
+      significance = sig_indicator,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  
+  return(results)
+}
+
+# Running Moran's I analysis for PM GAM models
+# List models
+pm_gam_models <- list(
+  gam_pm,
+  gam_pm_sd,
+  gam_pm_sd_2002,
+  gam_pm_baseline,
+  gam_pm_baseline_sd
+)
+
+o3_gam_models <- list(
+  gam_o3,
+  gam_o3_sd,
+  gam_o3_sd_2002,
+  gam_o3_baseline,
+  gam_o3_baseline_sd
+)
+
+no2_gam_models <- list(
+  gam_no2,
+  gam_no2_sd,
+  gam_no2_sd_2002,
+  gam_no2_baseline,
+  gam_no2_baseline_sd
+)
+
+ndvi_gam_models <- list(
+  gam_ndvi,
+  gam_ndvi_sd,
+  gam_ndvi_sd_2000,
+  gam_ndvi_baseline,
+  gam_ndvi_baseline_sd
+)
+
+temp_gam_models <- list(
+  gam_temp_1,
+  gam_temp_2
+)
+
+# Define model names
+pm_gam_names <- c(
+  "PM GAM",
+  "PM GAM with SD - both years",
+  "PM GAM with SD - 2002",
+  "PM GAM with baseline",
+  "PM GAM with baseline and SD"
+)
+
+o3_gam_names <- c(
+  "O3 GAM",
+  "O3 GAM with SD - both years",
+  "O3 GAM with SD - 2002",
+  "O3 GAM with baseline",
+  "O3 GAM with baseline and SD"
+)
+
+no2_gam_names <- c(
+  "NO2 GAM",
+  "NO2 GAM with SD - both years",
+  "NO2 GAM with SD - 2002",
+  "NO2 GAM with baseline",
+  "NO2 GAM with baseline and SD"
+)
+
+
+ndvi_gam_names <- c(
+  "NDVI GAM",
+  "NDVI GAM with SD - both years",
+  "NDVI GAM with SD - 2000",
+  "NDVI GAM with baseline",
+  "NDVI GAM with baseline and SD"
+)
+
+temp_gam_names <- c(
+  "Temp GAM 1",
+  "Temp GAM 2"
+)
+
+# Run the analysis 
+pm_gam_morans <- analyze_spatial_autocorrelation_gam(
+  pm_gam_models, 
+  pm_gam_names, 
+  Locations,  
+  k = 5, 
+  output_dir = "gam_morans_pm"
+)
+
+o3_gam_morans <- analyze_spatial_autocorrelation_gam(
+  o3_gam_models, 
+  o3_gam_names, 
+  Locations,  
+  k = 5, 
+  output_dir = "gam_morans_o3"
+)
+
+no2_gam_morans <- analyze_spatial_autocorrelation_gam(
+  no2_gam_models, 
+  no2_gam_names, 
+  Locations,  
+  k = 5, 
+  output_dir = "gam_morans_no2"
+)
+
+
+ndvi_gam_morans <- analyze_spatial_autocorrelation_gam(
+  ndvi_gam_models, 
+  ndvi_gam_names, 
+  Locations,  
+  k = 5, 
+  output_dir = "gam_morans_ndvi"
+)
+
+temp_gam_morans <- analyze_spatial_autocorrelation_gam(
+  temp_gam_models, 
+  temp_gam_names, 
+  Locations,  
+  k = 5, 
+  output_dir = "temp_morans_ndvi"
+)
+
+# Print the results
+print(pm_gam_morans)
+print(o3_gam_morans)
+print(no2_gam_morans)
+print(ndvi_gam_morans)
+print(temp_gam_morans)
+
+```
