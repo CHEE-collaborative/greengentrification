@@ -1,0 +1,397 @@
+
+```{r}
+library(tidyverse)
+library(here) 
+library(arrow)          # Reading parquet files
+library(readxl)         # Reading excel files
+library(tidycensus)     # Census data access
+library(tigris)         # Census tract boundaries
+library(terra)          # Raster processing
+library(exactextractr)  # Raster aerial interpolation
+library(tidyterra)      # For terra objects in tidyverse
+library(sf)             # Spatial data 
+library(spdep)          # Spatial dependence tests
+library(spatialreg)     # Spatial regression models
+library(INLA)           # Integrated nested laplace approximation models
+library(CARBayes)
+
+# Unused packages for this code (keeping for now)
+# library(mgcv) library(fixest) library(lmtest) library(mgcViz) library(DHARMa) library(qqplotr)
+# library(lattice)library(distr) #for qqbounds() 
+# library(gridExtra) library(qgam)  library(ggfields) # for plotting spatial field
+# library(ggregplot) #INLA compatible plotting library (efxplot)
+# library(kableExtra)library(inlatools) # for INLA diagnostics
+```
+
+```{r}
+# Check if 'data' directory exists; if not, create it
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+# Load gentrification score by tract
+gentrification <- read.csv(here("data", "Data_NYC_Gentrification_2000_16.csv")) %>% 
+  mutate(tractid = as.character(tractid)) %>% 
+  dplyr::select(tractid, score_0.5)
+
+# Load gentrification score if using xlsx file:
+# gentrification <- read_xlsx(here("Gentrification","Data_NYC_Gentrification_2000_16.xlsx")) %>%
+#   mutate(tractid = as.character(tractid)) %>%
+#   dplyr::select(tractid, score_0.5)
+
+# Pull NYC tract IDs/fips from gentrification index dataset for filtering
+nyc_fips <- gentrification$tractid
+
+# Load NYC tracts shapefile
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), year = 2010) %>%
+  # clean lat and long for Conley SEs
+  mutate(lat = as.numeric(INTPTLAT10), long = as.numeric(INTPTLON10), GEOID = GEOID10) %>% 
+  # filter for FIPS codes included in gentrification index dataset
+  filter(GEOID %in% nyc_fips)
+
+
+# Load NY tracts populatuion weighted centroid points from Census data
+nyc_weighted_centroids <- read.table("https://www2.census.gov/geo/docs/reference/cenpop2010/tract/CenPop2010_Mean_TR36.txt", 
+                         header = TRUE, sep = ",", stringsAsFactors = FALSE, 
+                         colClasses = c("character", "character", "character", "numeric", "numeric", "numeric")) %>%
+  mutate(FIPS = paste(STATEFP, COUNTYFP, TRACTCE, sep = "")) %>% 
+  ## filter for only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%  
+  rename(Longitude_weighted = LONGITUDE, 
+         Latitude_weighted = LATITUDE)
+
+# JH - 10/12/24 warning persists 10/13, 10/14 Warning: R metadata may have unsafe or invalid elements ℹ Type: "externalptr" options(arrow.unsafe_metadata = TRUE) #
+
+# Temperature data
+if(!file.exists(here("data","summarized_daily_temp_preds.parquet"))){download.file("https://zenodo.org/records/10557980/files/summarized_daily_temp_preds.parquet?download=1", 
+                                                                                   destfile = here("data","summarized_daily_temp_preds.parquet"))}
+
+# Temperature by tract
+temp <- read_parquet(here("data","summarized_daily_temp_preds.parquet")) %>%
+  filter(str_detect(date, "2016")) %>%
+  mutate(temp_c = mean_temp_daily_cK/100-273.15) %>% 
+  mutate(temp_f = temp_c*9/5+32) %>% 
+  group_by(GEOID, date) %>%
+  ungroup() %>% 
+  group_by(GEOID) %>% 
+  summarize(mean_temp = mean(mean_temp_daily_cK/100))
+
+# NDVI by tract (need to have it downloaded and stored locally)
+ndvi_mean_2016 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_mean_2000 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_sd_2016 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "stdev")
+
+ndvi_sd_2000 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "stdev")
+
+# PM2.5 data
+# Download data from URL
+download_data <- function() {
+  # set longer timeout
+  options(timeout = 7200)
+  if(!file.exists(here("data", "2016_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_pm25_daily_average.txt.gz", destfile = here("data", "2016_pm25_daily_average.txt.gz"))} #2016
+  if(!file.exists(here("data", "2002_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_pm25_daily_average.txt.gz", destfile = here("data", "2002_pm25_daily_average.txt.gz"))}} #2002
+download_data()
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2002
+pm_tract_2002 <- read.delim(gzfile(here("data", "2002_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## Include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## Calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+            pm_sd_2002 = sd(pm25_daily_average.ug.m3.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2016
+pm_tract_2016 <- read.delim(gzfile(here("data", "2016_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(pm_mean_2016 = mean(Prediction),
+            pm_sd_2016 = sd(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+  
+# Combine 2002 and 2016 pm data for nyc_tracts
+pm_tract <- pm_tract_2002 %>%
+  inner_join(pm_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# NO2 CACES
+no2_2016_caces <- read.csv(here("data", "2016_no2_caces.csv")) %>% 
+  mutate(no2_2016 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_2000_caces <- read.csv(here("data", "2000_no2_caces.csv")) %>% 
+  mutate(no2_2000 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_caces <- left_join(no2_2000_caces, no2_2016_caces, by = "fips") %>% 
+  dplyr::select(no2_2000, no2_2016, fips)
+
+#O3 data download
+options(timeout = 7200)
+if(!file.exists(here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))} #2016
+if(!file.exists(here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))} #2002
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2002
+o3_tract_2002 <- read.delim(gzfile(here("data", "2002_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>% 
+  ## include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>% 
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+            o3_sd_2002 = sd(ozone_daily_8hour_maximum.ppb.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2016
+o3_tract_2016 <- read.delim(gzfile(here("data", "2016_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>% 
+  ## calculate annual average by tract using  population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(o3_mean_2016 = mean(Prediction),
+            o3_sd_2016 = sd(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+o3_tract <- o3_tract_2002 %>%
+  left_join(o3_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# Merge all exposure data
+all_data <- nyc_tracts %>% 
+  # join gentrification index by tract
+  right_join(gentrification, by = c("GEOID10" = "tractid")) %>%
+  left_join(pm_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016-pm_2002) %>% 
+  left_join(o3_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002, o3_sd_2016 = o3_sd_2016, o3_sd_2002 = o3_sd_2002) %>% 
+  left_join(no2_caces, by = c("GEOID" = "fips")) %>% 
+  mutate(no2_change = no2_2016-no2_2000) %>% 
+  mutate(ndvi_mean_2016 = ndvi_mean_2016, ndvi_mean_2000 = ndvi_mean_2000, ndvi_change = ndvi_mean_2016-ndvi_mean_2000) %>%
+  mutate(ndvi_sd_2016 = ndvi_sd_2016, ndvi_sd_2000 = ndvi_sd_2000) %>%
+  left_join(temp, by = "GEOID")
+
+
+############# Median income ###############################
+# Find median household income variable in 2000 decennial census
+all_vars_dec <- 
+  load_variables(year = 2000, dataset = "sf3")
+
+# Models adjusting for median income in 2000 (note: 2000 decennial census is 1999 data)
+income_2000 <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2000 = value)
+#results in 226 missing tracts in terms of 2010 tracts.
+
+# Find median household income variable in 2010 American Community Survey
+income_2010 <- get_acs(variables = "B06011_001", year = 2010, state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2010 = estimate)
+
+# Joining both income sets with data and imputing 2010 data where 2000 data is missing
+all_data_inc <- all_data %>%
+  left_join(income_2000, by = "GEOID") %>%
+  left_join(income_2010, by = "GEOID") %>%
+  mutate(med_income_2000_impute = coalesce(med_income_2000, med_income_2010)) %>% 
+  # coerce GEOID to numeric then factor class to avoid error in MRF smooth
+  mutate(GEOID = as.numeric(GEOID)) %>% 
+  mutate(GEOID = factor(GEOID)) %>% 
+ # coerce COUNTYFP10 to numeric then factor class to avoid error ?
+  mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
+  mutate(COUNTYFP10 = factor(COUNTYFP10))
+
+# Ranking median income 
+all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)
+
+
+# Converting median income to deciles and scaling
+# Create deciles
+income_quantiles <- quantile(all_data_inc$med_income_2000_impute, probs = seq(0, 1, by = 0.1))
+all_data_inc$med_income_decile <- findInterval(all_data_inc$med_income_2000_impute, 
+                                             income_quantiles,
+                                             rightmost.closed = TRUE)
+```
+
+```{r}
+## Create Spatial Neighbors Matrix
+create_neighbors_matrix <- function(spatial_data) {
+  # Create queen contiguity neighbors
+  neighbors <- poly2nb(spatial_data, queen = TRUE)
+  
+  # Check for areas with no neighbors
+  no_neighbors <- which(card(neighbors) == 0)
+  
+  if(length(no_neighbors) > 0) {
+    cat("Found", length(no_neighbors), "areas with no neighbors. Fixing...\n")
+    
+    # Option 1: Add nearest neighbor connections for isolated areas
+    coords <- st_coordinates(st_centroid(spatial_data))
+    
+    for(i in no_neighbors) {
+      # Find nearest neighbor for each isolated area
+      distances <- sqrt((coords[i,1] - coords[,1])^2 + (coords[i,2] - coords[,2])^2)
+      distances[i] <- Inf  # Don't connect to itself
+      nearest <- which.min(distances)
+      
+      # Add bidirectional connection
+      neighbors[[i]] <- as.integer(nearest)
+      neighbors[[nearest]] <- sort(c(neighbors[[nearest]], as.integer(i)))
+    }
+  }
+  
+  # Convert to spatial weights matrix
+  W <- nb2mat(neighbors, style = "B", zero.policy = TRUE)
+  
+  # Ensure diagonal is zero
+  diag(W) <- 0
+  
+  # Final check - should have no zero row sums now
+  zero_rows <- which(rowSums(W) == 0)
+  if(length(zero_rows) > 0) {
+    stop("Still have areas with no neighbors after fixing. Manual intervention needed.")
+  }
+  
+  return(W)
+}
+
+
+W_matrix <- create_neighbors_matrix(nyc_tracts)
+
+
+## Ensure data ordering matches spatial matrix
+# The data must be sorted in the same order as the rows/columns of W_matrix
+# If using tract IDs, sort both the data and ensure W_matrix corresponds to the same order
+
+all_data_inc <- all_data_inc[order(all_data_inc$GEOID), ]
+
+```
+
+```{r}
+## CARBayes Model Fitting
+
+### Model fitting for PM2.5 with standard deviations
+fit_pm_sd <- S.CARleroux(
+  formula = pm_change ~ score_0.5 + med_income_decile + pm_sd_2002 + pm_sd_2016 + COUNTYFP10,
+  data = all_data_inc,
+  family = "gaussian",
+  W = W_matrix,  # Your spatial neighbors matrix
+  burnin = 10000,
+  thin = 10,
+  n.sample = 110000,
+  #n.chains = 1,
+  prior.mean.beta = rep(0.00, times = 9),  # covariates + intercept (COUNTY as factor so 9)
+  prior.var.beta = rep(100.00^2, times = 9),
+  prior.tau2 = c(0.01, 0.01)
+)
+
+### Model fitting for NDVI with standard deviations
+fit_ndvi_sd <- S.CARleroux(
+  formula = ndvi_change ~ score_0.5 + med_income_decile + ndvi_sd_2000 + ndvi_sd_2016 + COUNTYFP10,
+  data = all_data_inc,
+  family = "gaussian",
+  W = W_matrix,
+  burnin = 10000,
+  thin = 10,
+  n.sample = 110000,
+  #n.chains = 1,
+  prior.mean.beta = rep(0.00, times = 9),  # covariates + intercept (COUNTY as factor so 9)
+  prior.var.beta = rep(100.00^2, times = 9),
+  prior.tau2 = c(0.01, 0.01)
+)
+
+### Model fitting for O3 with standard deviations
+fit_o3_sd <- S.CARleroux(
+  formula = o3_change ~ score_0.5 + med_income_decile + o3_sd_2002 + o3_sd_2016 + COUNTYFP10,
+  data = all_data_inc,
+  family = "gaussian",
+  W = W_matrix,
+  burnin = 10000,
+  thin = 10,
+  n.sample = 110000,
+  #n.chains = 1,
+  prior.mean.beta = rep(0.00, times = 9),  # covariates + intercept (COUNTY as factor so 9)
+  prior.var.beta = rep(100.00^2, times = 9),
+  prior.tau2 = c(0.01, 0.01)
+)
+
+### Model fitting for NO2 (using O3 standard deviations as proxy)
+fit_no2_sd <- S.CARleroux(
+  formula = no2_change ~ score_0.5 + med_income_decile + o3_sd_2002 + o3_sd_2016 + COUNTYFP10,
+  data = all_data_inc,
+  family = "gaussian",
+  W = W_matrix,
+  burnin = 10000,
+  thin = 10,
+  n.sample = 110000,
+  #n.chains = 1,
+  prior.mean.beta = rep(0.00, times = 9),  # covariates + intercept (COUNTY as factor so 9)
+  prior.var.beta = rep(100.00^2, times = 9),
+  prior.tau2 = c(0.01, 0.01)
+)
+
+### Model fitting for Temperature (no standard deviation)
+fit_temp <- S.CARleroux(
+  formula = mean_temp ~ score_0.5 + med_income_decile + COUNTYFP10,
+  data = all_data_inc,
+  family = "gaussian",
+  W = W_matrix,
+  burnin = 10000,
+  thin = 10,
+  n.sample = 110000,
+  #n.chains = 1,
+  prior.mean.beta = rep(0.00, times = 7),  # covariates + intercept (COUNTY as factor so 7)
+  prior.var.beta = rep(100.00^2, times = 7),
+  prior.tau2 = c(0.01, 0.01)
+)
+```
+
+```{r}
+## Model Diagnostics and Results
+# Print model summaries
+print(fit_pm_sd)
+print(fit_ndvi_sd)
+print(fit_o3_sd)
+print(fit_no2_sd)
+print(fit_temp)
+
+# Convergence plots
+plot(fit_pm_sd$samples$beta[,1], type="l", main="PM Intercept")
+plot(fit_pm_sd$samples$beta[,2], type="l", main="PM Score")
+plot(fit_ndvi_sd$samples$beta[,1], type="l", main="NDVI Intercept") 
+plot(fit_ndvi_sd$samples$beta[,2], type="l", main="NDVI Score")
+plot(fit_o3_sd$samples$beta[,1], type="l", main="O3 Intercept")
+plot(fit_o3_sd$samples$beta[,2], type="l", main="O3 Score")
+plot(fit_no2_sd$samples$beta[,1], type="l", main="NO2 Intercept")
+plot(fit_no2_sd$samples$beta[,2], type="l", main="NO2 Score")
+plot(fit_temp$samples$beta[,1], type="l", main="Temp Intercept")
+plot(fit_temp$samples$beta[,2], type="l", main="Temp Score")
+
+```
+
