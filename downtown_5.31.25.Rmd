@@ -1,0 +1,441 @@
+---
+title: "downtown_5.31.25"
+output: html_document
+date: "2025-05-31"
+---
+
+```{r}
+library(tidyverse)
+library(tigris)
+library(here)
+library(mgcv)
+library(lmtest)
+library(terra)
+library(exactextractr)
+library(tidyterra)
+library(sf)
+library(mgcViz)
+library(biscale) # for bivariate map
+library(cowplot)
+library(ggplot2)
+library(raster)
+library(car)
+library(spdep)
+library(arrow)
+library(dplyr)
+library(tidycensus)
+library(corrplot)
+library(DHARMa)
+library(stats)
+library(factoextra) # clustering graphs
+library(scales)
+library(gridExtra)
+library(NbClust)
+
+library(cluster)
+library(ggrepel)
+library(tmap)
+library(gridExtra)
+library(ggdendro)
+library(dendextend)
+
+library(betareg)    
+library(glmmTMB)  
+library(dynamicTreeCut) # for dynamic tree cutting
+
+
+library(dodgr) # for calculating network distance
+library(osmextract) # for calculating network distance
+library(viridis)  #  color scales
+
+library(patchwork)
+library(scales)
+library(forestplot)
+library(mice)      # For pooling with Rubin's rules
+
+library(meta) # another forest plot package
+
+library(SpMeta)
+```
+
+Load all health data
+```{r}
+# Define NYC GEOIDs 
+nyc_boros <- c("36081","36005","36061","36085","36047")
+nyc_counties <- c("081", "005", "061", "085", "047")
+
+# 2016 health data
+hlthdata_total_2016 <- read_csv(here("data", "500_Cities__Local_Data_for_Better_Health__2016_release_20241003.csv"))
+
+# Subset to NYC, clean variables
+hlthdata_nyc_2016 <- hlthdata_total_2016 %>% 
+   mutate(CountyFIPS = str_sub(TractFIPS, 1, 5)) %>%
+   filter(CountyFIPS %in% nyc_boros) %>%
+   rename("GEOID" = "TractFIPS") %>% 
+  dplyr::select("Year", "DataSource", "Category", "Measure", "Data_Value_Unit","DataValueTypeID", "Data_Value","Low_Confidence_Limit","High_Confidence_Limit", "Short_Question_Text","Population2010","GeoLocation","MeasureId","CityFIPS","GEOID","CountyFIPS") 
+
+# 2023 health data
+hlthdata_total_2023 <- read_csv(here("data", "PLACES__Local_Data_for_Better_Health__Census_Tract_Data_2023_release_20241005.csv"))
+
+# Subset to NYC, clean variables
+hlthdata_nyc_2023 <- hlthdata_total_2023 %>%
+  filter(CountyFIPS %in% nyc_boros) %>%
+  rename("GEOID" = "LocationName") %>% 
+  dplyr::select("Year", "DataSource", "Category", "Measure", "Data_Value_Unit","DataValueTypeID", "Data_Value","Low_Confidence_Limit","High_Confidence_Limit", "Short_Question_Text","TotalPopulation","Geolocation","MeasureId","GEOID","CountyFIPS") 
+```
+
+NYC tracts and centroids data
+```{r}
+nyc_fips <- gent$tractid
+
+# Load NYC tracts shapefile
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), year = 2010) %>%
+  # clean lat and long for Conley SEs
+  mutate(lat = as.numeric(INTPTLAT10), long = as.numeric(INTPTLON10), GEOID = GEOID10) %>%
+  # filter for FIPS codes included in gentrification index dataset
+  filter(GEOID %in% nyc_fips)
+
+
+# Load NY tracts populatuion weighted centroid points from Census data
+nyc_weighted_centroids <- read.table("https://www2.census.gov/geo/docs/reference/cenpop2010/tract/CenPop2010_Mean_TR36.txt", 
+                         header = TRUE, sep = ",", stringsAsFactors = FALSE, 
+                         colClasses = c("character", "character", "character", "numeric", "numeric", "numeric")) %>%
+  mutate(FIPS = paste(STATEFP, COUNTYFP, TRACTCE, sep = "")) %>% 
+  ## filter for only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%  
+  rename(Longitude_weighted = LONGITUDE, 
+         Latitude_weighted = LATITUDE)
+
+###############################BACKING UP NYC WEIGHTED CENTROIDS########################
+# write.csv(nyc_weighted_centroids, "nyc_weighted_centroids.csv",row.names=FALSE)
+# nyc_weighted_centroids_copy <- read_csv(here("nyc_weighted_centroids.csv"))
+```
+
+Load and clean environmental data
+```{r}
+# # Temperature by tract
+# temp <- read_parquet(here("data","gent_data","summarized_daily_temp_preds.parquet")) %>%
+#   filter(str_detect(date, "2016")) %>%
+#   mutate(temp_c = mean_temp_daily_cK/100-273.15) %>% 
+#   mutate(temp_f = temp_c*9/5+32) %>% 
+#   group_by(GEOID, date) %>%
+#   ungroup() %>% 
+#   group_by(GEOID) %>% 
+#   summarize(mean_temp = mean(mean_temp_daily_cK/100))
+# 
+# # NDVI by tract (need to have it downloaded and stored locally)
+# ndvi_2016 <- rast(here("data", "gent_data","ndvi_c2_2016_2.tif")) %>% 
+#   exact_extract(nyc_tracts, fun = "mean")
+# 
+# ndvi_2000 <- rast(here("data", "gent_data","ndvi_c2_2000_2.tif")) %>% 
+#   exact_extract(nyc_tracts, fun = "mean")
+# 
+# # PM2.5 data
+# # Download data from URL
+# download_data <- function() {
+#   # set longer timeout
+#   options(timeout = 7200)
+#   if(!file.exists(here("data", "2016_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_pm25_daily_average.txt.gz", destfile = here("data", "2016_pm25_daily_average.txt.gz"))} #2016
+#   if(!file.exists(here("data", "2002_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_pm25_daily_average.txt.gz", destfile = here("data", "2002_pm25_daily_average.txt.gz"))}} #2002
+# download_data()
+# 
+# # Read in PM2.5 daily average by census tract from EPA FAQSD - 2002
+# pm_tract_2002 <- read.delim(gzfile(here("data", "gent_data","2002_pm25_daily_average.txt.gz")), sep = ",") %>%
+#   ## Include only NYC tracts
+#   filter(FIPS %in% nyc_fips) %>%
+#   ## Convert FIPS to character for compatibility
+#   mutate(FIPS = as.character(FIPS)) %>%
+#   ## Join with population-weighted centroids
+#   left_join(nyc_weighted_centroids, by = "FIPS") %>%
+#   ## Calculate annual average by tract using population weighted centroid
+#   group_by(FIPS) %>%
+#   summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+#             Longitude = first(Longitude_weighted),
+#             Latitude = first(Latitude_weighted))
+# 
+# # Read in PM2.5 daily average by census tract from EPA FAQSD - 2016
+# pm_tract_2016 <- read.delim(gzfile(here("data", "gent_data","2016_pm25_daily_average.txt.gz")), sep = ",") %>%
+#   ## include only NYC tracts
+#   filter(Loc_Label1 %in% nyc_fips) %>% 
+#   ## Convert Loc_Label1 to character for compatibility
+#   mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+#   ## Join with population-weighted centroids
+#   left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
+#   ## calculate annual average by tract using population weighted centroid
+#   group_by(Loc_Label1) %>%
+#   summarize(pm_mean_2016 = mean(Prediction), 
+#             Longitude = first(Longitude_weighted),
+#             Latitude = first(Latitude_weighted))
+#   
+# 
+# # Combine 2002 and 2016 pm data for nyc_tracts
+# pm_tract <- pm_tract_2002 %>%
+#   inner_join(pm_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+#   mutate(FIPS = as.character(FIPS))
+# 
+# # NO2 CACES
+# no2_2016_caces <- read.csv(here("data","gent_data", "2016_no2_caces.csv")) %>% 
+#   mutate(no2_2016 = as.numeric(pred_wght)) %>%  
+#   mutate(fips = as.character(fips))
+# 
+# no2_2000_caces <- read.csv(here("data","gent_data", "2000_no2_caces.csv")) %>% 
+#   mutate(no2_2000 = as.numeric(pred_wght)) %>%  
+#   mutate(fips = as.character(fips))
+# 
+# no2_caces <- left_join(no2_2000_caces, no2_2016_caces, by = "fips") %>% 
+#   dplyr::select(no2_2000, no2_2016, fips)
+# 
+# #O3 data download
+# options(timeout = 7200)
+# if(!file.exists(here("data","gent_data", "2016_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))} #2016
+# if(!file.exists(here("data","gent_data", "2002_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))} #2002
+# 
+# # Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2002
+# o3_tract_2002 <- read.delim(gzfile(here("data", "gent_data","2002_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>% 
+#   ## include only NYC tracts
+#   filter(FIPS %in% nyc_fips) %>% 
+#   ## Convert FIPS to character for compatibility
+#   mutate(FIPS = as.character(FIPS)) %>%
+#   ## Join with population-weighted centroids
+#   left_join(nyc_weighted_centroids, by = "FIPS") %>%
+#   ## calculate annual average by tract using population weighted centroid
+#   group_by(FIPS) %>%
+#   summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+#             Longitude = first(Longitude_weighted),
+#             Latitude = first(Latitude_weighted))
+# 
+# # Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2016
+# o3_tract_2016 <- read.delim(gzfile(here("data","gent_data", "2016_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>%
+#   ## include only NYC tracts
+#   filter(Loc_Label1 %in% nyc_fips) %>% 
+#   ## Convert Loc_Label1 to character for compatibility
+#   mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+#   ## Join with population-weighted centroids
+#   left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>% 
+#   ## calculate annual average by tract using  population weighted centroid
+#   group_by(Loc_Label1) %>%
+#   summarize(o3_mean_2016 = mean(Prediction),
+#             Longitude = first(Longitude_weighted),
+#             Latitude = first(Latitude_weighted))
+# 
+# 
+# o3_tract <- o3_tract_2002 %>%
+#   left_join(o3_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+#   mutate(FIPS = as.character(FIPS))
+# 
+# 
+# # Merge all exposure data
+# gent_df <- as.data.frame(gent)
+# 
+# 
+# env_data <- nyc_tracts %>%
+# # cleaning line might not be needed if tigris works
+#   mutate(GEOID = as.character(GEOID)) %>% 
+#   # join gentrification index by tract
+#   right_join(gent_df, by = c("GEOID" = "tractid")) %>%
+#   left_join(pm_tract, by = c("GEOID" = "FIPS")) %>%
+#   mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016 - pm_2002) %>%
+#   left_join(o3_tract, by = c("GEOID" = "FIPS")) %>%
+#   mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016 - o3_2002) %>%
+#   left_join(no2_caces, by = c("GEOID" = "fips")) %>%
+#   mutate(no2_change = no2_2016 - no2_2000) %>%
+#   mutate(ndvi_2016 = ndvi_2016, ndvi_2000 = ndvi_2000, ndvi_change = ndvi_2016 - ndvi_2000) %>%
+#   left_join(temp, by = "GEOID") %>%
+#   dplyr::select(GEOID, pm_change, o3_change, no2_change, ndvi_change, mean_temp, pm_2002, pm_2016, o3_2002, o3_2016, no2_2000, no2_2016)
+# 
+# 
+# ############ Median income ###############################
+# # Find median household income variable in 2000 decennial census
+# all_vars_dec <- 
+#   load_variables(year = 2000, dataset = "sf3")
+# 
+# # Models adjusting for median income in 2000 (note: 2000 decennial census is 1999 data)
+# income_2000 <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
+#                   county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+#   rename(med_income_2000 = value)
+# #results in 226 missing tracts in terms of 2010 tracts.
+# 
+# # Find median household income variable in 2010 ACS
+# income_2010 <- get_acs(variables = "B06011_001", year = 2010, state = "NY", 
+#                   county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+#   rename(med_income_2010 = estimate)
+# 
+# # Joining both income sets with data and imputing 2010 data where 2000 data is missing
+# env_cov <- env_data %>%
+#   left_join(income_2000, by = "GEOID") %>%
+#   left_join(income_2010, by = "GEOID") %>%
+#   mutate(med_income_2000_impute = coalesce(med_income_2000, med_income_2010)) %>% 
+#   # coerce GEOID to numeric then factor class to avoid error in MRF smooth
+#   mutate(GEOID = as.numeric(GEOID)) %>% 
+#   mutate(GEOID = factor(GEOID))
+# 
+# # Ranking median income for use in GAM models
+# env_cov$med_income_ranked <- rank(env_cov$med_income_2000_impute) 
+# 
+# # Converting median income to quantiles and scaling
+# # Create deciles
+# income_quantiles <- quantile(env_cov$med_income_2000_impute, probs = seq(0, 1, by = 0.1))
+# env_cov$med_income_decile <- findInterval(env_cov$med_income_2000_impute, 
+#                                              income_quantiles,
+#                                              rightmost.closed = TRUE)
+# 
+# # Combining enviromental variables and gentrification data frame
+# env_cov_gent <- as.data.frame(env_cov %>% 
+#   left_join(gent_df, by = c("GEOID" = "tractid")))
+# class(env_cov_gent)
+# 
+# ###### save
+# # Convert geometry to WKT format and save as CSV
+# env_cov_gent_wkt <- env_cov_gent %>%
+#   mutate(geometry = st_as_text(geometry))%>%
+#   dplyr::select(-geometry.x)
+# 
+# write.csv(env_cov_gent_wkt, "env_cov_gent_wkt.csv", row.names = FALSE)
+
+#####env_cov_gent_wkt.csv CONTAINS ALL GENT AND ENV COV DATA#################
+
+```
+
+READ IN ENV, GENT VARIABLES FROM SAVED CSV
+```{r}
+# read in saved csv
+env_cov_gent <- read.csv("here"("env_cov_gent_wkt.csv"))
+
+# # convert data frame to sf
+# env_cov_gent <- st_as_sf(env_cov_gent_wkt, wkt ="geometry")
+
+env_cov_gent$score_0.5 <- as.numeric(as.character(env_cov_gent$score_0.5))
+env_cov_gent$pm_change <- as.numeric(as.character(env_cov_gent$pm_change))
+env_cov_gent$o3_change <- as.numeric(as.character(env_cov_gent$o3_change))
+env_cov_gent$no2_change <- as.numeric(as.character(env_cov_gent$no2_change))
+env_cov_gent$ndvi_change <- as.numeric(as.character(env_cov_gent$ndvi_change))
+env_cov_gent$GEOID10 <- as.character(as.numeric(env_cov_gent$GEOID10))
+```
+
+Calculating network distance (driving time)
+```{r}
+# Function to determine downtown point based on taking the population weighted centroid of tracts below 59th st in Manhattan
+get_downtown_point <- function(weighted_centroids) {
+  # First create a copy of the input data
+  centroids_df <- as.data.frame(weighted_centroids)
+  
+  # Filter for Manhattan (below 59th Street)
+  downtown_centroids <- centroids_df %>%
+    filter(
+      substr(FIPS, 1, 5) == "36061",  # Manhattan FIPS code
+      centroids_df$Latitude_weighted < 40.7657  # 59th Street latitude
+    )
+  
+  # Calculate the weighted mean center using population weights
+  total_pop <- sum(downtown_centroids$POPULATION, na.rm = TRUE)
+  weighted_lon <- sum(downtown_centroids$Longitude_weighted * downtown_centroids$POPULATION, na.rm = TRUE) / total_pop
+  weighted_lat <- sum(downtown_centroids$Latitude_weighted * downtown_centroids$POPULATION, na.rm = TRUE) / total_pop
+  
+  return(data.frame(
+    lon = weighted_lon,
+    lat = weighted_lat
+  ))
+}
+
+# Function to calculate travel times
+calculate_travel_times <- function(centroids) {
+  # Get downtown point
+  downtown <- get_downtown_point(centroids)
+  
+  # Download OSM data for NYC
+  nyc_osm <- oe_get(
+    place = "New York City",
+    layer = "lines"
+  )
+  
+  # Clean the highway data - remove problematic types
+  nyc_osm <- nyc_osm %>%
+    filter(!is.na(highway),
+           !highway %in% c("construction", "proposed", "platform", "elevator", 
+                          "corridor", "raceway", "busway"))
+  
+  # Convert OSM data to dodgr format
+  graph <- weight_streetnet(
+    nyc_osm,
+    wt_profile = "motorcar",  # Use car travel times
+    keep_cols = c("name", "highway")
+  )
+  
+  # Prepare origin points
+  from_points <- data.frame(
+    lon = centroids$Longitude_weighted,
+    lat = centroids$Latitude_weighted
+  )
+  
+  # Calculate travel times
+  times <- dodgr_times(
+    graph,
+    from = from_points,
+    to = downtown
+  )
+  
+  # Add results back to original centroids
+  centroids$travel_time_minutes_drive <- as.vector(times) / 60  # Convert seconds to minutes
+  centroids$downtown_lon <- downtown$lon
+  centroids$downtown_lat <- downtown$lat
+  
+  return(centroids)
+}
+
+# Calculate travel times from all centroids to the calculated downtown point
+results <- calculate_travel_times(nyc_weighted_centroids)
+
+# Print downtown point coordinates
+downtown <- get_downtown_point(nyc_weighted_centroids)
+print("Downtown point coordinates:")
+print(downtown)
+
+# View summary statistics
+print("Travel time summary (minutes):")
+print(summary(results$travel_time_minutes))
+
+# Create breaks - round to nearest 5 minutes 
+max_time <- ceiling(max(results$travel_time_minutes_drive, na.rm = TRUE)/5)*5
+min_time <- floor(min(results$travel_time_minutes_drive, na.rm = TRUE)/5)*5
+breaks <- seq(min_time, max_time, by = 5)  # 5-minute intervals
+
+# Plot network distance map
+ggplot() +
+  geom_point(data = results, 
+             aes(x = Longitude_weighted, y = Latitude_weighted, 
+                 color = travel_time_minutes_drive),
+             size = 2, alpha = 0.7) +
+  geom_point(data = downtown, 
+             aes(x = lon, y = lat),
+             color = "black", size = 4, shape = 18) +
+  geom_text(data = downtown,
+            aes(x = lon, y = lat, label = "Downtown"),
+            hjust = -0.3, vjust = -0.5) +
+  scale_color_viridis_c(name = "Driving Time (minutes)",
+                        breaks = breaks,
+                        limits = c(min_time, max_time),
+                        option = "turbo") +
+  labs(title = "Travel Times to Downtown Manhattan",
+       subtitle = "Based on OpenStreetMap road network",
+       x = "Longitude", 
+       y = "Latitude") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right",
+        plot.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold")) +
+  coord_fixed(ratio = 1.3)  
+
+#these times don't feel very realistic... but if they are all somewhat similarly not accounting for traffic conditions etc then maybe it's okay for now?
+
+# Extract just the FIPS and travel time to merge with env_cov_gent
+dt_travel_time_drive <- results %>%
+  dplyr::select(FIPS, travel_time_minutes_drive)
+
+dt_travel_time_drive$FIPS = as.factor(dt_travel_time_drive$FIPS)
+env_cov_gent$GEOID = as.factor(env_cov_gent$GEOID)
+
+# Join travel time to env_cov_gent
+env_cov_gent <- env_cov_gent %>%
+  left_join(dt_travel_time_drive, by = c("GEOID" = "FIPS"))
+```
