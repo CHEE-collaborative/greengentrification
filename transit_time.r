@@ -147,41 +147,158 @@ vec_centroids <- paste0(df_centroids[, 2], " ", df_centroids[, 1])
 vec_downtown <- paste0(df_downtown[, 2], " ", df_downtown[, 1])
 
 ################################################################################
-# Query Google Maps transit times.
-list_gmaps_transit <- gmapsdistance::gmapsdistance(
+# Google Maps travel times.
+t1 <- "08:00:00"
+t2 <- "14:00:00"
+t3 <- "20:00:00"
+
+################################################################################
+# Manually correct Brooklyn Pier coordinates to nearest road.
+vec_centroids[sf_tracts$GEOID == "36047005300"] <-
+  "40.677089 -74.0183485"
+
+################################################################################
+# Query transit times.
+list_gmaps_transit_0800 <- gmapsdistance::gmapsdistance(
   origin = vec_centroids,
   destination = vec_downtown,
   combinations = "all",
   mode = "transit",
   key = Sys.getenv("GoogleAPI"),
-  shape = "long"
+  shape = "long",
+  dep_time = t1,
+  dep_date = paste0(Sys.Date() + 1)
 )
-df_gmaps_distance <- list_gmaps_transit$Distance
-df_gmaps_time <- list_gmaps_transit$Time
+list_gmaps_transit_1400 <- gmapsdistance::gmapsdistance(
+  origin = vec_centroids,
+  destination = vec_downtown,
+  combinations = "all",
+  mode = "transit",
+  key = Sys.getenv("GoogleAPI"),
+  shape = "long",
+  dep_time = t2,
+  dep_date = paste0(Sys.Date() + 1)
+)
+list_gmaps_transit_2000 <- gmapsdistance::gmapsdistance(
+  origin = vec_centroids,
+  destination = vec_downtown,
+  combinations = "all",
+  mode = "transit",
+  key = Sys.getenv("GoogleAPI"),
+  shape = "long",
+  dep_time = t3,
+  dep_date = paste0(Sys.Date() + 1)
+)
+sf_transit_t1 <- cbind(
+  sf_centroids,
+  tod = t1,
+  time = list_gmaps_transit_0800$Time$Time,
+  distance = list_gmaps_transit_0800$Distance$Distance
+)
+sf_transit_t2 <- cbind(
+  sf_centroids,
+  tod = t2,
+  time = list_gmaps_transit_1400$Time$Time,
+  distance = list_gmaps_transit_1400$Distance$Distance
+)
+sf_transit_t3 <- cbind(
+  sf_centroids,
+  tod = t3,
+  time = list_gmaps_transit_2000$Time$Time,
+  distance = list_gmaps_transit_2000$Distance$Distance
+)
+sf_transit <- rbind(sf_transit_t1, sf_transit_t2, sf_transit_t3)
 
 ################################################################################
-# Merge transit time and distance with centroids.
-sf_transit <- cbind(
-  sf_centroids,
-  transit_time = df_gmaps_time$Time,
-  transit_distance = df_gmaps_distance$Distance
+# Drive (Queens Breeze Point).
+vec_centroids_drive <- vec_centroids[sf_tracts$GEOID == "36081091601"]
+
+################################################################################
+# Query drive times.
+list_gmaps_drive_0800 <- gmapsdistance::gmapsdistance(
+  origin = vec_centroids_drive,
+  destination = vec_downtown,
+  combinations = "all",
+  mode = "driving",
+  key = Sys.getenv("GoogleAPI"),
+  shape = "long",
+  dep_time = t1,
+  dep_date = paste0(Sys.Date() + 1)
 )
+list_gmaps_drive_1400 <- gmapsdistance::gmapsdistance(
+  origin = vec_centroids_drive,
+  destination = vec_downtown,
+  combinations = "all",
+  mode = "driving",
+  key = Sys.getenv("GoogleAPI"),
+  shape = "long",
+  dep_time = t2,
+  dep_date = paste0(Sys.Date() + 1)
+)
+list_gmaps_drive_2000 <- gmapsdistance::gmapsdistance(
+  origin = vec_centroids_drive,
+  destination = vec_downtown,
+  combinations = "all",
+  mode = "driving",
+  key = Sys.getenv("GoogleAPI"),
+  shape = "long",
+  dep_time = t3,
+  dep_date = paste0(Sys.Date() + 1)
+)
+sf_drive_t1 <- cbind(
+  sf_centroids[sf_tracts$GEOID == "36081091601", ],
+  tod = t1,
+  time = list_gmaps_drive_0800$Time,
+  distance = list_gmaps_drive_0800$Distance
+)
+sf_drive_t2 <- cbind(
+  sf_centroids[sf_tracts$GEOID == "36081091601", ],
+  tod = t2,
+  time = list_gmaps_drive_1400$Time,
+  distance = list_gmaps_drive_1400$Distance
+)
+sf_drive_t3 <- cbind(
+  sf_centroids[sf_tracts$GEOID == "36081091601", ],
+  tod = t3,
+  time = list_gmaps_drive_2000$Time,
+  distance = list_gmaps_drive_2000$Distance
+)
+sf_drive <- rbind(sf_drive_t1, sf_drive_t2, sf_drive_t3)
+
+################################################################################
+# Drop geometry.
 df_transit <- sf::st_drop_geometry(sf_transit)
 
-write.csv(df_transit, "df_transit.csv")
+################################################################################
+# Replace 36081091601 transit times with driving times.
+df_transit[grep("36081091601", df_transit$GEOID), ] <- df_drive
+
+################################################################################
+# Calculate average travel time and distance.
+df_time_mean <- aggregate(
+  time ~ GEOID,
+  data = df_transit,
+  FUN = mean,
+  na.rm = FALSE
+)
+df_distance_mean <- aggregate(
+  distance ~ GEOID,
+  data = df_transit,
+  FUN = mean,
+  na.rm = FALSE
+)
+sf_transit_mean <- merge(
+  sf_tracts,
+  merge(df_time_mean, df_distance_mean, by = "GEOID"),
+  by = "GEOID"
+)
 
 ################################################################################
 # Plot transit tinmes per census block group.
-sf_transit_polygons <- cbind(sf_tracts, transit_time = df_gmaps_time$Time)
-sf_transit_polygons$transit_time_noout <- ifelse(
-  sf_transit_polygons$transit_time > 10000,
-  NA,
-  sf_transit_polygons$transit_time
-)
 ggplot2::ggplot() +
   ggplot2::geom_sf(
-    data = sf_transit_polygons,
-    aes(fill = transit_time_noout),
+    data = sf_transit_mean,
+    aes(fill = time),
     color = NA
   ) +
   scale_fill_viridis_c(option = "magma", name = "Transit Time") +
