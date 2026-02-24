@@ -1,0 +1,2112 @@
+---
+title: "forestplots_4.9.25"
+output: html_document
+date: "2025-04-09"
+---
+
+```{r}
+library(tidyverse)
+library(tigris)
+library(here)
+library(mgcv)
+library(lmtest)
+library(terra)
+library(exactextractr)
+library(tidyterra)
+library(sf)
+library(mgcViz)
+library(biscale) # for bivariate map
+library(cowplot)
+library(ggplot2)
+library(raster)
+library(car)
+library(spdep)
+library(arrow)
+library(dplyr)
+library(tidycensus)
+library(corrplot)
+library(DHARMa)
+library(stats)
+library(factoextra) # clustering graphs
+library(scales)
+library(gridExtra)
+library(NbClust)
+
+library(cluster)
+library(ggrepel)
+library(tmap)
+library(gridExtra)
+library(ggdendro)
+library(dendextend)
+
+library(betareg)    
+library(glmmTMB)  
+library(dynamicTreeCut) # for dynamic tree cutting
+
+
+library(dodgr) # for calculating network distance
+library(osmextract) # for calculating network distance
+library(viridis)  #  color scales
+
+library(patchwork)
+library(scales)
+library(forestplot)
+library(mice)      # For pooling with Rubin's rules
+
+library(meta) # another forest plot package
+```
+NEW 31/8/25
+```{r}
+# Load required packages
+library(forestplot)
+library(dplyr)
+library(grid)
+library(Cairo)
+
+# Define the outcome names and their readable labels
+outcomes <- c("phlth", "pinactive", "mhlth", "asthma", "checkup")
+outcome_labels <- c(
+  "phlth" = "Poor physical health",
+  "pinactive" = "Physical inactivity", 
+  "mhlth" = "Poor mental health",
+  "asthma" = "Current asthma",
+  "checkup" = "Routine health checkup"
+)
+
+# Initialize empty data frame to store all results
+all_data <- data.frame()
+
+# Read data from each CSV file
+for(outcome in outcomes) {
+  filename <- paste0("results_final_", outcome, ".csv")
+  
+  # Check if file exists
+  if(file.exists(filename)) {
+    # Read the CSV file
+    temp_data <- read.csv(filename, stringsAsFactors = FALSE)
+    
+    # Add to combined dataset
+    all_data <- rbind(all_data, temp_data)
+    cat("Loaded data from:", filename, "\n")
+  } else {
+    cat("Warning: File not found:", filename, "\n")
+  }
+}
+
+# Check if we have any data
+if(nrow(all_data) == 0) {
+  stop("No data files were found or loaded. Please check that your CSV files are in the working directory.")
+}
+
+# Filter for cluster effects only (cluster2 and cluster3)
+cluster_data <- all_data %>%
+  filter(term %in% c("cluster_2", "cluster_3")) %>%
+  mutate(
+    outcome_label = outcome_labels[outcome],
+    # Rename clusters
+    cluster_label = case_when(
+      term == "cluster_2" ~ "Environmental improvement",
+      term == "cluster_3" ~ "Environmental gentrification",
+      TRUE ~ term
+    ),
+    # Create formatted columns for display using posterior mean and credible intervals
+    est_ci = sprintf("%.2f (%.2f, %.2f)", posterior_mean, cred_low, cred_high)
+  ) %>%
+  arrange(match(outcome, outcomes), term)  # Order by the specified outcome order
+
+# Check if we have cluster data
+if(nrow(cluster_data) == 0) {
+  stop("No cluster2 or cluster3 terms found in the data. Please check your CSV files.")
+}
+
+# Display summary of loaded data
+cat("\nData summary:\n")
+print(table(cluster_data$outcome, cluster_data$term))
+
+# Setup forestplot data structures
+left_text <- list()
+means <- list()
+lower_limits <- list()
+upper_limits <- list()
+right_text <- list()
+is_summary_row <- list()
+
+row_count <- 1
+
+# Add header row
+left_text[[row_count]] <- c("Health-Relevant Endpoint")
+means[[row_count]] <- NA
+lower_limits[[row_count]] <- NA
+upper_limits[[row_count]] <- NA
+right_text[[row_count]] <- c("Effect (95% CI)")
+is_summary_row[[row_count]] <- TRUE
+row_count <- row_count + 1
+
+# Process each health outcome
+for (i in 1:length(outcomes)) {
+  outcome <- outcomes[i]
+  outcome_data <- cluster_data[cluster_data$outcome == outcome, ]
+  
+  # Skip if no data for this outcome
+  if(nrow(outcome_data) == 0) {
+    cat("Warning: No cluster data found for outcome:", outcome, "\n")
+    next
+  }
+  
+  # Add outcome header
+  left_text[[row_count]] <- c(outcome_labels[outcome])
+  means[[row_count]] <- NA
+  lower_limits[[row_count]] <- NA
+  upper_limits[[row_count]] <- NA
+  right_text[[row_count]] <- c("")
+  is_summary_row[[row_count]] <- TRUE
+  row_count <- row_count + 1
+  
+  # Add cluster rows
+  for (j in 1:nrow(outcome_data)) {
+    row <- outcome_data[j, ]
+    left_text[[row_count]] <- c(paste0("  ", row$cluster_label))
+    means[[row_count]] <- row$posterior_mean
+    lower_limits[[row_count]] <- row$cred_low
+    upper_limits[[row_count]] <- row$cred_high
+    right_text[[row_count]] <- c(row$est_ci)
+    is_summary_row[[row_count]] <- FALSE
+    row_count <- row_count + 1
+  }
+  
+  # Add a blank row if not the last outcome
+  if (i < length(outcomes)) {
+    left_text[[row_count]] <- c("")
+    means[[row_count]] <- NA
+    lower_limits[[row_count]] <- NA
+    upper_limits[[row_count]] <- NA
+    right_text[[row_count]] <- c("")
+    is_summary_row[[row_count]] <- FALSE
+    row_count <- row_count + 1
+  }
+}
+
+# Convert lists to vectors/matrices
+left_text <- do.call(rbind, left_text)
+means <- unlist(means)
+lower_limits <- unlist(lower_limits)
+upper_limits <- unlist(upper_limits)
+right_text <- do.call(rbind, right_text)
+is_summary_row <- unlist(is_summary_row)
+
+# Combine left and right text with empty column for the graph
+tabletext <- cbind(left_text, 
+                   matrix("", nrow=nrow(left_text), ncol=1),  # Empty column for the graph
+                   right_text)
+
+# Generate horizontal line positions - only after header and between outcome groups
+hline_positions <- c()
+hline_positions[length(hline_positions) + 1] <- 2  # Line after header
+
+# Calculate line positions dynamically based on actual data
+current_row <- 2  # Start after header
+outcomes_with_data <- unique(cluster_data$outcome)
+outcomes_with_data <- outcomes_with_data[order(match(outcomes_with_data, outcomes))]
+
+for (i in 1:length(outcomes_with_data)) {
+  outcome <- outcomes_with_data[i]
+  outcome_data <- cluster_data[cluster_data$outcome == outcome, ]
+  
+  # Count rows in this outcome group (1 header + number of clusters + 1 blank row except last group)
+  rows_in_group <- 1 + nrow(outcome_data)  # 1 header + cluster rows
+  if (i < length(outcomes_with_data)) rows_in_group <- rows_in_group + 1  # Add blank row
+  
+  # Add line after the entire outcome group
+  current_row <- current_row + rows_in_group
+  if (i < length(outcomes_with_data)) {  # Don't add line after the very last group
+    hline_positions[length(hline_positions) + 1] <- current_row
+  }
+}
+
+# Create horizontal lines
+hrzl_lines <- lapply(hline_positions, function(pos) {
+  gpar(lwd = 1)
+})
+names(hrzl_lines) <- as.character(hline_positions)
+
+# Determine appropriate axis range based on data
+data_range <- range(c(lower_limits, upper_limits), na.rm = TRUE)
+axis_min <- floor(data_range[1] * 2) / 2  # Round down to nearest 0.5
+axis_max <- ceiling(data_range[2] * 2) / 2  # Round up to nearest 0.5
+tick_seq <- seq(axis_min, axis_max, 0.5)
+
+# Create the forest plot
+forestplot(
+  tabletext,
+  means,
+  lower_limits,
+  upper_limits,
+  is.summary = is_summary_row,
+  graph.pos = 2,
+  txt_gp = fpTxtGp(
+    label = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    ticks = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    xlab = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    title = gpar(fontface = "plain", cex = 0.9, fontfamily = "Arial")
+  ),
+  col = fpColors(
+    box = "black",
+    line = "black",
+    summary = "black"
+  ),
+  boxsize = 0.2,
+  lineheight = unit(6, "mm"),
+  graphwidth = unit(120, "mm"),
+  lwd.ci = 1,
+  ci.vertices = TRUE,
+  ci.vertices.height = 0.1,
+  xlab = "Percentage Point Difference",
+  zero = 0,
+  grid = TRUE,
+  lty.zero = 2,
+  xticks = tick_seq,
+  clip = c(axis_min, axis_max),
+  hrzl_lines = hrzl_lines,
+  align = c("l", "c", "r"),
+  colgap = unit(5, "mm"),
+  mar = unit(c(5, 5, 5, 5), "mm")
+)
+
+# Save as TIFF file
+tiff_file <- "forest_plot_health_endpoints_imputations.tiff"
+tiff(tiff_file,
+     width = 10, height = 7,
+     units = "in",
+     compression = "lzw",
+     res = 600,
+     type = "cairo")
+
+# Recreate the forest plot for saving
+forestplot(
+  tabletext,
+  means,
+  lower_limits,
+  upper_limits,
+  is.summary = is_summary_row,
+  graph.pos = 2,
+  txt_gp = fpTxtGp(
+    label = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    ticks = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    xlab = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    title = gpar(fontface = "plain", cex = 0.9, fontfamily = "Arial")
+  ),
+  col = fpColors(
+    box = "black",
+    line = "black",
+    summary = "black"
+  ),
+  boxsize = 0.2,
+  lineheight = unit(6, "mm"),
+  graphwidth = unit(120, "mm"),
+  lwd.ci = 1,
+  ci.vertices = TRUE,
+  ci.vertices.height = 0.1,
+  xlab = "Percentage Point Difference",
+  zero = 0,
+  grid = TRUE,
+  lty.zero = 2,
+  xticks = tick_seq,
+  clip = c(axis_min, axis_max),
+  hrzl_lines = hrzl_lines,
+  align = c("l", "c", "r"),
+  title = "Forest Plot of Environmental Effects by Health Endpoint",
+  colgap = unit(5, "mm"),
+  mar = unit(c(5, 5, 5, 5), "mm")
+)
+
+dev.off()
+cat("Forest plot saved as", tiff_file, "\n")
+
+# Print summary statistics
+cat("\nSummary of effects:\n")
+summary_stats <- cluster_data %>%
+  dplyr::select(outcome_label, cluster_label, posterior_mean, cred_low, cred_high, credible_excludes_zero) %>%
+  arrange(outcome_label, cluster_label)
+print(summary_stats)
+```
+
+
+
+
+#########################################################################
+
+POINT ESTIMATE FOREST PLOT
+```{r}
+# Load required packages
+library(forestplot)
+library(dplyr)
+library(grid)
+library(Cairo)
+
+# Read in the data
+data <- data.frame(
+  outcome = c("prev_abs_change_phlth", "prev_abs_change_phlth", 
+              "prev_abs_change_pinactive", "prev_abs_change_pinactive",
+              "prev_abs_change_mhlth", "prev_abs_change_mhlth",
+              "prev_abs_change_asthma", "prev_abs_change_asthma",
+              "prev_abs_change_checkup", "prev_abs_change_checkup"),
+  cluster_term = c("cluster2", "cluster3", "cluster2", "cluster3", 
+                  "cluster2", "cluster3", "cluster2", "cluster3",
+                  "cluster2", "cluster3"),
+  estimate = c(0.120924921, 0.029255481, 0.088113025, -0.513648223,
+               0.051105088, -0.009210277, 0.042270808, -0.047390341,
+               0.011362223, -0.288148826),
+  std_error = c(0.091646213, 0.134813862, 0.17479646, 0.255425099,
+                0.081043873, 0.119029573, 0.032076693, 0.046991226,
+                0.047023382, 0.069982513),
+  p_value = c(0.187010241, 0.828203301, 0.614198629, 0.044330275,
+              0.528311604, 0.938322796, 0.187569122, 0.313217659,
+              0.809067486, 3.83E-05)
+)
+
+# Create a mapping for outcome names
+outcome_labels <- c(
+  "prev_abs_change_phlth" = "Poor physical health",
+  "prev_abs_change_pinactive" = "Physical inactivity",
+  "prev_abs_change_mhlth" = "Poor mental health",
+  "prev_abs_change_asthma" = "Current asthma",
+  "prev_abs_change_checkup" = "Routine health checkup"
+)
+
+# Add a nicer outcome label and calculate CI
+data <- data %>%
+  mutate(
+    outcome_label = outcome_labels[outcome],
+    # Rename clusters and remove the word "cluster" as requested
+    cluster_label = ifelse(cluster_term == "cluster2", 
+                          "Environmental improvement", 
+                          "Environmental gentrification"),
+    # Calculate lower and upper bounds of 95% CI
+    lower = estimate - 1.96 * std_error,
+    upper = estimate + 1.96 * std_error,
+    # Create formatted columns for display with 2 decimal places
+    est_ci = sprintf("%.2f (%.2f, %.2f)", estimate, lower, upper)
+  ) %>%
+  arrange(outcome, cluster_term)
+
+# Get unique outcomes in order for the plot
+outcomes_order <- c("prev_abs_change_phlth", "prev_abs_change_pinactive", 
+                   "prev_abs_change_mhlth", "prev_abs_change_asthma", 
+                   "prev_abs_change_checkup")
+
+# Setup forestplot data structures
+left_text <- list()
+means <- list()
+lower_limits <- list()
+upper_limits <- list()
+right_text <- list()
+is_summary_row <- list()
+
+row_count <- 1
+
+# Add header row
+left_text[[row_count]] <- c("Health-Relevant Endpoint")  # Changed from "Health Outcome"
+means[[row_count]] <- NA
+lower_limits[[row_count]] <- NA
+upper_limits[[row_count]] <- NA
+right_text[[row_count]] <- c("Effect (95% CI)")  # Removed significance column
+is_summary_row[[row_count]] <- TRUE
+row_count <- row_count + 1
+
+# Process each health outcome
+for (i in 1:length(outcomes_order)) {
+  outcome <- outcomes_order[i]
+  outcome_data <- data[data$outcome == outcome, ]
+  
+  # Add outcome header
+  left_text[[row_count]] <- c(outcome_labels[outcome])
+  means[[row_count]] <- NA
+  lower_limits[[row_count]] <- NA
+  upper_limits[[row_count]] <- NA
+  right_text[[row_count]] <- c("")  # Only one column needed now
+  is_summary_row[[row_count]] <- TRUE
+  row_count <- row_count + 1
+  
+  # Add cluster rows
+  for (j in 1:nrow(outcome_data)) {
+    row <- outcome_data[j, ]
+    left_text[[row_count]] <- c(paste0("  ", row$cluster_label))
+    means[[row_count]] <- row$estimate
+    lower_limits[[row_count]] <- row$lower
+    upper_limits[[row_count]] <- row$upper
+    right_text[[row_count]] <- c(row$est_ci)  # Only one column needed now
+    is_summary_row[[row_count]] <- FALSE
+    row_count <- row_count + 1
+  }
+  
+  # Add a blank row if not the last outcome
+  if (i < length(outcomes_order)) {
+    left_text[[row_count]] <- c("")
+    means[[row_count]] <- NA
+    lower_limits[[row_count]] <- NA
+    upper_limits[[row_count]] <- NA
+    right_text[[row_count]] <- c("")  # Only one column needed now
+    is_summary_row[[row_count]] <- FALSE
+    row_count <- row_count + 1
+  }
+}
+
+# Convert lists to vectors/matrices
+left_text <- do.call(rbind, left_text)
+means <- unlist(means)
+lower_limits <- unlist(lower_limits)
+upper_limits <- unlist(upper_limits)
+right_text <- do.call(rbind, right_text)
+is_summary_row <- unlist(is_summary_row)
+
+# Combine left and right text with empty column for the graph
+tabletext <- cbind(left_text, 
+                   matrix("", nrow=nrow(left_text), ncol=1),  # Empty column for the graph
+                   right_text)
+
+# Generate horizontal line positions - only after header and between outcome groups
+hline_positions <- c()
+hline_positions[length(hline_positions) + 1] <- 2  # Line after header
+
+# For each outcome, add a line only after the whole outcome group
+current_row <- 2  # Start after header
+for (i in 1:length(outcomes_order)) {
+  # Count rows in this outcome group (1 header + 2 clusters + 1 blank row except last group)
+  rows_in_group <- 3  # 1 header + 2 clusters
+  if (i < length(outcomes_order)) rows_in_group <- rows_in_group + 1  # Add blank row
+  
+  # Add line after the entire outcome group
+  current_row <- current_row + rows_in_group
+  if (i < length(outcomes_order)) {  # Don't add line after the very last group
+    hline_positions[length(hline_positions) + 1] <- current_row
+  }
+}
+
+# Create horizontal lines
+hrzl_lines <- lapply(hline_positions, function(pos) {
+  gpar(lwd = 1)
+})
+names(hrzl_lines) <- as.character(hline_positions)
+
+# Function to create the forest plot - we'll define it first so we can reuse it
+create_forest_plot <- function() {
+  forestplot(
+    tabletext,
+    means,
+    lower_limits,
+    upper_limits,
+    is.summary = is_summary_row,
+    graph.pos = 2,
+    txt_gp = fpTxtGp(
+      label = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+      ticks = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+      xlab = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+      title = gpar(fontface = "plain", cex = 0.9, fontfamily = "Arial")
+    ),
+    col = fpColors(
+      box = "black",
+      line = "black",
+      summary = "black"
+    ),
+    boxsize = 0.2,
+    lineheight = unit(6, "mm"),
+    graphwidth = unit(120, "mm"),
+    lwd.ci = 1,
+    ci.vertices = TRUE,
+    ci.vertices.height = 0.1,
+    xlab = "Percentage Point Difference",
+    zero = 0,
+    grid = TRUE,
+    lty.zero = 2,
+    xticks = seq(-0.8, 0.8, 0.2),
+    clip = c(-0.8, 0.8),
+    hrzl_lines = hrzl_lines,
+    align = c("l", "c", "r"),
+    colgap = unit(5, "mm"),
+    mar = unit(c(5, 5, 5, 5), "mm")
+  )
+}
+
+# 1. Save as TIFF file
+tiff_file <- "forest_plot_health_endpoints.tiff"
+tiff(tiff_file,
+     width = 10, height = 7, # Dimensions in inches
+     units = "in",
+     compression = "lzw", # LZW compression for smaller file size
+     res = 600, # Resolution in dpi (600 dpi is publication quality)
+     type = "cairo") # Use Cairo for better quality
+
+create_forest_plot()
+dev.off()
+cat("Forest plot saved as", tiff_file, "\n")
+
+# 2. Save as PDF file
+pdf_file <- "forest_plot_health_endpoints.pdf"
+pdf(pdf_file,
+    width = 8, height = 10, # Dimensions in inches
+    useDingbats = FALSE) # Avoid font issues
+
+create_forest_plot()
+dev.off()
+cat("Forest plot saved as", pdf_file, "\n")
+
+# 3. Display the plot in the R viewer (optional)
+create_forest_plot()
+```
+
+```{r}
+# Load required packages
+library(forestplot)
+library(dplyr)
+library(grid)
+library(Cairo)
+
+# Read in the data from CSV - replace with your actual file path
+# In this case, we're assuming the data is already loaded from your provided CSV content
+# Let's create a filtered dataframe with just the cluster effects we want to visualize
+
+# Create a data frame from the CSV content
+# In a real scenario, you would read from a file using read.csv()
+data <- data.frame(
+  outcome = c("phlth", "phlth", 
+              "pinactive", "pinactive",
+              "mhlth", "mhlth",
+              "asthma", "asthma",
+              "checkup", "checkup"),
+  term = c("cluster2", "cluster3", "cluster2", "cluster3", 
+           "cluster2", "cluster3", "cluster2", "cluster3",
+           "cluster2", "cluster3"),
+  estimate = c(0.1094, 0.0084, 0.1097, -0.4726,
+               0.0478, -0.0995, 0.0326, -0.0597,
+               0.0198, -0.3116),
+  lower = c(-0.1832, -0.4314, -0.4913, -1.3610,
+            -0.2550, -0.5665, -0.1281, -0.3017,
+            -0.2962, -0.7730),
+  upper = c(0.4019, 0.4481, 0.7107, 0.4157,
+            0.3505, 0.3674, 0.1934, 0.1822,
+            0.3357, 0.1499),
+  p_value = c(0.4637, 0.9703, 0.7206, 0.2971,
+              0.7572, 0.6761, 0.6907, 0.6286,
+              0.9025, 0.1858)
+)
+
+# Create a mapping for outcome names with more readable labels
+outcome_labels <- c(
+  "phlth" = "Poor physical health",
+  "pinactive" = "Physical inactivity",
+  "mhlth" = "Poor mental health",
+  "asthma" = "Current asthma",
+  "checkup" = "Routine health checkup"
+)
+
+# Enhance the data with labels and formatted values
+data <- data %>%
+  mutate(
+    outcome_label = outcome_labels[outcome],
+    # Rename clusters as requested - without "cluster" at the end
+    cluster_label = ifelse(term == "cluster2", 
+                          "Environmental improvement", 
+                          "Environmental gentrification"),
+    # Create formatted columns for display with 2 decimal places (not 3)
+    est_ci = sprintf("%.2f (%.2f, %.2f)", estimate, lower, upper)
+  ) %>%
+  arrange(outcome, term)
+
+# Get unique outcomes in order for the plot
+outcomes_order <- c("phlth", "pinactive", "mhlth", "asthma", "checkup")
+
+# Setup forestplot data structures
+left_text <- list()
+means <- list()
+lower_limits <- list()
+upper_limits <- list()
+right_text <- list()
+is_summary_row <- list()
+
+row_count <- 1
+
+# Add header row
+left_text[[row_count]] <- c("Health-Relevant Endpoint")  # Changed from "Health Outcome"
+means[[row_count]] <- NA
+lower_limits[[row_count]] <- NA
+upper_limits[[row_count]] <- NA
+right_text[[row_count]] <- c("Effect (95% CI)")  # Only one column now
+is_summary_row[[row_count]] <- TRUE
+row_count <- row_count + 1
+
+# Process each health outcome
+for (i in 1:length(outcomes_order)) {
+  outcome <- outcomes_order[i]
+  outcome_data <- data[data$outcome == outcome, ]
+  
+  # Add outcome header
+  left_text[[row_count]] <- c(outcome_labels[outcome])
+  means[[row_count]] <- NA
+  lower_limits[[row_count]] <- NA
+  upper_limits[[row_count]] <- NA
+  right_text[[row_count]] <- c("")
+  is_summary_row[[row_count]] <- TRUE
+  row_count <- row_count + 1
+  
+  # Add cluster rows
+  for (j in 1:nrow(outcome_data)) {
+    row <- outcome_data[j, ]
+    left_text[[row_count]] <- c(paste0("  ", row$cluster_label))
+    means[[row_count]] <- row$estimate
+    lower_limits[[row_count]] <- row$lower
+    upper_limits[[row_count]] <- row$upper
+    right_text[[row_count]] <- c(row$est_ci)
+    is_summary_row[[row_count]] <- FALSE
+    row_count <- row_count + 1
+  }
+  
+  # Add a blank row if not the last outcome
+  if (i < length(outcomes_order)) {
+    left_text[[row_count]] <- c("")
+    means[[row_count]] <- NA
+    lower_limits[[row_count]] <- NA
+    upper_limits[[row_count]] <- NA
+    right_text[[row_count]] <- c("")
+    is_summary_row[[row_count]] <- FALSE
+    row_count <- row_count + 1
+  }
+}
+
+# Convert lists to vectors/matrices
+left_text <- do.call(rbind, left_text)
+means <- unlist(means)
+lower_limits <- unlist(lower_limits)
+upper_limits <- unlist(upper_limits)
+right_text <- do.call(rbind, right_text)
+is_summary_row <- unlist(is_summary_row)
+
+# Combine left and right text with empty column for the graph
+tabletext <- cbind(left_text, 
+                   matrix("", nrow=nrow(left_text), ncol=1),  # Empty column for the graph
+                   right_text)
+
+# Generate horizontal line positions - only after header and between outcome groups
+hline_positions <- c()
+hline_positions[length(hline_positions) + 1] <- 2  # Line after header
+
+# For each outcome, add a line only after the whole outcome group
+current_row <- 2  # Start after header
+for (i in 1:length(outcomes_order)) {
+  # Count rows in this outcome group (1 header + 2 clusters + 1 blank row except last group)
+  rows_in_group <- 3  # 1 header + 2 clusters
+  if (i < length(outcomes_order)) rows_in_group <- rows_in_group + 1  # Add blank row
+  
+  # Add line after the entire outcome group
+  current_row <- current_row + rows_in_group
+  if (i < length(outcomes_order)) {  # Don't add line after the very last group
+    hline_positions[length(hline_positions) + 1] <- current_row
+  }
+}
+
+# Create horizontal lines
+hrzl_lines <- lapply(hline_positions, function(pos) {
+  gpar(lwd = 1)
+})
+names(hrzl_lines) <- as.character(hline_positions)
+
+# Create the forest plot
+forestplot(
+  tabletext,
+  means,
+  lower_limits,
+  upper_limits,
+  is.summary = is_summary_row,
+  graph.pos = 2,
+  txt_gp = fpTxtGp(
+    # Smaller text with just fontfamily for Arial
+    label = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    ticks = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    xlab = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    title = gpar(fontface = "plain", cex = 0.9, fontfamily = "Arial")
+  ),
+  col = fpColors(
+    box = "black",
+    line = "black",
+    summary = "black"
+  ),
+  boxsize = 0.2,
+  lineheight = unit(6, "mm"),  # Slightly reduced line height for smaller text
+  graphwidth = unit(120, "mm"),  # Increased graph width
+  lwd.ci = 1,
+  ci.vertices = TRUE,
+  ci.vertices.height = 0.1,
+  xlab = "Percentage Point Difference",  # Changed from "Estimated Effect"
+  zero = 0,
+  grid = TRUE,
+  lty.zero = 2,
+  xticks = seq(-1.5, 1.0, 0.5),  # Adjusted for the range of these data
+  clip = c(-1.5, 1.0),  # Adjusted for the range of these data
+  hrzl_lines = hrzl_lines,
+  align = c("l", "c", "r"),
+  colgap = unit(5, "mm"),
+  mar = unit(c(5, 5, 5, 5), "mm")
+)
+
+# Save as TIFF file with "_imputations" added to the name
+tiff_file <- "forest_plot_health_endpoints_imputations.tiff"
+tiff(tiff_file,
+     width = 10, height = 7, # Dimensions in inches
+     units = "in",
+     compression = "lzw", # LZW compression for smaller file size
+     res = 600, # Resolution in dpi (600 dpi is publication quality)
+     type = "cairo") # Use Cairo for better quality
+
+# Recreate the forest plot
+forestplot(
+  tabletext,
+  means,
+  lower_limits,
+  upper_limits,
+  is.summary = is_summary_row,
+  graph.pos = 2,
+  txt_gp = fpTxtGp(
+    label = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    ticks = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    xlab = gpar(fontface = "plain", cex = 0.7, fontfamily = "Arial"),
+    title = gpar(fontface = "plain", cex = 0.9, fontfamily = "Arial")
+  ),
+  col = fpColors(
+    box = "black",
+    line = "black",
+    summary = "black"
+  ),
+  boxsize = 0.2,
+  lineheight = unit(6, "mm"),
+  graphwidth = unit(120, "mm"),
+  lwd.ci = 1,
+  ci.vertices = TRUE,
+  ci.vertices.height = 0.1,
+  xlab = "Percentage Point Difference",
+  zero = 0,
+  grid = TRUE,
+  lty.zero = 2,
+  xticks = seq(-1.5, 1.0, 0.5),
+  clip = c(-1.5, 1.0),
+  hrzl_lines = hrzl_lines,
+  align = c("l", "c", "r"),
+  title = "Forest Plot of Environmental Effects by Health Endpoint",
+  colgap = unit(5, "mm"),
+  mar = unit(c(5, 5, 5, 5), "mm")
+)
+
+dev.off()
+cat("Forest plot saved as", tiff_file, "\n")
+```
+
+```{r}
+# Prepare data
+env_data_std <- create_env_score(env_cov_gent)
+
+# Create clustering data
+clustering_data_zscore <- data.frame(
+  score_0.5 = env_data_std$score_0.5,
+  env_improvement = env_data_std$env_improvement
+) %>% scale()
+
+# Perform k-means clustering with k=3
+set.seed(123) # For reproducibility
+kmeans_result <- kmeans(clustering_data_zscore, centers = 3, nstart = 25)
+
+# Add cluster assignments to main data 
+clustered_data <- env_data_std %>%
+  mutate(cluster = as.factor(kmeans_result$cluster))
+
+# Examine cluster means to identify which is which
+cluster_means <- aggregate(clustering_data_zscore, by=list(cluster=kmeans_result$cluster), mean)
+print("Original cluster means:")
+print(cluster_means)
+
+# Create a mapping to recode clusters 
+# swapping clusters 1 and 3 to make 1 no enviro gent the referent
+cluster_mapping <- c(3, 2, 1)  # This maps original cluster 1->3, 2->2, 3->1
+
+# Apply the recoding
+clustered_data <- clustered_data %>%
+  mutate(original_cluster = cluster,
+         cluster = as.factor(cluster_mapping[as.numeric(cluster)]))
+
+# Convert geometry strings to sf geometry
+gent_sf <- gent_env_hlth %>%
+  mutate(geometry = st_as_sfc(geometry)) %>%
+  st_sf(sf_column_name = "geometry", crs = 4326) %>%
+  left_join(clustered_data %>% dplyr::select(GEOID10, cluster), by = c("GEOID10" = "GEOID10"))
+
+nyct2010wi <- st_read("nybb.shp")  
+create_figure_1 <- function(data, spatial_data, nyct2010wi) {
+  # Define colors
+  cluster_colors <- c("#e4c988", "#687c24", "#7e4708")
+  
+  # Cluster labels
+  cluster_labels <- c(
+    "1" = "Cluster 1: No environmental gentrification",
+    "2" = "Cluster 2: Environmental improvement, no gentrification",
+    "3" = "Cluster 3: Environmental gentrification"
+  )
+  
+  # Clip spatial data to NYC boundaries
+  # Convert both to the same CRS if needed
+  if (st_crs(spatial_data) != st_crs(nyct2010wi)) {
+    spatial_data <- st_transform(spatial_data, st_crs(nyct2010wi))
+  }
+  
+  # Create a union of NYC boundaries to use for clipping
+  nyc_boundary <- st_union(nyct2010wi)
+  
+  # Clip spatial data to NYC boundary
+  spatial_data <- st_intersection(spatial_data, nyc_boundary)
+  
+  # Identify areas with missing cluster data (NA)
+  missing_data <- spatial_data %>%
+    filter(is.na(cluster))
+  
+  # Find bounding box where data exists to crop the map
+  data_exists <- spatial_data %>% filter(!is.na(cluster))
+  
+  # Create a buffer around data areas
+  buffered_data_bbox <- st_bbox(data_exists) + c(-0.01, -0.01, 0.01, 0.01)
+  
+  # Figure 1a: K-means clustering results 
+  p1 <- ggplot(data, aes(x = env_improvement, y = score_0.5, color = cluster)) +
+    geom_point(alpha = 0.28) +
+    scale_color_manual(
+      values = cluster_colors,
+      labels = cluster_labels
+    ) +
+    labs(
+      title = "(a) K-means Clustering Results",  
+      x = "Environmental Improvement Score",
+      y = "Gentrification Score",
+      color = "Cluster Type"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  # Figure 1b: Spatial map with background mask for grid lines
+  p2 <- ggplot() +
+    # Create a white background for NYC area to hide grid lines only behind the map
+    # This is drawn first so grid lines will still appear outside the NYC boundary
+    geom_sf(data = nyc_boundary, fill = "white", color = NA) +
+    # Add non-study areas with light grey fill
+    geom_sf(data = missing_data, fill = "#F0F0F0", color = "grey", size = 0.1) +
+    # Add areas with cluster data
+    geom_sf(data = spatial_data %>% filter(!is.na(cluster)), 
+            aes(fill = cluster), color = "grey", linewidth = 0.1) +
+    # Redraw NYC borders on top to ensure clean edges
+    geom_sf(data = nyct2010wi, fill = NA, color = "black", size = 0.5) +
+    scale_fill_manual(
+      values = cluster_colors,
+      labels = cluster_labels
+    ) +
+    coord_sf(xlim = c(buffered_data_bbox["xmin"], buffered_data_bbox["xmax"]), 
+             ylim = c(buffered_data_bbox["ymin"], buffered_data_bbox["ymax"])) +
+    labs(
+      title = "(b) Spatial Distribution of Clusters",
+      fill = "Cluster Type"
+    ) +
+    # Keep grid lines but ensure they're behind all map elements
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      # Make grid lines lighter so they're visible outside the map but not distracting
+      panel.grid.major = element_line(color = "#DDDDDD", size = 0.2),
+      panel.grid.minor = element_line(color = "#EEEEEE", size = 0.1)
+    )
+  
+# Create a common legend for both plots with proper spacing and sizing
+common_legend <- ggpubr::get_legend(
+  ggplot(data, aes(x = env_improvement, y = score_0.5, color = cluster)) +
+    geom_point(size = 3) +  # Slightly reduced point size (was 4)
+    scale_color_manual(
+      values = cluster_colors,
+      labels = cluster_labels,
+      name = NULL  
+    ) +
+    theme(
+      legend.position = "bottom",
+      legend.background = element_rect(fill = "white"), 
+      legend.key = element_rect(fill = "white"),
+      legend.key.size = unit(1.0, "cm"),  # Reduced key size (was 1.5)
+      legend.text = element_text(size = 10),  # Reduced text size (was 12)
+      legend.spacing.x = unit(0.3, "cm"),  # Reduced horizontal spacing (was 0.5)
+      legend.box.spacing = unit(0.3, "cm"),  # Control spacing around legend box
+      legend.margin = margin(t = 0, r = 5, b = 0, l = 5, unit = "pt"),  # Reduced margins
+      legend.box.margin = margin(t = 5, unit = "pt"),  # Reduced top margin
+      legend.direction = "horizontal",  # Ensure horizontal layout
+      legend.box.just = "center"  # Center the legend box
+    )
+)
+  
+  # Combine plots using gridExtra with a shared legend at the bottom
+  combined_plot <- gridExtra::grid.arrange(
+    gridExtra::arrangeGrob(
+      p1, p2, 
+      ncol = 2,
+      top = grid::textGrob("Figure 1: K-means Clustering Analysis",
+                          gp = grid::gpar(fontsize = 14, fontface = "bold"))
+    ),
+    common_legend,
+    heights = c(10, 1),
+    ncol = 1
+  )
+  
+  return(combined_plot)
+}
+
+# Run the code to produce the figure with the NYC outline using nyct2010
+figure_1 <- create_figure_1(clustered_data, gent_sf, nyct2010wi)
+
+# Save outputs
+ggsave(
+  "cluster_visualizations/figure_1_kmeans_with_nyct2010_cropped.png", 
+  figure_1, 
+  width = 12, height = 6, 
+  dpi = 300, 
+  type = "cairo-png"
+)
+ggsave(
+  "cluster_visualizations/figure_1_kmeans_with_nyct2010_cropped.pdf", 
+  figure_1, 
+  width = 12, height = 6, 
+  device = cairo_pdf
+)
+
+# Print the figure
+print(figure_1)
+```
+
+```{r}
+# Prepare data
+env_data_std <- create_env_score(env_cov_gent)
+
+# Create clustering data
+clustering_data_zscore <- data.frame(
+  score_0.5 = env_data_std$score_0.5,
+  env_improvement = env_data_std$env_improvement
+) %>% scale()
+
+# Perform k-means clustering with k=3
+set.seed(123) # For reproducibility
+kmeans_result <- kmeans(clustering_data_zscore, centers = 3, nstart = 25)
+
+# Add cluster assignments to main data 
+clustered_data <- env_data_std %>%
+  mutate(cluster = as.factor(kmeans_result$cluster))
+
+# Examine cluster means to identify which is which
+cluster_means <- aggregate(clustering_data_zscore, by=list(cluster=kmeans_result$cluster), mean)
+print("Original cluster means:")
+print(cluster_means)
+
+# Create a mapping to recode clusters 
+# swapping clusters 1 and 3 to make 1 no enviro gent the referent
+cluster_mapping <- c(3, 2, 1)  # This maps original cluster 1->3, 2->2, 3->1
+
+# Apply the recoding
+clustered_data <- clustered_data %>%
+  mutate(original_cluster = cluster,
+         cluster = as.factor(cluster_mapping[as.numeric(cluster)]))
+
+# Convert geometry strings to sf geometry
+gent_sf <- gent_env_hlth %>%
+  mutate(geometry = st_as_sfc(geometry)) %>%
+  st_sf(sf_column_name = "geometry", crs = 4326) %>%
+  left_join(clustered_data %>% dplyr::select(GEOID10, cluster), by = c("GEOID10" = "GEOID10"))
+
+# Get NYC boroughs boundary data
+nyc_counties <- tigris::counties(state = "NY", cb = TRUE, year = 2010) %>%
+  filter(NAME %in% c("Bronx", "Kings", "New York", "Queens", "Richmond")) %>%
+  st_transform(st_crs(gent_sf))
+
+# Identify missing tracts
+all_nyc_tracts <- tigris::tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), cb = TRUE) %>%
+  st_transform(st_crs(gent_sf)) %>%
+  mutate(GEOID = as.character(GEOID))
+
+missing_tracts <- all_nyc_tracts %>%
+  anti_join(clustered_data, by = c("GEOID" = "GEOID10"))
+
+# Add outlines to the figure
+figure_1 <- figure_1 +
+  geom_sf(data = nyc_counties, fill = NA, color = "black", size = 1) +
+  geom_sf(data = missing_tracts, fill = NA, color = "red", size = 0.5, linetype = "dashed") +
+  labs(caption = "NYC boundary in solid black, missing tracts in dashed red")
+
+# Re-save the updated figure
+ggsave(
+  "cluster_visualizations/figure_1_kmeans.png", 
+  figure_1, 
+  width = 12, height = 6, 
+  dpi = 300, 
+  type = "cairo-png"
+)
+ggsave(
+  "cluster_visualizations/figure_1_kmeans.pdf", 
+  figure_1, 
+  width = 12, height = 6, 
+  device = cairo_pdf
+)
+
+# Print updated figure
+print(figure_1)
+
+# Run the code to produce the figure
+figure_1 <- create_figure_1(clustered_data, gent_sf)
+
+# Save outputs
+ggsave(
+  "cluster_visualizations/figure_1_kmeans.png", 
+  figure_1, 
+  width = 12, height = 6, 
+  dpi = 300, 
+  type = "cairo-png"
+)
+
+ggsave(
+  "cluster_visualizations/figure_1_kmeans.pdf", 
+  figure_1, 
+  width = 12, height = 6, 
+  device = cairo_pdf
+)
+
+# Print the figure
+print(figure_1)
+
+# Make sure km3_zscore also has the correct cluster coding
+km3_zscore <- clustered_data %>%
+  mutate(GEOID = as.character(GEOID10)) %>%
+  dplyr::select(GEOID, cluster)
+
+# Save recoded clusters 
+saveRDS(km3_zscore, "km3_zscore_recoded.rds")
+```
+
+10.4.25 spatial residuals
+
+```{r}
+# Modified version of create_residual_map function with pale yellow middle color
+create_residual_map <- function(residuals_df, spatial_data, outcome, 
+                               title = NULL, save_path = NULL) {
+  # Merge residuals with spatial data
+  map_data <- spatial_data %>%
+    left_join(residuals_df, by = "tractid")
+  
+  # Convert residuals to standard deviation units
+  map_data <- map_data %>%
+    mutate(std_residual = (residual - mean(residual, na.rm = TRUE)) / sd(residual, na.rm = TRUE))
+  
+  # Calculate range to ensure all values are covered
+  min_val <- floor(min(map_data$std_residual, na.rm = TRUE))
+  max_val <- ceiling(max(map_data$std_residual, na.rm = TRUE))
+  
+  # Create 5 equally spaced breaks between min and max
+  breaks <- seq(min_val, max_val, length.out = 6)
+  
+  # Create labels for these groups
+  sd_labels <- character(5)
+  for(i in 1:5) {
+    if(i == 1) {
+      # First group uses closed bracket on both sides
+      sd_labels[i] <- sprintf("[%.1f,%.1f]", breaks[i], breaks[i+1])
+    } else {
+      # Other groups use open bracket on left side
+      sd_labels[i] <- sprintf("(%.1f,%.1f]", breaks[i], breaks[i+1])
+    }
+  }
+  
+  # Create custom orange to blue palette with pale yellow in the middle (5 colors)
+  color_palette <- c("#FD8D3C", "#FDBE85", "#FFFDE4", "#9ECAE1", "#3182BD")
+  
+  # Create title if not provided
+  if(is.null(title)) {
+    title <- paste("Spatial Residuals for", toupper(outcome))
+  }
+  
+  # Create categories for map coloring
+  map_data <- map_data %>%
+    mutate(residual_cat = case_when(
+      std_residual >= breaks[1] & std_residual <= breaks[2] ~ sd_labels[1],
+      std_residual > breaks[2] & std_residual <= breaks[3] ~ sd_labels[2],
+      std_residual > breaks[3] & std_residual <= breaks[4] ~ sd_labels[3],
+      std_residual > breaks[4] & std_residual <= breaks[5] ~ sd_labels[4],
+      std_residual > breaks[5] & std_residual <= breaks[6] ~ sd_labels[5],
+      TRUE ~ "Unknown"  # Catch any unexpected values
+    ))
+  
+  # Ensure factor levels are ordered correctly for legend
+  map_data$residual_cat <- factor(map_data$residual_cat, levels = sd_labels)
+  
+  # Create map with white background and fixed aspect ratio
+  p <- ggplot(map_data) +
+    geom_sf(aes(fill = residual_cat, geometry = geometry), 
+            color = "white", size = 0.1) +
+    scale_fill_manual(
+      name = "Residuals\n(Standard Deviations)", 
+      values = setNames(color_palette, sd_labels),
+      drop = FALSE  # Ensure all legend items appear even if no data
+    ) +
+    theme_minimal() +
+    labs(title = title) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right",
+      legend.title = element_text(size = 10),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    ) +
+    # Fix the aspect ratio to avoid stretching
+    coord_sf(datum = NA)  # This helps with the stretching issue
+  
+  # Save if path is provided
+  if(!is.null(save_path)) {
+    ggsave(save_path, p, width = 10, height = 8, dpi = 300, bg = "white")
+  }
+  
+  return(p)
+}
+
+# Also update the custom version
+create_residual_map_custom <- function(residuals_df, spatial_data, outcome, 
+                                      custom_breaks = NULL,
+                                      custom_colors = NULL,
+                                      title = NULL, save_path = NULL) {
+  # Merge residuals with spatial data
+  map_data <- spatial_data %>%
+    left_join(residuals_df, by = "tractid")
+  
+  # Convert residuals to standard deviation units
+  map_data <- map_data %>%
+    mutate(std_residual = (residual - mean(residual, na.rm = TRUE)) / sd(residual, na.rm = TRUE))
+  
+  # Calculate range or use custom breaks
+  if(is.null(custom_breaks)) {
+    # Calculate range to ensure all values are covered
+    min_val <- floor(min(map_data$std_residual, na.rm = TRUE))
+    max_val <- ceiling(max(map_data$std_residual, na.rm = TRUE))
+    
+    # Create 5 equally spaced breaks between min and max
+    breaks <- seq(min_val, max_val, length.out = 6)
+  } else {
+    breaks <- custom_breaks
+  }
+  
+  # Create labels for these groups
+  n_groups <- length(breaks) - 1
+  custom_labels <- character(n_groups)
+  for(i in 1:n_groups) {
+    if(i == 1) {
+      # First group uses closed bracket on both sides
+      custom_labels[i] <- sprintf("[%.1f,%.1f]", breaks[i], breaks[i+1])
+    } else {
+      # Other groups use open bracket on left side
+      custom_labels[i] <- sprintf("(%.1f,%.1f]", breaks[i], breaks[i+1])
+    }
+  }
+  
+  # Default colors using orange to blue palette with pale yellow middle
+  if(is.null(custom_colors)) {
+    if(n_groups == 5) {
+      custom_colors <- c("#FD8D3C", "#FDBE85", "#FFFDE4", "#9ECAE1", "#3182BD")
+    } else if(n_groups == 4) {
+      custom_colors <- c("#FD8D3C", "#FDBE85", "#FFFDE4", "#3182BD")
+    } else {
+      # For other number of groups, create a gradient
+      custom_colors <- colorRampPalette(c("#FD8D3C", "#FFFDE4", "#3182BD"))(n_groups)
+    }
+  }
+  
+  # Create title if not provided
+  if(is.null(title)) {
+    title <- paste("Spatial Residuals for", toupper(outcome))
+  }
+  
+  # Create categories based on breaks
+  map_data$residual_cat <- cut(map_data$std_residual, 
+                              breaks = breaks,
+                              labels = custom_labels,
+                              include.lowest = TRUE)
+  
+  # Create map with white background and fixed aspect ratio
+  p <- ggplot(map_data) +
+    geom_sf(aes(fill = residual_cat, geometry = geometry), 
+            color = "white", size = 0.1) +
+    scale_fill_manual(
+      name = "Residuals\n(Standard Deviations)", 
+      values = setNames(custom_colors, custom_labels),
+      drop = FALSE  # Ensure all legend items appear even if no data
+    ) +
+    theme_minimal() +
+    labs(title = title) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right",
+      legend.title = element_text(size = 10),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    ) +
+    # Fix the aspect ratio
+    coord_sf(datum = NA)
+  
+  # Save if path is provided
+  if(!is.null(save_path)) {
+    ggsave(save_path, p, width = 10, height = 8, dpi = 300, bg = "white")
+  }
+  
+  return(p)
+}
+
+# Update the advanced map function as well
+create_advanced_residual_map <- function(residuals_df, spatial_data, outcome, 
+                                        county_boundaries = NULL, 
+                                        highlight_tracts = NULL,
+                                        title = NULL, save_path = NULL) {
+  # Merge residuals with spatial data
+  map_data <- spatial_data %>%
+    left_join(residuals_df, by = "tractid")
+  
+  # Create title if not provided
+  if(is.null(title)) {
+    title <- paste("Spatial Residuals for", toupper(outcome))
+  }
+  
+  # Convert to standard deviations
+  map_data <- map_data %>%
+    mutate(std_residual = (residual - mean(residual, na.rm = TRUE)) / sd(residual, na.rm = TRUE))
+  
+  # Calculate range for color scale
+  min_val <- floor(min(map_data$std_residual, na.rm = TRUE))
+  max_val <- ceiling(max(map_data$std_residual, na.rm = TRUE))
+  
+  # Create base map with white background using continuous scale with fixed limits
+  p <- ggplot() +
+    geom_sf(data = map_data, aes(fill = std_residual, geometry = geometry), 
+            color = "white", size = 0.1) +
+    scale_fill_gradientn(
+      name = "Residual\n(Standard Deviations)", 
+      colors = c("#FD8D3C", "#FDBE85", "#FFFDE4", "#9ECAE1", "#3182BD"),
+      limits = c(min_val, max_val)
+    ) +
+    guides(fill = guide_colorbar(barwidth = 10, barheight = 0.5))
+  
+  # Add county boundaries if provided
+  if(!is.null(county_boundaries)) {
+    p <- p + geom_sf(data = county_boundaries, fill = NA, color = "black", size = 0.5)
+  }
+  
+  # Highlight specific tracts if provided
+  if(!is.null(highlight_tracts)) {
+    highlight_data <- spatial_data %>%
+      filter(tractid %in% highlight_tracts)
+    
+    p <- p + geom_sf(data = highlight_data, fill = NA, color = "purple", size = 1)
+  }
+  
+  # Finalize map styling with white background and fixed aspect ratio
+  p <- p + theme_minimal() +
+    labs(title = title,
+         subtitle = "Spatial residuals from SCAT GAM model with MRF smoothing") +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "bottom",
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    ) +
+    # Fix the aspect ratio
+    coord_sf(datum = NA)
+  
+  # Save if path is provided
+  if(!is.null(save_path)) {
+    ggsave(save_path, p, width = 10, height = 8, dpi = 300, bg = "white")
+  }
+  
+  return(p)
+}
+
+maps <- generate_all_residual_maps(
+  combined_data_sf = combined_data_sf,
+  all_simulations = all_simulations,
+  outcomes = outcomes,
+  nb = nb,
+  k_value = 50,
+  save_dir = "./residual_maps"
+)
+```
+Calculating network distance (driving time) MAP
+```{r}
+# Plot network distance map with polygon census tracts and yellow-to-purple viridis palette
+# First, join your travel time data with the spatial census tracts
+# Assuming you have a census tract shapefile/sf object called 'nyc_tracts'
+
+# Assuming nyc_tracts is your census tract spatial data
+# If you don't have it yet, you might need to load it:
+# nyc_tracts <- tigris::tracts(state = "NY", county = c("New York", "Kings", "Queens", "Bronx", "Richmond"))
+
+# Join travel time data with census tracts
+tracts_with_times <- nyc_tracts %>%
+  left_join(dt_travel_time_drive, by = c("GEOID" = "FIPS"))
+
+# Create breaks - round to nearest 5 minutes 
+max_time <- ceiling(max(results$travel_time_minutes_drive, na.rm = TRUE)/5)*5
+min_time <- floor(min(results$travel_time_minutes_drive, na.rm = TRUE)/5)*5
+breaks <- seq(min_time, max_time, by = 5)  # 5-minute intervals
+
+# Get downtown point for reference
+downtown <- data.frame(
+  lon = unique(results$downtown_lon),
+  lat = unique(results$downtown_lat)
+)
+
+# Plot map with census tract polygons
+p <- ggplot() +
+  # Plot census tracts as polygons
+  geom_sf(data = tracts_with_times, 
+          aes(fill = travel_time_minutes_drive),
+          color = "grey50", size = 0.1) +
+  # Mark downtown point
+  geom_point(data = downtown, 
+             aes(x = lon, y = lat),
+             color = "black", size = 4, shape = 18) +
+  geom_text(data = downtown,
+            aes(x = lon, y = lat, label = "Downtown"),
+            hjust = -0.3, vjust = -0.5) +
+  scale_fill_viridis_c(name = "Driving Time (minutes)",
+                       breaks = breaks,
+                       limits = c(min_time, max_time),
+                       option = "plasma", # Changed to plasma palette
+                       direction = -1,    # Yellow for shorter times
+                       na.value = "grey80") +
+  labs(caption = "Based on OpenStreetMap road network",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right",
+        plot.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"))
+
+ggsave("nyc_travel_times_map.png", plot = p, width = 10, height = 8, dpi = 300)
+
+```
+
+12.4 spatial residuals 1
+```{r}
+# Custom function to generate spatial residual maps for NYC
+# Modified for all_simulations as a list of 1000 dataframes, each containing all outcomes
+generate_nyc_residual_maps <- function(nyc_tracts, 
+                                      all_simulations, 
+                                      outcomes,
+                                      geoid_col_tracts = "GEOID", # Column in nyc_tracts to match with tractid
+                                      save_dir = "./improved_residual_maps") {
+  
+  # Create the save directory if it doesn't exist
+  if (!dir.exists(save_dir)) {
+    dir.create(save_dir, recursive = TRUE)
+  }
+  
+  # Ensure proper CRS for nyc_tracts
+  if (is.na(sf::st_crs(nyc_tracts))) {
+    nyc_tracts <- sf::st_set_crs(nyc_tracts, 4326)
+  }
+  
+  # Transform to WGS84 for consistent mapping
+  nyc_tracts <- sf::st_transform(nyc_tracts, 4326)
+  
+  # Create a list to store all maps
+  all_maps <- list()
+  
+  # Loop through each outcome
+  for (outcome in outcomes) {
+    cat("Processing outcome:", outcome, "\n")
+    
+    # Construct full column names for observed and expected values
+    observed_col <- paste0("sim_prev_abs_change_", outcome)
+    expected_col <- paste0("expected_", outcome)  # Adjust if your expected column naming is different
+    
+    # Check if the expected columns exist in the first dataframe (assuming all have same structure)
+    if (length(all_simulations) > 0) {
+      first_df <- all_simulations[[1]]
+      
+      if (!(observed_col %in% colnames(first_df))) {
+        warning("Observed column ", observed_col, " not found in simulation dataframes. Skipping.")
+        next
+      }
+      
+      # For expected, we'll either use the expected_* column if it exists, or calculate the mean across simulations
+      has_expected_col <- expected_col %in% colnames(first_df)
+      if (!has_expected_col) {
+        cat("Expected column not found. Will calculate mean across all simulations.\n")
+      }
+    } else {
+      warning("all_simulations is empty. Skipping.")
+      next
+    }
+    
+    # Extract tractids from the first dataframe
+    tractids <- first_df$tractid
+    
+    # Create aggregation dataframe with tractid
+    agg_data <- data.frame(tractid = tractids)
+    
+    # Extract observed values from each simulation for this outcome
+    observed_values <- matrix(NA, nrow = length(tractids), ncol = length(all_simulations))
+    
+    for (i in 1:length(all_simulations)) {
+      sim_df <- all_simulations[[i]]
+      
+      # Match tractids to ensure correct alignment
+      idx <- match(tractids, sim_df$tractid)
+      
+      # Extract values for this outcome
+      observed_values[, i] <- sim_df[idx, observed_col]
+    }
+    
+    # Calculate mean observed value across all simulations for each tract
+    agg_data$observed <- rowMeans(observed_values, na.rm = TRUE)
+    
+    # Get or calculate expected values
+    if (has_expected_col) {
+      # If expected column exists, use it from the first simulation
+      agg_data$expected <- first_df[match(tractids, first_df$tractid), expected_col]
+    } else {
+      # Otherwise, calculate the global mean as the expected value
+      agg_data$expected <- mean(agg_data$observed, na.rm = TRUE)
+    }
+    
+    # Calculate residuals
+    agg_data$residual <- agg_data$observed - agg_data$expected
+    
+    # Check for NAs in residuals
+    if (any(is.na(agg_data$residual))) {
+      cat("Warning: NAs found in residuals. Count:", sum(is.na(agg_data$residual)), "\n")
+    }
+    
+    # Create a mapping between tractid and GEOID (or GEOID10) if needed
+    if (geoid_col_tracts != "tractid" && !("tractid" %in% colnames(nyc_tracts))) {
+      # If nyc_tracts doesn't have tractid, we need to ensure it can join with sim_data
+      cat("Creating temporary 'tractid' column from", geoid_col_tracts, "for joining\n")
+      nyc_tracts$tractid <- nyc_tracts[[geoid_col_tracts]]
+    }
+    
+    # Print summary of tractids for debugging
+    cat("Sample aggregated tractids:", head(agg_data$tractid), "\n")
+    cat("Sample nyc_tracts tractids (or mapped column):", 
+        ifelse("tractid" %in% colnames(nyc_tracts), 
+               paste(head(nyc_tracts$tractid), collapse=", "),
+               paste(head(nyc_tracts[[geoid_col_tracts]]), collapse=", ")), "\n")
+    
+    # Create a temporary copy of nyc_tracts for this outcome
+    map_data <- nyc_tracts
+    
+    # Join with agg_data to get residuals
+    if ("tractid" %in% colnames(map_data)) {
+      map_data$residual <- NA # Initialize with NA
+      map_data$residual[match(agg_data$tractid, map_data$tractid)] <- agg_data$residual
+    } else {
+      # Join based on geoid_col_tracts matching tractid in agg_data
+      map_data$residual <- NA # Initialize with NA
+      map_data$residual[match(agg_data$tractid, map_data[[geoid_col_tracts]])] <- agg_data$residual
+    }
+    
+    # Print summary after joining to check for NAs
+    cat("Summary of residuals after joining:\n")
+    print(summary(map_data$residual))
+    
+    # Skip this outcome if all residuals are NA
+    if (all(is.na(map_data$residual))) {
+      warning("All residuals are NA for outcome ", outcome, ". Skipping.")
+      next
+    }
+    
+    # Calculate standardized residuals (z-scores)
+    map_data$std_residual <- (map_data$residual - mean(map_data$residual, na.rm = TRUE)) / 
+                             sd(map_data$residual, na.rm = TRUE)
+    
+    # Calculate min and max for better breaks
+    min_val <- floor(min(map_data$std_residual, na.rm = TRUE))
+    max_val <- ceiling(max(map_data$std_residual, na.rm = TRUE))
+    
+    # Create symmetric breaks centered at 0
+    max_abs <- max(abs(min_val), abs(max_val))
+    breaks <- c(-max_abs, -max_abs/2, 0, max_abs/2, max_abs)
+    
+    # Create labels for the categories
+    sd_labels <- character(length(breaks) - 1)
+    for (i in 1:(length(breaks) - 1)) {
+      if (i == 1) {
+        sd_labels[i] <- sprintf("[%.1f,%.1f]", breaks[i], breaks[i+1])
+      } else {
+        sd_labels[i] <- sprintf("(%.1f,%.1f]", breaks[i], breaks[i+1])
+      }
+    }
+    
+    # Create custom orange to blue palette with pale yellow in the middle
+    color_palette <- c("#FD8D3C", "#FDBE85", "#FFFDE4", "#9ECAE1", "#3182BD")
+    
+    # Create categories for coloring
+    map_data$residual_cat <- cut(map_data$std_residual, 
+                               breaks = breaks,
+                               labels = sd_labels,
+                               include.lowest = TRUE)
+    
+    # Create the map
+    title <- paste("Spatial Residuals for", toupper(outcome))
+    
+    map <- ggplot2::ggplot() +
+      ggplot2::geom_sf(data = map_data, 
+                     ggplot2::aes(fill = residual_cat), 
+                     color = "white", size = 0.1) +
+      ggplot2::scale_fill_manual(
+        name = "Residuals\n(Standard Deviations)", 
+        values = setNames(color_palette, sd_labels),
+        drop = FALSE,
+        na.value = "gray80"  # Color for NA values
+      ) +
+      ggplot2::labs(title = title,
+                  subtitle = "Standardized by Standard Deviation") +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = ggplot2::element_text(hjust = 0.5),
+        legend.position = "right",
+        legend.title = ggplot2::element_text(size = 10),
+        panel.grid = ggplot2::element_blank(),
+        panel.background = ggplot2::element_rect(fill = "white", color = NA),
+        plot.background = ggplot2::element_rect(fill = "white", color = NA),
+        axis.text = ggplot2::element_blank(),
+        axis.ticks = ggplot2::element_blank()
+      ) +
+      # Fix the aspect ratio to avoid stretching
+      ggplot2::coord_sf(datum = NA)
+    
+    # Add the map to the list
+    all_maps[[outcome]] <- map
+    
+    # Save the map to a file
+    map_filename <- file.path(save_dir, paste0("residual_map_", outcome, ".png"))
+    ggplot2::ggsave(map_filename, map, width = 10, height = 8, dpi = 300, bg = "white")
+    
+    # Create an interactive map using tmap
+    tmap_mode <- tmap::tmap_mode("view")
+    
+    # Create the interactive map
+    interactive_map <- tmap::tm_shape(map_data) +
+      tmap::tm_polygons("std_residual", 
+                    style = "fisher",
+                    n = 5,
+                    palette = color_palette,
+                    title = "Residuals (SD)",
+                    colorNA = "gray80") +
+      tmap::tm_layout(title = paste("Spatial Residuals for", outcome))
+    
+    # Save interactive map
+    interactive_filename <- file.path(save_dir, paste0("interactive_map_", outcome, ".html"))
+    tmap::tmap_save(interactive_map, 
+                  interactive_filename, 
+                  selfcontained = FALSE)
+    
+    # Reset tmap mode
+    tmap::tmap_mode(tmap_mode)
+  }
+  
+  # Return the list of maps
+  return(all_maps)
+}
+
+# Helper function to inspect the structure of all_simulations
+inspect_simulation_structure <- function(all_simulations, outcomes) {
+  cat("Structure of all_simulations:\n")
+  cat("Class:", class(all_simulations), "\n")
+  cat("Length:", length(all_simulations), "\n")
+  
+  if (length(all_simulations) == 0) {
+    cat("all_simulations is empty\n")
+    return(FALSE)
+  }
+  
+  # Check the first simulation to understand the structure
+  first_sim <- all_simulations[[1]]
+  cat("\nStructure of first simulation dataframe:\n")
+  cat("Dimensions:", nrow(first_sim), "rows,", ncol(first_sim), "columns\n")
+  cat("Column names:", paste(colnames(first_sim), collapse=", "), "\n")
+  
+  # Check if expected outcome columns exist
+  outcome_cols <- paste0("sim_prev_abs_change_", outcomes)
+  found_outcomes <- outcome_cols[outcome_cols %in% colnames(first_sim)]
+  missing_outcomes <- outcome_cols[!outcome_cols %in% colnames(first_sim)]
+  
+  cat("\nOutcome columns found:", paste(found_outcomes, collapse=", "), "\n")
+  if (length(missing_outcomes) > 0) {
+    cat("Outcome columns not found:", paste(missing_outcomes, collapse=", "), "\n")
+  }
+  
+  # Check sample values for found outcomes
+  if (length(found_outcomes) > 0) {
+    cat("\nSample values for first found outcome:", found_outcomes[1], "\n")
+    cat(paste(head(first_sim[[found_outcomes[1]]]), collapse=", "), "\n")
+  }
+  
+  # Check if tractid column exists
+  if ("tractid" %in% colnames(first_sim)) {
+    cat("\nSample tractid values:", paste(head(first_sim$tractid), collapse=", "), "\n")
+  } else {
+    cat("\nWARNING: No 'tractid' column found in simulation dataframes\n")
+  }
+  
+  return(TRUE)
+}
+
+# Usage example:
+# First inspect the structure of your all_simulations object
+inspect_simulation_structure(all_simulations, outcomes)
+
+# Now run the generate_nyc_residual_maps function
+maps <- generate_nyc_residual_maps(
+  nyc_tracts = nyc_tracts,
+  all_simulations = all_simulations,
+  outcomes = outcomes,
+  geoid_col_tracts = "GEOID",
+  save_dir = "./improved_residual_maps"
+)
+```
+
+2 GOOD SPATIAL RESIDUALS
+```{r}
+# Custom function to generate spatial residual maps for NYC with combined health outcomes
+generate_nyc_combined_residual_map <- function(nyc_tracts, 
+                                              all_simulations, 
+                                              outcomes,
+                                              geoid_col_tracts = "GEOID",
+                                              save_dir = "./improved_residual_maps") {
+  
+  # Create the save directory if it doesn't exist
+  if (!dir.exists(save_dir)) {
+    dir.create(save_dir, recursive = TRUE)
+  }
+  
+  # Ensure proper CRS for nyc_tracts
+  if (is.na(sf::st_crs(nyc_tracts))) {
+    nyc_tracts <- sf::st_set_crs(nyc_tracts, 4326)
+  }
+  
+  # Transform to WGS84 for consistent mapping
+  nyc_tracts <- sf::st_transform(nyc_tracts, 4326)
+  
+  # Create a data structure to store standardized residuals for all outcomes
+  all_std_residuals <- list()
+  
+  # Get a global max/min to create consistent breaks across all outcomes
+  global_min_std <- Inf
+  global_max_std <- -Inf
+  
+  # Loop through each outcome to calculate standardized residuals
+  for (outcome in outcomes) {
+    cat("Processing outcome:", outcome, "\n")
+    
+    # Construct full column names for observed and expected values
+    observed_col <- paste0("sim_prev_abs_change_", outcome)
+    expected_col <- paste0("expected_", outcome)  # Adjust if your expected column naming is different
+    
+    # Check if the expected columns exist in the first dataframe (assuming all have same structure)
+    if (length(all_simulations) > 0) {
+      first_df <- all_simulations[[1]]
+      
+      if (!(observed_col %in% colnames(first_df))) {
+        warning("Observed column ", observed_col, " not found in simulation dataframes. Skipping.")
+        next
+      }
+      
+      # For expected, we'll either use the expected_* column if it exists, or calculate the mean across simulations
+      has_expected_col <- expected_col %in% colnames(first_df)
+      if (!has_expected_col) {
+        cat("Expected column not found. Will calculate mean across all simulations.\n")
+      }
+    } else {
+      warning("all_simulations is empty. Skipping.")
+      next
+    }
+    
+    # Extract tractids from the first dataframe
+    tractids <- first_df$tractid
+    
+    # Create aggregation dataframe with tractid
+    agg_data <- data.frame(tractid = tractids)
+    
+    # Extract observed values from each simulation for this outcome
+    observed_values <- matrix(NA, nrow = length(tractids), ncol = length(all_simulations))
+    
+    for (i in 1:length(all_simulations)) {
+      sim_df <- all_simulations[[i]]
+      
+      # Match tractids to ensure correct alignment
+      idx <- match(tractids, sim_df$tractid)
+      
+      # Extract values for this outcome
+      observed_values[, i] <- sim_df[idx, observed_col]
+    }
+    
+    # Calculate mean observed value across all simulations for each tract
+    agg_data$observed <- rowMeans(observed_values, na.rm = TRUE)
+    
+    # Get or calculate expected values
+    if (has_expected_col) {
+      # If expected column exists, use it from the first simulation
+      agg_data$expected <- first_df[match(tractids, first_df$tractid), expected_col]
+    } else {
+      # Otherwise, calculate the global mean as the expected value
+      agg_data$expected <- mean(agg_data$observed, na.rm = TRUE)
+    }
+    
+    # Calculate residuals
+    agg_data$residual <- agg_data$observed - agg_data$expected
+    
+    # Check for NAs in residuals
+    if (any(is.na(agg_data$residual))) {
+      cat("Warning: NAs found in residuals. Count:", sum(is.na(agg_data$residual)), "\n")
+    }
+    
+    # Create a mapping between tractid and GEOID if needed
+    if (geoid_col_tracts != "tractid" && !("tractid" %in% colnames(nyc_tracts))) {
+      cat("Creating temporary 'tractid' column from", geoid_col_tracts, "for joining\n")
+      nyc_tracts$tractid <- nyc_tracts[[geoid_col_tracts]]
+    }
+    
+    # Create a temporary copy of nyc_tracts for this outcome
+    map_data <- nyc_tracts
+    
+    # Join with agg_data to get residuals
+    if ("tractid" %in% colnames(map_data)) {
+      map_data$residual <- NA # Initialize with NA
+      map_data$residual[match(agg_data$tractid, map_data$tractid)] <- agg_data$residual
+    } else {
+      # Join based on geoid_col_tracts matching tractid in agg_data
+      map_data$residual <- NA # Initialize with NA
+      map_data$residual[match(agg_data$tractid, map_data[[geoid_col_tracts]])] <- agg_data$residual
+    }
+    
+    # Print summary after joining to check for NAs
+    cat("Summary of residuals after joining:\n")
+    print(summary(map_data$residual))
+    
+    # Skip this outcome if all residuals are NA
+    if (all(is.na(map_data$residual))) {
+      warning("All residuals are NA for outcome ", outcome, ". Skipping.")
+      next
+    }
+    
+    # Calculate standardized residuals (z-scores)
+    map_data$std_residual <- (map_data$residual - mean(map_data$residual, na.rm = TRUE)) / 
+                             sd(map_data$residual, na.rm = TRUE)
+    
+    # Store the standardized residuals for this outcome
+    map_data$outcome <- outcome  # Add outcome as a column
+    all_std_residuals[[outcome]] <- map_data
+    
+    # Update global min/max for standardized residuals
+    outcome_min <- min(map_data$std_residual, na.rm = TRUE)
+    outcome_max <- max(map_data$std_residual, na.rm = TRUE)
+    
+    if (outcome_min < global_min_std) global_min_std <- outcome_min
+    if (outcome_max > global_max_std) global_max_std <- outcome_max
+  }
+  
+  # If no outcomes were processed successfully, return NULL
+  if (length(all_std_residuals) == 0) {
+    warning("No outcomes were processed successfully. Returning NULL.")
+    return(NULL)
+  }
+  
+  # Round the global min/max to create nice breaks
+  global_min_std <- floor(global_min_std)
+  global_max_std <- ceiling(global_max_std)
+  
+  # MODIFIED: Create breaks where middle two brackets are within 2 standard deviations
+  # Instead of evenly distributed breaks, we'll set specific SD cutoffs
+  breaks <- c(-Inf, -2, 0, 2, Inf)
+  
+  # Create labels for the categories
+  sd_labels <- c("< -2 SD", "-2 to 0 SD", "0 to +2 SD", "> +2 SD")
+  
+  # Create new color palette with specified colors
+  # From brown to teal (#a6611a #dfc27d #80cdc1 #018571)
+  color_palette <- c("#fd8d3c", "#fee391", "#a6bddb", "#08519c")
+  
+  # Create individual maps, using the same breaks for all
+  individual_maps <- list()
+  
+  # Create mapping of outcome codes to descriptive names
+  outcome_labels <- c(
+    "phlth" = "Poor physical health",
+    "pinactive" = "Physical inactivity",
+    "mhlth" = "Poor mental health",
+    "checkup" = "Routine health checkup",
+    "asthma" = "Current asthma"
+  )
+  
+  for (outcome in names(all_std_residuals)) {
+    map_data <- all_std_residuals[[outcome]]
+    
+    # Create categories for coloring using the global breaks
+    map_data$residual_cat <- cut(map_data$std_residual, 
+                               breaks = breaks,
+                               labels = sd_labels,
+                               include.lowest = TRUE)
+    
+    # Create the map
+    outcome_label <- outcome_labels[outcome]
+    if (is.na(outcome_label)) {
+      outcome_label <- toupper(outcome)
+    }
+    
+    title <- paste("Spatial Residuals for", outcome_label)
+    
+    map <- ggplot2::ggplot() +
+      ggplot2::geom_sf(data = map_data, 
+                     ggplot2::aes(fill = residual_cat), 
+                     color = "white", size = 0.1) +
+      ggplot2::scale_fill_manual(
+        name = "Residuals\n(Standard Deviations)", 
+        values = setNames(color_palette, sd_labels),
+        drop = FALSE,
+        na.value = "gray80"  # Color for NA values
+      ) +
+      ggplot2::labs(title = title) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+        legend.position = "right",
+        legend.title = ggplot2::element_text(size = 12),
+        legend.text = ggplot2::element_text(size = 11),
+        panel.grid = ggplot2::element_blank(),
+        panel.background = ggplot2::element_rect(fill = "white", color = NA),
+        plot.background = ggplot2::element_rect(fill = "white", color = NA),
+        axis.text = ggplot2::element_blank(),
+        axis.ticks = ggplot2::element_blank()
+      ) +
+      # Fix the aspect ratio to avoid stretching
+      ggplot2::coord_sf(datum = NA)
+    
+    # Add the map to the list
+    individual_maps[[outcome]] <- map
+    
+    # Save the individual map
+    map_filename <- file.path(save_dir, paste0("residual_map_", outcome, ".png"))
+    ggplot2::ggsave(map_filename, map, width = 10, height = 8, dpi = 300, bg = "white")
+  }
+  
+  # Combine all map data into a single dataset for faceting
+  combined_data <- do.call(rbind, all_std_residuals)
+  
+  # Convert outcome to a factor with the desired order
+  combined_data$outcome <- factor(combined_data$outcome, levels = outcomes)
+  
+  # Add the residual_cat column to the combined data
+  combined_data$residual_cat <- cut(combined_data$std_residual, 
+                                 breaks = breaks,
+                                 labels = sd_labels,
+                                 include.lowest = TRUE)
+  
+  # Create a single plot with facets for each outcome
+  combined_plot <- ggplot2::ggplot() +
+    ggplot2::geom_sf(data = combined_data, 
+                   ggplot2::aes(fill = residual_cat), 
+                   color = "white", size = 0.1) +
+    ggplot2::scale_fill_manual(
+      name = "Residuals\n(Standard Deviations)", 
+      values = setNames(color_palette, sd_labels),
+      drop = FALSE,
+      na.value = "gray80"  # Color for NA values
+    ) +
+    ggplot2::facet_wrap(~ outcome, 
+                      ncol = ifelse(length(outcomes) <= 3, length(outcomes), 
+                                  ifelse(length(outcomes) <= 6, 2, 3)),
+                      labeller = ggplot2::labeller(outcome = function(x) {
+                        idx <- match(x, outcomes)
+                        labels <- outcome_labels[x]
+                        labels <- paste0("(", letters[idx], ") ", labels)
+                        return(labels)
+                      })) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(face = "bold", size = 16),
+      legend.position = "right",
+      legend.title = ggplot2::element_text(size = 14, face = "bold"),
+      legend.text = ggplot2::element_text(size = 12),
+      legend.key.size = ggplot2::unit(1.5, "cm"),
+      panel.grid = ggplot2::element_blank(),
+      panel.background = ggplot2::element_rect(fill = "white", color = NA),
+      plot.background = ggplot2::element_rect(fill = "white", color = NA),
+      axis.text = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      panel.spacing = ggplot2::unit(1, "lines")
+    ) +
+    # Fix the aspect ratio to avoid stretching while allowing the maps to be larger
+    ggplot2::coord_sf(datum = NA)
+  
+  # Save the combined map (larger size)
+  combined_filename <- file.path(save_dir, "combined_health_outcomes_map.tiff")
+  ggplot2::ggsave(combined_filename, combined_plot, width = 24, height = 18, dpi = 900, bg = "white",  compression = "lzw")
+  
+  # Return the maps
+  return(list(individual_maps = individual_maps, combined_map = combined_plot))
+}
+
+# Usage example:
+maps <- generate_nyc_combined_residual_map(
+  nyc_tracts = nyc_tracts,
+  all_simulations = all_simulations,
+  outcomes = outcomes,
+  geoid_col_tracts = "GEOID",
+  save_dir = "./improved_residual_maps"
+)
+```
+
+CLUSTERING -vertical
+```{r}
+# Load required libraries
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(patchwork)
+library(ggpubr)
+
+# Prepare data
+env_data_std <- create_env_score(env_cov_gent)
+
+# Create clustering data
+clustering_data_zscore <- data.frame(
+  score_0.5 = env_data_std$score_0.5,
+  env_improvement = env_data_std$env_improvement
+) %>% scale()
+
+# Perform k-means clustering with k = 3
+set.seed(123)
+kmeans_result <- kmeans(clustering_data_zscore, centers = 3, nstart = 25)
+
+# Assign clusters to main data
+clustered_data <- env_data_std %>%
+  mutate(cluster = as.factor(kmeans_result$cluster))
+
+# Check original cluster means
+cluster_means <- aggregate(clustering_data_zscore, by = list(cluster = kmeans_result$cluster), mean)
+print("Original cluster means:")
+print(cluster_means)
+
+# Recode clusters so cluster 1 = no enviro gent
+cluster_mapping <- c(3, 2, 1)
+clustered_data <- clustered_data %>%
+  mutate(original_cluster = cluster,
+         cluster = as.factor(cluster_mapping[as.numeric(cluster)]))
+
+# Convert to sf and join cluster data
+gent_sf <- gent_env_hlth %>%
+  mutate(geometry = st_as_sfc(geometry)) %>%
+  st_sf(sf_column_name = "geometry", crs = 4326) %>%
+  left_join(clustered_data %>% dplyr::select(GEOID10, cluster), by = c("GEOID10" = "GEOID10"))
+
+# Load NYC boundary shapefile
+nyct2010wi <- st_read("nybb.shp")
+
+# Create combined figure
+create_figure_1 <- function(data, spatial_data, nyct2010wi) {
+  cluster_colors <- c("#e4c988", "#687c24", "#7e4708")
+  cluster_labels <- c(
+    "1" = "Cluster 1: No environmental gentrification",
+    "2" = "Cluster 2: Environmental improvement",
+    "3" = "Cluster 3: Environmental gentrification"
+  )
+
+  # Clip spatial data to NYC boundary
+  if (st_crs(spatial_data) != st_crs(nyct2010wi)) {
+    spatial_data <- st_transform(spatial_data, st_crs(nyct2010wi))
+  }
+  nyc_boundary <- st_union(nyct2010wi)
+  spatial_data <- st_intersection(spatial_data, nyc_boundary)
+
+  # Define bounding box and missing areas
+  missing_data <- spatial_data %>% filter(is.na(cluster))
+  data_exists <- spatial_data %>% filter(!is.na(cluster))
+  buffered_data_bbox <- st_bbox(data_exists) + c(-0.01, -0.01, 0.01, 0.01)
+
+  # Plot (a): Scatterplot
+  p1 <- ggplot(data, aes(x = env_improvement, y = score_0.5, color = cluster)) +
+  geom_point(alpha = 0.35) +  
+  scale_color_manual(values = cluster_colors, labels = cluster_labels, name = NULL) +
+  labs(
+    title = "(a) K-means Clustering Results",
+    x = "Environmental Improvement Score",
+    y = "Gentrification Score"
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(size = 3.5, alpha = 0.9)  # Set higher alpha for legend points
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 9.5),  # Decrease legend text size to fit on one line
+    plot.title = element_text(hjust = 0, face = "bold"),
+    plot.title.position = "plot",
+    plot.margin = margin(t = 5, r = 10, b = 5, l = 10)
+  )
+
+
+  # Plot (b): Spatial map with filled polygons but no legend
+  p2 <- ggplot() +
+    geom_sf(data = nyc_boundary, fill = "white", color = NA) +
+    geom_sf(data = missing_data, fill = "#F0F0F0", color = "grey", size = 0.1) +
+    geom_sf(
+      data = spatial_data %>% filter(!is.na(cluster)),
+      aes(fill = cluster),
+      color = "grey", linewidth = 0.1
+    ) +
+    geom_sf(data = nyct2010wi, fill = NA, color = "black", size = 0.5) +
+    scale_fill_manual(values = cluster_colors, guide = "none") + # Remove fill legend
+    coord_sf(
+      xlim = c(buffered_data_bbox["xmin"], buffered_data_bbox["xmax"]),
+      ylim = c(buffered_data_bbox["ymin"], buffered_data_bbox["ymax"])
+    ) +
+    labs(
+      title = "(b) Spatial Distribution of Clusters"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",  # No legend for this plot
+      plot.title = element_text(hjust = 0, face = "bold"),
+      plot.title.position = "plot",
+      panel.grid.major = element_line(color = "#DDDDDD", size = 0.2),
+      panel.grid.minor = element_line(color = "#EEEEEE", size = 0.1),
+      plot.margin = margin(t = 5, r = 10, b = 5, l = 10)
+    )
+
+  # Combine plots with only p1's legend
+  combined_plot <- (p1 / p2) +
+    plot_layout(heights = c(1, 1))
+
+  return(combined_plot)
+}
+
+# Generate the figure
+figure_1 <- create_figure_1(clustered_data, gent_sf, nyct2010wi)
+
+# Save the figure as a TIFF
+ggsave(
+  "cluster_visualizations/figure_1_kmeans_vertical_layout.tiff",
+  figure_1,
+  width = 10, height = 12,
+  dpi = 600,
+  compression = "lzw",
+  limitsize = FALSE
+)
+
+# Display the figure
+print(figure_1)
+
+```

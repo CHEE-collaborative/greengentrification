@@ -2,3 +2,15 @@
 .Rhistory
 .RData
 .Ruserdata
+data/*
+results/*
+*.csv
+*.rds
+*.txt.gz
+*.tif
+*.tiff
+*.png
+*.parquet
+*.zip
+CopyOfthesis_JH/
+inla*
