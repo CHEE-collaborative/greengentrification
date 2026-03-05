@@ -5,6 +5,7 @@
 data/*
 results/*
 *.csv
+!data_gh/df_travel.csv
 *.rds
 *.txt.gz
 *.tif
