@@ -3,7 +3,8 @@ This repository holds the code for the research project, “Environmental Gentri
 
 ## Project overview
 This project first examines the relationship between gentrification and environmental changes in New York City between 2000 and 2016, investigating whether census tracts experiencing higher levels of gentrification are associated with patterns of environmental improvement or degradation. This analysis informs the basis of a second part of the project which evaluates the relationship between environmental gentrification (as a combined exposure) and the change in prevalence of health-relevant endpoints.
-## Data Downloads
+
+## Data downloads
 We use a census tract-level index of gentrification (Johnson et al., 2021) as the independent variable and examines its relationship with several environmental factors (dependent variables): Air quality indicators (PM2.5,O3, NO2), vegetation measured through NDVI - Normalized Difference Vegetation Index, mean temperature in 2016. We use CDC PLACES health data for our health-relevant endpoints (CDC, 2024).
 
 The following datasets are downloaded and processed in the provided code:
