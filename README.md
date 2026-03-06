@@ -24,6 +24,8 @@ NDVI - Google Earth Engine Landsat Collection 2 Tier 1 Level 2 Annual EVI Compos
 
 Population weighted centroids: U.S. Census Bureau. (2021). Centers of Population for the 2010 Census. Census.Gov. https://www.census.gov/geographies/reference-files/2010/geo/2010-centers-population.html (also included in the data_gh folder)
 
+CDC PLACES datasets for health-relevant endpoints (CDC, 2024): https://www.cdc.gov/places/index.html
+
 ## Analysis
 Four R scripts are available in the “scripts” folder of the repository, and provide the code for the following analysis components:
 
