@@ -29,7 +29,7 @@ Four R scripts are available in the “scripts” folder of the repository, and 
 
 01_carbayes.R runs the analysis for the relationship between gentrification and environmental variables, using the CARBayes package https://cran.r-project.org/web/packages/CARBayes/index.html 
 
-02_clustering.R runs cluster diagnostics and create k means clusters to group census tracts by patterns in environmental gentrification
+02_clustering.R runs cluster diagnostics and creates clusters to group census tracts by patterns in environmental gentrification
 
 03_transit.time.R calculates the transit time from a population-weighted downtown point to the population-weighted centroid of each census tract. The output of this analysis is df_travel.csv which can be found in the data_gh folder.
 
