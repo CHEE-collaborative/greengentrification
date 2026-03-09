@@ -1,0 +1,1144 @@
+---
+title: "gam_cleaning_9.26.24"
+output: html_document
+date: "2024-09-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages (JH - check if any are unused after code cleaned)
+```{r}
+library(tidyverse)
+library(tigris)
+library(arrow)
+library(here)
+library(mgcv)
+library(fixest)
+library(lmtest)
+library(terra)
+library(exactextractr)
+library(tidyterra)
+library(sf)
+library(mgcViz)
+
+library(DHARMa)
+library(qqplotr)
+library(readxl) # for read_excel()
+library(spdep) # for moran.test()
+library(tidycensus) # for median income
+library(distr) # for qqbounds()
+library(spatialreg) # for spatial lag and error models
+library(gridExtra) # for viewing plots side-by-side
+library(qgam) 
+```
+
+Load and clean data
+```{r}
+# Check if 'data' directory exists; if not, create it
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+# load gentrification score by tract
+gentrification <- read.csv(here("data", "Data_NYC_Gentrification_2000_16.csv")) %>% 
+  mutate(tractid = as.character(tractid)) %>% 
+  dplyr::select(tractid, score_0.5)
+
+gentrification <- read_xlsx(here("Gentrification","Data_NYC_Gentrification_2000_16.xlsx")) %>%
+
+  mutate(tractid = as.character(tractid)) %>%
+
+  dplyr::select(tractid, score_0.5)
+
+# pull NYC tract IDs/fips from gentrification index dataset for filtering
+nyc_fips <- gentrification$tractid
+
+# load NYC tracts shapefile
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), year = 2010) %>%
+  # clean lat and long for Conley SEs
+  mutate(lat = as.numeric(INTPTLAT10), long = as.numeric(INTPTLON10), GEOID = GEOID10) %>% 
+  # filter for FIPS codes included in gentrification index dataset
+  filter(GEOID %in% nyc_fips)
+
+
+#load NY tracts populatuion weighted centroid points from Census data
+nyc_weighted_centroids <- read.table("https://www2.census.gov/geo/docs/reference/cenpop2010/tract/CenPop2010_Mean_TR36.txt", 
+                         header = TRUE, sep = ",", stringsAsFactors = FALSE, 
+                         colClasses = c("character", "character", "character", "numeric", "numeric", "numeric")) %>%
+  mutate(FIPS = paste(STATEFP, COUNTYFP, TRACTCE, sep = "")) %>% 
+  ## filter for only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%  
+  rename(Longitude_weighted = LONGITUDE, 
+         Latitude_weighted = LATITUDE)
+
+# JH - 10/12/24, warning persists 10/13, 10/14 Warning: R metadata may have unsafe or invalid elements ℹ Type: "externalptr" options(arrow.unsafe_metadata = TRUE) #
+
+# temperature data
+if(!file.exists(here("data","summarized_daily_temp_preds.parquet"))){download.file("https://zenodo.org/records/10557980/files/summarized_daily_temp_preds.parquet?download=1", 
+                                                                                   destfile = here("data","summarized_daily_temp_preds.parquet"))}
+
+# temperature by tract
+temp <- read_parquet(here("data","summarized_daily_temp_preds.parquet")) %>%
+  filter(str_detect(date, "2016")) %>%
+  mutate(temp_c = mean_temp_daily_cK/100-273.15) %>% 
+  mutate(temp_f = temp_c*9/5+32) %>% 
+  group_by(GEOID, date) %>%
+  ungroup() %>% 
+  group_by(GEOID) %>% 
+  summarize(mean_temp = mean(mean_temp_daily_cK/100))
+
+# ndvi by tract (need to have it downloaded and stored locally)
+ndvi_2016 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_2000 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+# PM2.5 data
+# download data from URL
+download_data <- function() {
+  # set longer timeout
+  options(timeout = 7200)
+  if(!file.exists(here("data", "2016_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_pm25_daily_average.txt.gz", destfile = here("data", "2016_pm25_daily_average.txt.gz"))} #2016
+  if(!file.exists(here("data", "2002_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_pm25_daily_average.txt.gz", destfile = here("data", "2002_pm25_daily_average.txt.gz"))}} #2002
+download_data()
+
+# read in PM2.5 daily average by census tract from EPA FAQSD - 2002
+pm_tract_2002 <- read.delim(gzfile(here("data", "2002_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## Include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## Calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# read in PM2.5 daily average by census tract from EPA FAQSD - 2016
+pm_tract_2016 <- read.delim(gzfile(here("data", "2016_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(pm_mean_2016 = mean(Prediction), 
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+  
+
+# combine 2002 and 2016 pm data for nyc_tracts
+pm_tract <- pm_tract_2002 %>%
+  inner_join(pm_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# NO2 CACES
+no2_2016_caces <- read.csv(here("data", "2016_no2_caces.csv")) %>% 
+  mutate(no2_2016 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_2000_caces <- read.csv(here("data", "2000_no2_caces.csv")) %>% 
+  mutate(no2_2000 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_caces <- left_join(no2_2000_caces, no2_2016_caces, by = "fips") %>% 
+  select(no2_2000, no2_2016, fips)
+
+#O3 data download
+options(timeout = 7200)
+if(!file.exists(here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))} #2016
+if(!file.exists(here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))} #2002
+
+# read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2002
+o3_tract_2002 <- read.delim(gzfile(here("data", "2002_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>% 
+  ## include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>% 
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2016
+o3_tract_2016 <- read.delim(gzfile(here("data", "2016_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>% 
+  ## calculate annual average by tract using  population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(o3_mean_2016 = mean(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+
+o3_tract <- o3_tract_2002 %>%
+  left_join(o3_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# merge all exposure data
+all_data <- nyc_tracts %>% 
+  # join gentrification index by tract
+  right_join(gentrification, by = c("GEOID10" = "tractid")) %>%
+  left_join(pm_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016-pm_2002) %>% 
+  left_join(o3_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002) %>% 
+  left_join(no2_caces, by = c("GEOID" = "fips")) %>% 
+  mutate(no2_change = no2_2016-no2_2000) %>% 
+  mutate(ndvi_2016 = ndvi_2016, ndvi_2000 = ndvi_2000, ndvi_change = ndvi_2016-ndvi_2000) %>% 
+  left_join(temp, by = "GEOID")
+
+# models adjusting for median income in 2016
+income <- get_acs(variables = "B06011_001", year = 2016, state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2016 = estimate)
+
+all_data_inc <- all_data %>% 
+  left_join(income, by = "GEOID") %>% 
+  # coerce GEOID to numeric then factor class to avoid error in MRF smooth
+  mutate(GEOID = as.numeric(GEOID)) %>% 
+  mutate(GEOID = factor(GEOID))
+
+##################### models adjusting for median income in 2016 and distance to downtown ###############
+# load nyc roads
+downtown_st <- roads(state = "NY", county = "New York", year = 2011)
+ggplot() + geom_sf(data = downtown_st)
+
+# Define bounding box
+bbox_coords <- matrix(c(
+  -74.0187, 40.70158,  # Southwest
+  -74.0187, 40.77279,  # Northwest
+  -73.95953, 40.77279, # Northeast
+  -73.95953, 40.70158, # Southeast
+  -74.0187, 40.70158   # Closing the polygon
+), ncol = 2, byrow = TRUE)
+
+# convert bounding box to sf
+bbox_polygon <- st_sfc(st_polygon(list(bbox_coords)), crs = 4326)
+
+# Ensure roads are the same CRS and filter for streets within bbox
+downtown_st <- st_transform(downtown_st, crs = st_crs(bbox_polygon))
+filtered_streets <- downtown_st[st_within(downtown_st, bbox_polygon, sparse = FALSE), ]
+
+# Plot filtered downtown streets and bounding box
+ggplot() +
+  geom_sf(data = filtered_streets) +
+  geom_sf(data = bbox_polygon, fill = NA, color = 'red') +
+  ggtitle("Downtown Streets within Bounding Box")
+
+# Ensure census tracts are in the same CRS
+nyc_tracts <- st_transform(nyc_tracts, crs = st_crs(bbox_polygon))
+
+# Filter intersecting tracts within downtown
+intersecting_tracts <- st_intersection(nyc_tracts, bbox_polygon)
+combined_area <- st_union(intersecting_tracts)
+#get downtown centroid
+area_centroid <- st_centroid(combined_area)
+
+ggplot() +
+  geom_sf(data = intersecting_tracts, fill = 'lightblue', color = 'black') +
+  geom_sf(data = area_centroid, color = 'red', size = 3) +
+  ggtitle('Centroid of Downtown Census Tracts')
+
+# Calculate distances and add to "all_data_inc" dataframe
+distances <- st_distance(nyc_tracts, area_centroid)
+all_data_inc$dt_dist <- as.numeric(distances)
+```
+Create model functions
+```{r}
+# Create exposure list with proper variable names
+exposure_list <- list(
+  pm = list(
+    name = "pm",
+    baseline = "pm_2002",
+    change = "pm_change"
+  ),
+  o3 = list(
+    name = "o3",
+    baseline = "o3_2002",
+    change = "o3_change"
+  ),
+  no2 = list(
+    name = "no2",
+    baseline = "no2_2000",
+    change = "no2_change"
+  ),
+  ndvi = list(
+    name = "ndvi",
+    baseline = "ndvi_2000",
+    change = "ndvi_change"
+  ),
+  temp = list(
+    name = "mean_temp",
+    baseline = NULL,
+    change = "mean_temp"  # No change variable for temp
+  )
+)
+
+# Function to run GAM models
+run_gam_models <- function(data, exposure_info) {
+  # Extract exposure information
+  exp_var <- exposure_info$change
+  baseline_exposure <- exposure_info$baseline
+  
+  # Skip if data is missing the exposure variable
+  if (!exp_var %in% names(data)) {
+    warning(paste("Variable", exp_var, "not found in dataset"))
+    return(NULL)
+  }
+  
+  # Base components that will be in all models
+  base_formula <- paste(exp_var, "~ s(score_0.5) + s(COUNTYFP10, bs='re')")
+  
+  # Create model formulas
+  formulas <- list(
+    # Base models (score + county + spatial)
+    tp_base = paste(base_formula, "+ te(long, lat, d = 2, bs = 'gp', m = 2)"),
+    mrf_base = paste(base_formula, "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+    
+    # Models with income
+    tp_income = paste(base_formula, "+ s(med_income_2016) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
+    mrf_income = paste(base_formula, "+ s(med_income_2016) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+    
+    # Models with distance
+    tp_dist = paste(base_formula, "+ s(dt_dist) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
+    mrf_dist = paste(base_formula, "+ s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  )
+  
+  # Add baseline models if baseline exists
+  if (!is.null(baseline_exposure) && baseline_exposure %in% names(data)) {
+    formulas$tp_baseline <- paste(base_formula, "+", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_baseline <- paste(base_formula, "+", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    # Combinations with baseline
+    formulas$tp_income_baseline <- paste(base_formula, "+ s(med_income_2016) +", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_income_baseline <- paste(base_formula, "+ s(med_income_2016) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$tp_dist_baseline <- paste(base_formula, "+ s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_dist_baseline <- paste(base_formula, "+ s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$tp_full <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_full <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  }
+  
+  # Add income + distance combinations
+  formulas$tp_income_dist <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) + te(long, lat, d = 2, bs = 'gp', m = 2)")
+  formulas$mrf_income_dist <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  
+  # Convert formulas to formula objects
+  formulas <- lapply(formulas, as.formula)
+  
+  # Run models
+  models <- purrr::map(formulas, ~try(gam(., 
+                                        family = scat, 
+                                        data = data, 
+                                        method = "REML"), 
+                                    silent = TRUE))
+  
+  return(models)
+}
+
+# Main execution
+# First drop geometry from spatial data while keeping coordinates
+data_prepared <- all_data_inc %>%
+  mutate(
+    COUNTYFP10 = as.factor(COUNTYFP10),
+    GEOID = as.factor(GEOID)
+  ) %>%
+  st_drop_geometry()
+
+# Construct neighbors list for MRF models
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id")
+
+# Run models for each exposure
+all_models <- purrr::map(exposure_list, ~run_gam_models(data_prepared, .))
+
+# Function to check which models succeeded/failed
+check_models <- function(models) {
+  model_status <- map(models, ~!inherits(., "try-error"))
+  successful_models <- names(models)[unlist(model_status)]
+  failed_models <- names(models)[!unlist(model_status)]
+  
+  return(list(
+    successful = successful_models,
+    failed = failed_models
+  ))
+}
+
+# Check status of all models
+model_status <- map(all_models, check_models)
+```
+display_all_model_diagnostics(all_models)
+# Print model names for each exposure
+for(exposure in names(all_models)) {
+  cat("\nExposure:", exposure, "\n")
+  print(names(all_models[[exposure]]))
+}
+
+# Check for failed models
+for(exposure in names(all_models)) {
+  cat("\nExposure:", exposure, "\n")
+  for(model_name in names(all_models[[exposure]])) {
+    if(inherits(all_models[[exposure]][[model_name]], "try-error")) {
+      cat("Failed model:", model_name, "\n")
+      print(all_models[[exposure]][[model_name]])
+    }
+  }
+}
+
+Create qqplot functions
+```{r}
+# Function to create QQ plots for a specific exposure
+create_exposure_qq_plots <- function(models_list, exposure_name) {
+  exposure_models <- models_list[[exposure_name]]
+  plots <- list()
+  
+  for (model_name in names(exposure_models)) {
+    model <- exposure_models[[model_name]]
+    
+    # Skip if model is an error
+    if (inherits(model, "try-error")) {
+      next
+    }
+    
+    # Create QQ plot
+    resid_df <- data.frame(
+      residuals = residuals(model, type = "deviance"),
+      fitted = fitted(model)
+    )
+    
+    plots[[model_name]] <- ggplot(resid_df, aes(sample = residuals)) +
+      stat_qq() +
+      stat_qq_line(color = "red") +
+      labs(
+        title = paste0(exposure_name, "\n", model_name),
+        x = "Theoretical Quantiles",
+        y = "Sample Quantiles"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7)
+      )
+  }
+  
+  # Calculate grid layout
+  n_plots <- length(plots)
+  n_cols <- min(3, n_plots)
+  n_rows <- ceiling(n_plots / n_cols)
+  
+  # Combine plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = plots,
+    ncol = n_cols,
+    nrow = n_rows,
+    top = grid::textGrob(paste("QQ Plots for", exposure_name), 
+                        gp = grid::gpar(fontsize = 12))
+  )
+  
+  return(combined_plot)
+}
+
+# Function to create QQ plots for a specific model type across exposures
+create_model_type_qq_plots <- function(models_list, model_type) {
+  plots <- list()
+  
+  for (exposure_name in names(models_list)) {
+    exposure_models <- models_list[[exposure_name]]
+    
+    # Check if the model type exists for this exposure
+    if (model_type %in% names(exposure_models)) {
+      model <- exposure_models[[model_type]]
+      
+      # Skip if model is an error
+      if (inherits(model, "try-error")) {
+        next
+      }
+      
+      # Create QQ plot
+      resid_df <- data.frame(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model)
+      )
+      
+      plots[[exposure_name]] <- ggplot(resid_df, aes(sample = residuals)) +
+        stat_qq() +
+        stat_qq_line(color = "red") +
+        labs(
+          title = paste0(exposure_name, "\n", model_type),
+          x = "Theoretical Quantiles",
+          y = "Sample Quantiles"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(size = 10, hjust = 0.5),
+          axis.title = element_text(size = 8),
+          axis.text = element_text(size = 7)
+        )
+    }
+  }
+  
+  # Calculate grid layout
+  n_plots <- length(plots)
+  n_cols <- min(3, n_plots)
+  n_rows <- ceiling(n_plots / n_cols)
+  
+  # Combine plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = plots,
+    ncol = n_cols,
+    nrow = n_rows,
+    top = grid::textGrob(paste("QQ Plots for", model_type), 
+                        gp = grid::gpar(fontsize = 12))
+  )
+  
+  return(combined_plot)
+}
+
+# Function to list available model types
+list_model_types <- function(models_list) {
+  unique(unlist(lapply(models_list, names)))
+}
+
+# Function to list available exposures
+list_exposures <- function(models_list) {
+  names(models_list)
+}
+
+create_exposure_qq_plots(all_models, "pm")
+create_model_type_qq_plots(all_models, "tp_base")
+list_model_types(all_models)
+```
+
+create_model_type_qq_plots(all_models, "mrf_base")
+create_model_type_qq_plots(all_models, "mrf_income")
+create_model_type_qq_plots(all_models, "mrf_baseline")
+create_model_type_qq_plots(all_models, "mrf_dist")
+create_model_type_qq_plots(all_models, "mrf_dist_baseline")
+create_model_type_qq_plots(all_models, "mrf_income_baseline")
+create_model_type_qq_plots(all_models, "mrf_full")
+
+
+create_model_type_qq_plots(all_models, "tp_base")
+create_model_type_qq_plots(all_models, "tp_income")
+create_model_type_qq_plots(all_models, "tp_baseline")
+create_model_type_qq_plots(all_models, "tp_income_dist")
+create_model_type_qq_plots(all_models, "tp_income_baseline")
+create_model_type_qq_plots(all_models, "tp_dist_baseline")
+create_model_type_qq_plots(all_models, "tp_full")
+
+
+
+```{r}
+# Function to create comprehensive diagnostic plots for a specific model type
+create_model_diagnostics_by_type <- function(models_list, model_type) {
+  # List to store plots for each exposure
+  diagnostic_plots <- list()
+  
+  for (exposure_name in names(models_list)) {
+    exposure_models <- models_list[[exposure_name]]
+    
+    # Check if the model type exists for this exposure
+    if (model_type %in% names(exposure_models)) {
+      model <- exposure_models[[model_type]]
+      
+      # Skip if model is an error
+      if (inherits(model, "try-error")) {
+        next
+      }
+      
+      # Extract residuals and fitted values
+      resid_df <- data.frame(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model),
+        scale_residuals = residuals(model, type = "scaled.pearson"),
+        response = model$y
+      )
+      
+      # Create plot list for this exposure
+      exposure_plots <- list()
+      
+      # 1. QQ plot
+      exposure_plots[["qq"]] <- ggplot(resid_df, aes(sample = residuals)) +
+        stat_qq() +
+        stat_qq_line(color = "red") +
+        labs(title = paste(exposure_name, "- Normal Q-Q Plot")) +
+        theme_minimal() +
+        theme(plot.title = element_text(size = 8))
+      
+      # 2. Residuals vs Fitted
+      exposure_plots[["resid"]] <- ggplot(resid_df, aes(x = fitted, y = residuals)) +
+        geom_point(alpha = 0.5) +
+        geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +
+        labs(title = paste(exposure_name, "- Residuals vs Fitted"),
+             x = "Fitted values",
+             y = "Deviance residuals") +
+        theme_minimal() +
+        theme(plot.title = element_text(size = 8))
+      
+      # 3. Scale-location plot
+      exposure_plots[["scale"]] <- ggplot(resid_df, 
+                                        aes(x = fitted, y = sqrt(abs(scale_residuals)))) +
+        geom_point(alpha = 0.5) +
+        geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+        labs(title = paste(exposure_name, "- Scale-Location"),
+             x = "Fitted values",
+             y = "√|Standardized residuals|") +
+        theme_minimal() +
+        theme(plot.title = element_text(size = 8))
+      
+      # 4. Response vs Fitted
+      exposure_plots[["resp"]] <- ggplot(resid_df, aes(x = fitted, y = response)) +
+        geom_point(alpha = 0.5) +
+        geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+        labs(title = paste(exposure_name, "- Response vs Fitted"),
+             x = "Fitted values",
+             y = "Response") +
+        theme_minimal() +
+        theme(plot.title = element_text(size = 8))
+      
+      # Store all plots for this exposure
+      diagnostic_plots[[exposure_name]] <- exposure_plots
+    }
+  }
+  
+  # Calculate layout dimensions
+  n_exposures <- length(diagnostic_plots)
+  if (n_exposures == 0) {
+    stop("No valid models found for the specified model type")
+  }
+  
+  # Create a list of all plots in the desired order
+  all_plots <- list()
+  for (exposure_name in names(diagnostic_plots)) {
+    all_plots <- c(all_plots, diagnostic_plots[[exposure_name]])
+  }
+  
+  # Calculate grid dimensions based on number of exposures
+  n_cols <- 4  # One column for each type of diagnostic plot
+  n_rows <- n_exposures  # One row for each exposure
+  
+  # Combine all plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = all_plots,
+    ncol = n_cols,
+    nrow = n_rows,
+    top = grid::textGrob(
+      paste("Diagnostic Plots for Model Type:", model_type),
+      gp = grid::gpar(fontsize = 12, fontface = "bold")
+    )
+  )
+  
+  return(combined_plot)
+}
+
+# Function to display diagnostics for all model types
+display_all_model_diagnostics <- function(models_list) {
+  # Get unique model types
+  model_types <- unique(unlist(lapply(models_list, names)))
+  
+  # Create plots for each model type
+  for (model_type in model_types) {
+    tryCatch({
+      plot <- create_model_diagnostics_by_type(models_list, model_type)
+      print(plot)
+      # Add a pause between plots if running interactively
+      if (interactive()) {
+        readline(prompt = paste("Press [Enter] to see next plot for model type:", 
+                              model_type))
+      }
+    }, error = function(e) {
+      message(paste("Error creating plots for model type:", model_type))
+      message(e)
+    })
+  }
+}
+
+# Function to get summary statistics for a specific model type
+get_model_type_summary <- function(models_list, model_type) {
+  summary_stats <- data.frame(
+    exposure = character(),
+    r_squared = numeric(),
+    deviance_explained = numeric(),
+    aic = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (exposure_name in names(models_list)) {
+    exposure_models <- models_list[[exposure_name]]
+    
+    if (model_type %in% names(exposure_models)) {
+      model <- exposure_models[[model_type]]
+      
+      if (!inherits(model, "try-error")) {
+        summary_stats <- rbind(summary_stats, data.frame(
+          exposure = exposure_name,
+          r_squared = summary(model)$r.sq,
+          deviance_explained = summary(model)$dev.expl * 100,
+          aic = AIC(model),
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+  }
+  
+  return(summary_stats)
+}
+```
+
+
+# Function to scale exposures by IQR and fit MRF income models
+scale_and_fit_mrf <- function(data, exposure_list) {
+  # Function to scale a variable by its IQR
+  scale_by_iqr <- function(x) {
+    x / (IQR(x, na.rm = TRUE))
+  }
+  
+  # Create scaled dataset
+  scaled_data <- data %>%
+    mutate(
+      # Scale changes
+      pm_change_scaled = scale_by_iqr(pm_change),
+      o3_change_scaled = scale_by_iqr(o3_change),
+      no2_change_scaled = scale_by_iqr(no2_change),
+      ndvi_change_scaled = scale_by_iqr(ndvi_change),
+      mean_temp_scaled = scale_by_iqr(mean_temp),
+      
+      # Scale baselines
+      pm_2002_scaled = scale_by_iqr(pm_2002),
+      o3_2002_scaled = scale_by_iqr(o3_2002),
+      no2_2000_scaled = scale_by_iqr(no2_2000),
+      ndvi_2000_scaled = scale_by_iqr(ndvi_2000)
+    )
+  
+  # Create modified exposure list with scaled variables
+  scaled_exposure_list <- list(
+    pm = list(
+      name = "pm",
+      baseline = "pm_2002_scaled",
+      change = "pm_change_scaled"
+    ),
+    o3 = list(
+      name = "o3",
+      baseline = "o3_2002_scaled",
+      change = "o3_change_scaled"
+    ),
+    no2 = list(
+      name = "no2",
+      baseline = "no2_2000_scaled",
+      change = "no2_change_scaled"
+    ),
+    ndvi = list(
+      name = "ndvi",
+      baseline = "ndvi_2000_scaled",
+      change = "ndvi_change_scaled"
+    ),
+    temp = list(
+      name = "mean_temp",
+      baseline = NULL,
+      change = "mean_temp_scaled"
+    )
+  )
+  
+  # Function to fit MRF income model for each exposure
+  fit_mrf_income <- function(data, exposure_info) {
+    exp_var <- exposure_info$change
+    baseline_exposure <- exposure_info$baseline
+    
+    if (!exp_var %in% names(data)) {
+      warning(paste("Variable", exp_var, "not found in dataset"))
+      return(NULL)
+    }
+    
+    # Base formula components
+    base_formula <- paste(exp_var, "~ s(score_0.5) + s(COUNTYFP10, bs='re')")
+    
+    # Add baseline if it exists
+    if (!is.null(baseline_exposure) && baseline_exposure %in% names(data)) {
+      formula <- as.formula(paste(
+        base_formula,
+        "+ s(med_income_2016) +",
+        paste0("s(", baseline_exposure, ")"),
+        "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"
+      ))
+    } else {
+      formula <- as.formula(paste(
+        base_formula,
+        "+ s(med_income_2016)",
+        "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"
+      ))
+    }
+    
+    # Fit model
+    model <- try(gam(formula,
+                    family = scat,
+                    data = data,
+                    method = "REML"),
+                 silent = TRUE)
+    
+    return(model)
+  }
+  
+  # Fit models for each exposure
+  scaled_models <- purrr::map(scaled_exposure_list, ~fit_mrf_income(scaled_data, .))
+  
+  # Return both scaled data and models
+  return(list(
+    scaled_data = scaled_data,
+    models = scaled_models
+  ))
+}
+
+# Usage example:
+scaled_results <- scale_and_fit_mrf(data_prepared, exposure_list)
+
+# Function to extract and summarize model results
+summarize_scaled_models <- function(scaled_results) {
+  map_df(names(scaled_results$models), function(exposure) {
+    model <- scaled_results$models[[exposure]]
+    if(inherits(model, "try-error")) {
+      return(NULL)
+    }
+    
+    summary <- summary(model)
+    data.frame(
+      exposure = exposure,
+      r_squared = summary$r.sq,
+      deviance_explained = summary$dev.expl * 100,
+      n = summary$n
+    )
+  })
+}
+
+# Get model summaries
+model_summaries <- summarize_scaled_models(scaled_results)
+model_summaries
+
+######################NEW
+library(tidyverse)
+library(mgcv)
+
+analyze_gentrification_effects <- function(scaled_results) {
+  # First scale the gentrification score in the data
+  scaled_results$scaled_data <- scaled_results$scaled_data %>%
+    mutate(score_0.5_scaled = score_0.5 / IQR(score_0.5, na.rm = TRUE))
+  
+  # Update models to use scaled score
+  models <- scaled_results$models
+  
+  # Function to process each model
+  process_model <- function(model, exposure_name) {
+    if(inherits(model, "try-error")) {
+      return(NULL)
+    }
+    
+    # Extract smooth term for gentrification score
+    smooth_term <- summary(model)$s.table["s(score_0.5_scaled)", ]
+    
+    # Get effective degrees of freedom (complexity of relationship)
+    edf <- smooth_term["edf"]
+    
+    # Get p-value
+    p_value <- smooth_term["p-value"]
+    
+    # Calculate range of fitted values for scaled gentrification score
+    score_seq <- seq(min(scaled_results$scaled_data$score_0.5_scaled, na.rm = TRUE),
+                    max(scaled_results$scaled_data$score_0.5_scaled, na.rm = TRUE),
+                    length.out = 100)
+    
+    # Create prediction data frame
+    pred_data <- data.frame(
+      score_0.5_scaled = score_seq,
+      # Set other variables to their median/reference values
+      med_income_2016 = median(scaled_results$scaled_data$med_income_2016, na.rm = TRUE),
+      COUNTYFP10 = levels(scaled_results$scaled_data$COUNTYFP10)[1],
+      GEOID = levels(scaled_results$scaled_data$GEOID)[1]
+    )
+    
+    # Add baseline exposure if it exists in the model
+    if(exposure_name != "temp") {
+      baseline_col <- paste0(tolower(exposure_name), "_2002_scaled")
+      if(exposure_name == "no2") baseline_col <- "no2_2000_scaled"
+      if(exposure_name == "ndvi") baseline_col <- "ndvi_2000_scaled"
+      pred_data[[baseline_col]] <- median(scaled_results$scaled_data[[baseline_col]], na.rm = TRUE)
+    }
+    
+    # Get predictions with standard errors
+    pred <- predict(model, newdata = pred_data, type = "terms", se.fit = TRUE)
+    
+    # Extract just the gentrification score component
+    score_effect <- pred$fit[, "s(score_0.5_scaled)"]
+    score_se <- pred$se.fit[, "s(score_0.5_scaled)"]
+    
+    data.frame(
+      exposure = exposure_name,
+      edf = edf,
+      p_value = p_value,
+      score = score_seq,
+      effect = score_effect,
+      se_lower = score_effect - 1.96 * score_se,
+      se_upper = score_effect + 1.96 * score_se
+    )
+  }
+  
+  # Apply to all models
+  results <- map_df(names(models), ~process_model(models[[.]], .))
+  
+  return(results)
+}
+
+# Create visualization with proper axis labels
+ggplot(gent_analysis, aes(x = score, y = effect)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = se_lower, ymax = se_upper), alpha = 0.2) +
+  facet_wrap(~exposure, scales = "free_y") +
+  labs(x = "Gentrification Score (IQR units)",
+       y = "Standardized Effect",
+       title = "Relationship between Gentrification Score and Environmental Exposures",
+       subtitle = "Effects shown per IQR increase in exposure and gentrification score") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12),
+    axis.title = element_text(size = 11),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12)
+  )
+
+# Updated summary table
+gent_summary <- gent_analysis %>%
+  group_by(exposure) %>%
+  summarize(
+    edf = first(edf),
+    p_value = first(p_value),
+    max_effect = max(effect) - min(effect),
+    direction = case_when(
+      max_effect > 0 ~ "Positive",
+      max_effect < 0 ~ "Negative",
+      TRUE ~ "No effect"
+    )
+  ) %>%
+  arrange(p_value)
+
+# Print formatted summary with note about scaling
+print(knitr::kable(gent_summary, 
+                   digits = c(0, 2, 4, 2, 0),
+                   col.names = c("Exposure", "EDF", "P-value", "Max Effect Size", "Direction"),
+                   caption = "Results per IQR increase in both exposure and gentrification score"))
+
+  ########################################
+
+create_forest_plots <- function(scaled_results) {
+  # Function to extract model coefficients and CIs
+  extract_model_stats <- function(model, exposure_name) {
+    if(inherits(model, "try-error")) {
+      return(NULL)
+    }
+    
+    # Extract summary statistics
+    model_summary <- summary(model)
+    
+    # Get parametric coefficients (if any)
+    param_coef <- coef(model)
+    param_se <- sqrt(diag(vcov(model)))
+    
+    # Calculate confidence intervals
+    ci_lower <- param_coef - (1.96 * param_se)
+    ci_upper <- param_coef + (1.96 * param_se)
+    
+    # Create data frame with results
+    data.frame(
+      exposure = exposure_name,
+      estimate = param_coef[1],
+      ci_lower = ci_lower[1],
+      ci_upper = ci_upper[1],
+      p_value = summary(model)$s.table[1, 4],
+      r_squared = summary(model)$r.sq,
+      deviance_explained = summary(model)$dev.expl * 100
+    )
+  }
+  
+  # Extract results for selected models (excluding temperature)
+  selected_exposures <- c("pm", "o3", "no2", "ndvi")
+  
+  results_df <- map_df(selected_exposures, function(exp_name) {
+    extract_model_stats(scaled_results$models[[exp_name]], exp_name)
+  })
+  
+  # Create exposure labels mapping
+  exposure_labels <- c(
+    "pm" = "PM2.5",
+    "o3" = "O3",
+    "no2" = "NO2",
+    "ndvi" = "NDVI"
+  )
+  
+  # Add formatted labels
+  results_df$exposure_label <- exposure_labels[results_df$exposure]
+  
+  # Create forest plot
+  forest_plot <- ggplot(results_df, aes(y = reorder(exposure_label, estimate))) +
+    # Add vertical line at null effect
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    # Add points and confidence intervals
+    geom_point(aes(x = estimate), size = 3) +
+    geom_errorbarh(aes(xmin = ci_lower, xmax = ci_upper), height = 0.2) +
+    # Customize appearance
+    theme_bw() +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.title.y = element_blank(),
+      text = element_text(size = 12),
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.text = element_text(size = 10)
+    ) +
+    # Add labels
+    labs(
+      title = "Gent and environmental exposure",
+      subtitle = "Standardized effects per interquartile range increase",
+      x = "Effect Size",
+      caption = "Error bars represent 95% confidence intervals"
+    )
+  
+  # Create summary table
+  summary_table <- results_df %>%
+    mutate(
+      exposure = exposure_label,
+      estimate = round(estimate, 3),
+      ci = sprintf("(%0.3f, %0.3f)", ci_lower, ci_upper),
+      p_value = sprintf("%0.3f", p_value),
+      r_squared = sprintf("%0.1f%%", r_squared * 100),
+      deviance_explained = sprintf("%0.1f%%", deviance_explained)
+    ) %>%
+    select(exposure, estimate, ci, p_value, r_squared, deviance_explained)
+  
+  return(list(
+    plot = forest_plot,
+    summary = summary_table
+  ))
+}
+
+# Usage example:
+results <- create_forest_plots(scaled_results)
+
+# Display plot
+print(results$plot)
+
+# Display summary table
+print(results$summary)
+  
+  ###################################
+  
+  # Function to create forest plot data
+create_forest_plot_data <- function(gent_summary) {
+  # Add confidence intervals (placeholder - you may want to extract these from your models)
+  forest_data <- gent_summary %>%
+    mutate(
+      # Create labels that include EDF and p-value
+      label = paste0(exposure, "\n(EDF = ", sprintf("%.2f", edf), 
+                    ", p = ", sprintf("%.3f", p_value), ")"),
+      # Order exposures by effect size
+      label = factor(label, levels = label[order(max_effect)])
+    )
+  
+  return(forest_data)
+}
+
+# Create basic forest plot
+create_basic_forest_plot <- function(forest_data) {
+  ggplot(forest_data, aes(y = label, x = max_effect)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_point(size = 3, color = "darkblue") +
+    theme_minimal() +
+    theme(
+      axis.title.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      text = element_text(size = 12)
+    ) +
+    labs(
+      x = "Maximum Effect Size (IQR units)",
+      title = "Environmental Exposure Changes Associated with Gentrification",
+      subtitle = "Effect sizes shown in interquartile range (IQR) units"
+    )
+}
+
+# Create enhanced forest plot with confidence intervals and EDF visualization
+create_enhanced_forest_plot <- function(forest_data) {
+  # Create base plot
+  p1 <- ggplot(forest_data, aes(y = label, x = max_effect)) +
+    # Add reference line
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    # Add points
+    geom_point(aes(size = edf), color = "darkblue") +
+    # Add color gradient based on p-value
+    scale_size_continuous(name = "EDF\n(complexity)", 
+                         range = c(3, 8)) +
+    # Customize theme
+    theme_minimal() +
+    theme(
+      axis.title.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      text = element_text(size = 12),
+      legend.position = "right"
+    ) +
+    labs(
+      x = "Maximum Effect Size (IQR units)",
+      title = "Environmental Exposure Changes Associated with Gentrification",
+      subtitle = "Effect sizes shown in interquartile range (IQR) units\nPoint size indicates relationship complexity (EDF)"
+    )
+  
+  return(p1)
+}
+
+# Create plot showing standardized effects across gentrification scores
+create_trajectory_plot <- function(gent_analysis) {
+  ggplot(gent_analysis, aes(x = score, y = effect, color = exposure)) +
+    geom_line(size = 1) +
+    geom_ribbon(aes(ymin = se_lower, ymax = se_upper, fill = exposure), 
+                alpha = 0.2, color = NA) +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      x = "Gentrification Score",
+      y = "Standardized Effect (IQR units)",
+      title = "Trajectories of Environmental Exposures Across Gentrification Scores",
+      subtitle = "Shaded areas represent 95% confidence intervals"
+    )
+}
+
+# Generate plots
+forest_data <- create_forest_plot_data(gent_summary)
+basic_plot <- create_basic_forest_plot(forest_data)
+enhanced_plot <- create_enhanced_forest_plot(forest_data)
+trajectory_plot <- create_trajectory_plot(gent_analysis)
+
+# Display plots
+print(basic_plot)
+print(enhanced_plot)
+print(trajectory_plot)
+
+# Save plots if needed
+#ggsave("basic_forest_plot.png", basic_plot, width = 10, height = 6)
+#ggsave("enhanced_forest_plot.png", enhanced_plot, width = 10, height = 6)
+#ggsave("trajectory_plot.png", trajectory_plot, width = 12, height = 6)

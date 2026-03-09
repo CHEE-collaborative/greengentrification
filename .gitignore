@@ -2,3 +2,16 @@
 .Rhistory
 .RData
 .Ruserdata
+data/*
+results/*
+*.csv
+!data_gh/df_travel.csv
+*.rds
+*.txt.gz
+*.tif
+*.tiff
+*.png
+*.parquet
+*.zip
+CopyOfthesis_JH/
+inla*

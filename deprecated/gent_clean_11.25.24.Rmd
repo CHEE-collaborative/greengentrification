@@ -1,0 +1,4683 @@
+---
+title: "gent_clean_11.25.24"
+author: "Joyce Hu"
+date: "2024-11-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages (JH - check if any are unused after code cleaned)
+```{r}
+library(tidyverse)
+library(tigris)
+library(arrow)
+library(here)
+library(mgcv)
+library(fixest)
+library(lmtest)
+library(terra)
+library(exactextractr)
+library(tidyterra)
+library(sf)
+library(mgcViz)
+
+library(DHARMa)
+library(qqplotr)
+library(readxl) # for read_excel()
+library(spdep) # for moran.test()
+library(tidycensus) # for median income
+library(distr) # for qqbounds()
+library(spatialreg) # for spatial lag and error models
+library(gridExtra) # for viewing plots side-by-side
+library(qgam) 
+library(dplyr)
+library(INLA)
+library(ggregplot) #INLA compatible plotting library (efxplot)
+library(ggfields) # for plotting spatial field
+library(lattice) # for levelplot
+library(inlatools) # for INLA diagnostics 
+```
+
+Load and clean data
+```{r}
+# Check if 'data' directory exists; if not, create it
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+# Load gentrification score by tract
+gentrification <- read.csv(here("data", "Data_NYC_Gentrification_2000_16.csv")) %>% 
+  mutate(tractid = as.character(tractid)) %>% 
+  dplyr::select(tractid, score_0.5)
+
+# Load gentrification score if using xlsx file:
+# gentrification <- read_xlsx(here("Gentrification","Data_NYC_Gentrification_2000_16.xlsx")) %>%
+#   mutate(tractid = as.character(tractid)) %>%
+#   dplyr::select(tractid, score_0.5)
+
+# pull NYC tract IDs/fips from gentrification index dataset for filtering
+nyc_fips <- gentrification$tractid
+
+# Load NYC tracts shapefile
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), year = 2010) %>%
+  # clean lat and long for Conley SEs
+  mutate(lat = as.numeric(INTPTLAT10), long = as.numeric(INTPTLON10), GEOID = GEOID10) %>% 
+  # filter for FIPS codes included in gentrification index dataset
+  filter(GEOID %in% nyc_fips)
+
+
+# Load NY tracts populatuion weighted centroid points from Census data
+nyc_weighted_centroids <- read.table("https://www2.census.gov/geo/docs/reference/cenpop2010/tract/CenPop2010_Mean_TR36.txt", 
+                         header = TRUE, sep = ",", stringsAsFactors = FALSE, 
+                         colClasses = c("character", "character", "character", "numeric", "numeric", "numeric")) %>%
+  mutate(FIPS = paste(STATEFP, COUNTYFP, TRACTCE, sep = "")) %>% 
+  ## filter for only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%  
+  rename(Longitude_weighted = LONGITUDE, 
+         Latitude_weighted = LATITUDE)
+
+# JH - 10/12/24 warning persists 10/13, 10/14 Warning: R metadata may have unsafe or invalid elements ℹ Type: "externalptr" options(arrow.unsafe_metadata = TRUE) #
+
+# Temperature data
+if(!file.exists(here("data","summarized_daily_temp_preds.parquet"))){download.file("https://zenodo.org/records/10557980/files/summarized_daily_temp_preds.parquet?download=1", 
+                                                                                   destfile = here("data","summarized_daily_temp_preds.parquet"))}
+
+# Temperature by tract
+temp <- read_parquet(here("data","summarized_daily_temp_preds.parquet")) %>%
+  filter(str_detect(date, "2016")) %>%
+  mutate(temp_c = mean_temp_daily_cK/100-273.15) %>% 
+  mutate(temp_f = temp_c*9/5+32) %>% 
+  group_by(GEOID, date) %>%
+  ungroup() %>% 
+  group_by(GEOID) %>% 
+  summarize(mean_temp = mean(mean_temp_daily_cK/100))
+
+# NDVI by tract (need to have it downloaded and stored locally)
+ndvi_2016 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_2000 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+# PM2.5 data
+# Download data from URL
+download_data <- function() {
+  # set longer timeout
+  options(timeout = 7200)
+  if(!file.exists(here("data", "2016_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_pm25_daily_average.txt.gz", destfile = here("data", "2016_pm25_daily_average.txt.gz"))} #2016
+  if(!file.exists(here("data", "2002_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_pm25_daily_average.txt.gz", destfile = here("data", "2002_pm25_daily_average.txt.gz"))}} #2002
+download_data()
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2002
+pm_tract_2002 <- read.delim(gzfile(here("data", "2002_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## Include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## Calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2016
+pm_tract_2016 <- read.delim(gzfile(here("data", "2016_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(pm_mean_2016 = mean(Prediction), 
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+  
+
+# Combine 2002 and 2016 pm data for nyc_tracts
+pm_tract <- pm_tract_2002 %>%
+  inner_join(pm_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# NO2 CACES
+no2_2016_caces <- read.csv(here("data", "2016_no2_caces.csv")) %>% 
+  mutate(no2_2016 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_2000_caces <- read.csv(here("data", "2000_no2_caces.csv")) %>% 
+  mutate(no2_2000 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_caces <- left_join(no2_2000_caces, no2_2016_caces, by = "fips") %>% 
+  select(no2_2000, no2_2016, fips)
+
+#O3 data download
+options(timeout = 7200)
+if(!file.exists(here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))} #2016
+if(!file.exists(here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))} #2002
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2002
+o3_tract_2002 <- read.delim(gzfile(here("data", "2002_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>% 
+  ## include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>% 
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2016
+o3_tract_2016 <- read.delim(gzfile(here("data", "2016_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>% 
+  ## calculate annual average by tract using  population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(o3_mean_2016 = mean(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+
+o3_tract <- o3_tract_2002 %>%
+  left_join(o3_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# Merge all exposure data
+all_data <- nyc_tracts %>% 
+  # join gentrification index by tract
+  right_join(gentrification, by = c("GEOID10" = "tractid")) %>%
+  left_join(pm_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016-pm_2002) %>% 
+  left_join(o3_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002) %>% 
+  left_join(no2_caces, by = c("GEOID" = "fips")) %>% 
+  mutate(no2_change = no2_2016-no2_2000) %>% 
+  mutate(ndvi_2016 = ndvi_2016, ndvi_2000 = ndvi_2000, ndvi_change = ndvi_2016-ndvi_2000) %>% 
+  left_join(temp, by = "GEOID")
+
+############ Median income ###############################
+# Find median household income variable in 2000 decennial census
+all_vars_dec <- 
+  load_variables(year = 2000, dataset = "sf3")
+
+# Models adjusting for median income in 2000 (note: 2000 decennial census is 1999 data)
+income_2000 <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2000 = value)
+#results in 226 missing tracts in terms of 2010 tracts.
+
+# Find median household income variable in 2010 ACS
+income_2010 <- get_acs(variables = "B06011_001", year = 2010, state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2010 = estimate)
+
+# Joining both income sets with data and imputing 2010 data where 2000 data is missing
+all_data_inc <- all_data %>%
+  left_join(income_2000, by = "GEOID") %>%
+  left_join(income_2010, by = "GEOID") %>%
+  mutate(med_income_2000_impute = coalesce(med_income_2000, med_income_2010)) %>% 
+  # coerce GEOID to numeric then factor class to avoid error in MRF smooth
+  mutate(GEOID = as.numeric(GEOID)) %>% 
+  mutate(GEOID = factor(GEOID)) %>% 
+ # coerce COUNTYFP10 to numeric then factor class to avoid error ?
+  mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
+  mutate(COUNTYFP10 = factor(COUNTYFP10))
+
+# Ranking median income for use in GAM models
+all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)
+
+
+# Converting median income to quantiles and scaling
+# Create deciles
+# First create the decile groups (1-10)
+income_quantiles <- quantile(all_data_inc$med_income_2000_impute, probs = seq(0, 1, by = 0.1))
+all_data_inc$med_income_decile <- findInterval(all_data_inc$med_income_2000_impute, 
+                                             income_quantiles,
+                                             rightmost.closed = TRUE)
+
+# Then create the scaled version (1-10 continuous)
+all_data_inc$med_income_decile_scale <- (all_data_inc$med_income_2000_impute - min(all_data_inc$med_income_2000_impute)) / 
+  (max(all_data_inc$med_income_2000_impute) - min(all_data_inc$med_income_2000_impute)) * 9 + 1
+
+
+############# Distance to downtown #########
+# Load nyc roads
+downtown_st <- roads(state = "NY", county = "New York", year = 2011)
+ggplot() + geom_sf(data = downtown_st)
+
+# Define bounding box
+bbox_coords <- matrix(c(
+  -74.0187, 40.70158,  # Southwest
+  -74.0187, 40.77279,  # Northwest
+  -73.95953, 40.77279, # Northeast
+  -73.95953, 40.70158, # Southeast
+  -74.0187, 40.70158   # Closing the polygon
+), ncol = 2, byrow = TRUE)
+
+# Convert bounding box to sf
+bbox_polygon <- st_sfc(st_polygon(list(bbox_coords)), crs = 4326)
+
+# Ensure roads are the same CRS and filter for streets within bbox
+downtown_st <- st_transform(downtown_st, crs = st_crs(bbox_polygon))
+filtered_streets <- downtown_st[st_within(downtown_st, bbox_polygon, sparse = FALSE), ]
+
+# Plot filtered downtown streets and bounding box
+ggplot() +
+  geom_sf(data = filtered_streets) +
+  geom_sf(data = bbox_polygon, fill = NA, color = 'red') +
+  ggtitle("Downtown Streets within Bounding Box")
+
+# Ensure census tracts are in the same CRS
+nyc_tracts <- st_transform(nyc_tracts, crs = st_crs(bbox_polygon))
+
+# Filter intersecting tracts within downtown
+intersecting_tracts <- st_intersection(nyc_tracts, bbox_polygon)
+combined_area <- st_union(intersecting_tracts)
+#get downtown centroid
+area_centroid <- st_centroid(combined_area)
+
+ggplot() +
+  geom_sf(data = intersecting_tracts, fill = 'lightblue', color = 'black') +
+  geom_sf(data = area_centroid, color = 'red', size = 3) +
+  ggtitle('Centroid of Downtown Census Tracts')
+
+# Calculate distances and add to "all_data_inc" dataframe
+distances <- st_distance(nyc_tracts, area_centroid)
+all_data_inc$dt_dist <- as.numeric(distances)
+
+#all_data_inc includes gentrification score (score_0.5), all exposure data, median income, distance to downtown
+
+```
+INLA set up
+```{r}
+# # Set INLA repository
+# options(repos = c(getOption("repos"),
+#    INLA="https://inla.r-inla-download.org/R/stable"))
+# 
+# # Install INLA and dependencies (from CRAN)
+# install.packages("INLA", dep = TRUE)
+
+#need older version of INLA to be compatible with R version
+ # remotes::install_version("INLA", version="22.05.07",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/testing"), dep=TRUE)
+
+# Install an even older version of INLA for GLIBC compatibility
+
+# remotes::install_version("INLA", 
+#                          version="21.02.23", 
+#                          repos=c(getOption("repos"),
+#                                  INLA="https://inla.r-inla-download.org/R/stable"), 
+#                          dep=TRUE)
+
+```
+
+INLA PM2.5 models without spatial aspect 
+```{r}
+######INLA PM2.5 MODELS #####
+
+IM_pm_1  <- inla(pm_change ~ score_0.5 + med_income_decile,
+               family = "gaussian", 
+               data = all_data_inc, verbose = TRUE) 
+
+IM_pm_2 <- inla(pm_change ~ score_0.5 + med_income_decile + f(COUNTYFP10, model = "iid"),
+                family = "gaussian", 
+                data = all_data_inc, verbose = TRUE)
+
+IM_pm_3 <- inla(pm_change ~ score_0.5 + med_income_decile + f(COUNTYFP10, model = "iid") + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+IM_pm_4 <- inla(pm_change ~ score_0.5 + med_income_decile + dt_dist, family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+IM_pm_5 <- inla(pm_change ~ score_0.5, family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+IM_pm_6 <- inla(pm_change ~ score_0.5 + f(COUNTYFP10, model = "iid"), family = "gaussian", data = all_data_inc, verbose = TRUE)
+
+
+
+# plotting INLA 2.5 models
+Efxplot(list(IM_pm_1, IM_pm_2, IM_pm_3, IM_pm_4, IM_pm_5, IM_pm_6))
+
+```
+INLA - Mesh creation
+```{r}
+#### Create mesh using tract centroids as locations
+
+# Create matrix of locations
+Locations <- as.matrix(cbind(
+  as.numeric(nyc_weighted_centroids$Longitude_weighted),
+  as.numeric(nyc_weighted_centroids$Latitude_weighted)
+))
+
+# Create mesh options
+# Various mesh option specifications 
+MeshA <- inla.mesh.2d(jitter(Locations), max.edge = c(20, 40))
+MeshB <- inla.mesh.2d(Locations, max.edge = c(20, 40))
+MeshC <- inla.mesh.2d(Locations, max.edge = c(50, 100))
+mesh_simple <- inla.mesh.create(Locations)
+
+# Visualize mesh options
+plot(MeshA)
+points(Locations, col = "red", pch = 2)
+
+plot(MeshB)
+points(Locations, col = "red", pch = 2)
+
+plot(MeshC)
+points(Locations, col = "red", pch = 2)
+
+
+# "Generally, the mesh function automatically creates a mesh like mesh A, where closer-together sampling locations produce smaller triangles. When exploring/setting up preliminary analyses, use a mesh like mesh B. For analyses to be reported in a paper, use a mesh like mesh C. Be careful of edges, and try to allow some space around your sampling area for INLA to estimate. The edge triangles can be bigger to reduce computing power."
+
+# Set chosen mesh to use for analysis
+Mesh <- MeshB
+```
+
+INLA - Creating the A Matrix and SPDE
+```{r}
+# Create A matrix
+A <- inla.spde.make.A(Mesh, loc = Locations) 
+# "the A matrix maps the Gaussian Markov Random Field (GMRF) from the mesh nodes to the n observation location. This is represented by a matrix with the number of observations as column and the number of nodes as rows."
+
+
+# Create spatial structure (SPDE object)
+spde <- inla.spde2.matern(Mesh, alpha=2) #they fix alpha as 2
+
+# Create all the required indexes for the SPDE model, naming the spatial field as “spatial.field”, which facilitates the extraction of the estimated values of the spatial field after the fitting process.
+iset <- inla.spde.make.index(name = "spatial.field", spde$n.spde)
+```
+
+INLA stack (PM2.5)
+```{r}
+# Create stack
+stk <- inla.stack(
+  data=list(y=all_data_inc$pm_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                               dt_dist = all_data_inc$dt_dist)))
+
+
+#"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
+```
+
+
+INLA - model fitting (no priors) for PM2.5
+```{r}
+# Specify formula
+formula1 <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  dt_dist +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+  #rw1 and rw2 don't work for the covariates, not sure how else to smooth, so right now just linear?? 
+
+# Specify model
+model1<-inla(formula1, 
+             data = inla.stack.data(stk, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk),compute = TRUE), 
+             control.compute = list(cpo = TRUE, config = TRUE))
+
+```
+
+INLA model results for PM2.5
+```{r}
+###  Model results
+
+# Posterior distribution summary of the fixed effects
+model1$summary.fix
+
+# Posterior distribution summary of the hyper parameters (spatial field parameters)
+model1$summary.hyperpar
+
+# Rounded summaries
+round(model1$summary.fixed,3) 
+round(model1$summary.hyperpar,3)
+
+# "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
+model1.res<-inla.spde2.result(model1, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+
+model1.res$summary.log.range.nominal
+model1.res$summary.log.variance.nominal
+
+# Plot effect estimate and credible intervals
+graphics.off()
+Efxplot(list(model1))
+
+# Plot for fixed parameters for insight into the effect of covariates
+par(mfrow=c(2,2))
+plot(model1$marginals.fixed[[1]], ty = "l", xlab = expression(beta[0]), ylab = "Density")
+plot(model1$marginals.fixed[[2]], ty = "l", xlab = expression(beta[score_0.5]), ylab = "Density") 
+plot(model1$marginals.fixed[[3]], ty = "l", xlab = expression(beta[med_income_ranked]), ylab = "Density") 
+plot(model1$marginals.fixed[[4]], ty = "l", xlab = expression(beta[dt_dist]), ylab = "Density") 
+
+# Plots for hyper parameters for insight into the effect of the structure of the spatial field
+par(mfrow=c(1,3))
+plot(model1.res$marginals.var[[1]], ty = "l", xlab = expression(sigma[randomfield]^2), ylab = "Density") 
+plot(model1.res$marginals.kap[[1]], type = "l", xlab = expression(kappa), ylab = "Density")
+plot(model1.res$marginals.range[[1]], type = "l", xlab = "range nominal", ylab = "Density")
+
+dev.off()
+
+# Plot spatial field 
+gproj <- inla.mesh.projector(Mesh,  dims = c(300, 300))
+g.mean <- inla.mesh.project(gproj, model1$summary.random$spatial.field$mean)
+g.sd <- inla.mesh.project(gproj, model1$summary.random$spatial.field$sd)
+
+grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
+             levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
+             nrow=1)
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+
+# Other model plots
+plot(model1, single = TRUE) # look into how to interpret?
+
+```
+
+INLA - model selection of covariates for PM2.5
+```{r}
+### Model selection 
+# Model selection with WAIC (other criteria can be used)
+
+# Create a vector of fixed effect covariates
+covariates <- c("med_income_decile", "dt_dist")
+
+for(i in 1:length(covariates)) {
+  
+  # Build formula with random effect for county
+  f1 <- as.formula(paste0("y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + f(COUNTYFP10, model='iid') + ",
+                         paste0(covariates[1:i], collapse = " + ")))
+  
+  model1 <- inla(f1, 
+                 data = inla.stack.data(stk, spde=spde),
+                 family = 'gaussian',
+                 control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
+                 control.compute = list(dic = TRUE, cpo=TRUE, waic = TRUE))
+  
+  # Store model selection results
+  model_selection <- if(i==1) {
+    rbind(c(model = paste(covariates[1:i]), waic = model1$waic$waic))
+  } else {
+    rbind(model_selection, 
+          c(model = paste(covariates[1:i], collapse = " + "), 
+            waic = model1$waic$waic))
+  }
+}
+
+model_selection
+
+```
+
+INLA - setting priors in the model for PM2.5
+```{r}
+## trying to set priors using GAM model results
+formula2 <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_decile + dt_dist 
+
+# Using the estimates and standard errors to inform priors
+model2 <- inla(formula2, 
+               data = inla.stack.data(stk, spde=spde),
+               family = 'gaussian', 
+               control.fixed = list(
+                 mean = list(Intercept = -5.954,
+                           score_0.5 = -7.859e-4,
+                           med_income_decile = 1.002e-6, # This was using med_income_ranked in the GAM
+                           dt_dist = 0),  # No prior info for dt_dist from GAM
+                 prec = list(Intercept = 1/(8.170e-04)^2,
+                           score_0.5 = 1/(5.793e-04)^2,
+                           med_income_decile = 1/(7.453e-07)^2,
+                           dt_dist = 1)  # Using default precision for dt_dist
+               ),
+               control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
+               verbose = FALSE)
+
+
+# Plot effect estimates and credible intervals
+graphics.off()
+Efxplot(list(model2))
+Efxplot(list(model1))
+
+
+plot(model2, single = TRUE) #don't know what this plot is and don't know why output is different from model 1
+
+# Compare model 1 (no priors) and model 2 (priors) results
+model1$summary.fix
+model1$summary.hyperpar
+
+model2$summary.fix
+model2$summary.hyperpar
+
+
+
+```
+
+INLA stack (NDVI)
+```{r}
+# Create stack
+stk_ndvi <- inla.stack(
+  data=list(y=all_data_inc$ndvi_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                               dt_dist = all_data_inc$dt_dist)))
+
+
+#"Two projector matrices are needed A = list(A,1): the projector matrix for the latent field and a matrix that is a one-to-one map of the covariate. The latter matrix can simply be a constant rather than a diagonal matrix."
+```
+
+
+INLA - model fitting (no priors) for 
+```{r}
+# Specify formula
+formula1_ndvi <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  dt_dist +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+  #rw1 and rw2 don't work for the covariates, not sure how else to smooth, so right now just linear?? 
+
+# Specify model
+model1_ndvi<-inla(formula1_ndvi, 
+             data = inla.stack.data(stk_ndvi, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_ndvi),compute = TRUE), 
+             control.compute = list(cpo = TRUE))
+
+```
+
+INLA model results for NDVI
+```{r}
+###  Model results
+# Posterior distribution summary of the fixed effects
+model1_ndvi$summary.fix
+
+# Posterior distribution summary of the hyper parameters (spatial field parameters)
+model1_ndvi$summary.hyperpar
+
+# Rounded summaries
+round(model1_ndvi$summary.fixed,3) #med_income_ranked and dt_dist still come out out as all zeroes --> rounded...
+round(model1_ndvi$summary.hyperpar,3)
+
+# "The posterior distribution of the hyperparameters θ1 and θ2 are difficult to interpret. We can transform them into more interpretable quantities such as the range, and the variance. The range is of particular interest. It provides the distance value (in the unit of the point coordinates) above which spatial dependencies become negligible."
+model1_ndvi.res<-inla.spde2.result(model1_ndvi, 'spatial.field', spde, do.transf=TRUE) #do.tranf = TRUE makes sure that marginals are calculated in the same scale as the data.
+
+model1_ndvi.res$summary.log.range.nominal
+model1_ndvi.res$summary.log.variance.nominal
+
+# Plot effect estimate and credible intervals
+graphics.off()
+Efxplot(list(model1_ndvi))
+
+# Plot for fixed parameters for insight into the effect of covariates
+par(mfrow=c(2,2))
+plot(model1_ndvi$marginals.fixed[[1]], ty = "l", xlab = expression(beta[0]), ylab = "Density")
+plot(model1_ndvi$marginals.fixed[[2]], ty = "l", xlab = expression(beta[score_0.5]), ylab = "Density") 
+plot(model1_ndvi$marginals.fixed[[3]], ty = "l", xlab = expression(beta[med_income_ranked]), ylab = "Density") 
+plot(model1_ndvi$marginals.fixed[[4]], ty = "l", xlab = expression(beta[dt_dist]), ylab = "Density") 
+
+# Plots for hyper parameters for insight into the effect of the structure of the spatial field
+par(mfrow=c(1,3))
+plot(model1_ndvi.res$marginals.var[[1]], ty = "l", xlab = expression(sigma[randomfield]^2), ylab = "Density") 
+plot(model1_ndvi.res$marginals.kap[[1]], type = "l", xlab = expression(kappa), ylab = "Density")
+plot(model1_ndvi.res$marginals.range[[1]], type = "l", xlab = "range nominal", ylab = "Density")
+
+
+# Plot spatial field 
+gproj <- inla.mesh.projector(Mesh,  dims = c(300, 300))
+g.mean <- inla.mesh.project(gproj, model1_ndvi$summary.random$spatial.field$mean)
+g.sd <- inla.mesh.project(gproj, model1_ndvi$summary.random$spatial.field$sd)
+
+grid.arrange(levelplot(g.mean, scales=list(draw=F), xlab='', ylab='', main='mean',col.regions = heat.colors(16)),
+             levelplot(g.sd, scal=list(draw=F), xla='', yla='', main='sd' ,col.regions = heat.colors(16)),
+             nrow=1)
+# "take a look at the spatial field to understand the spatial structure. It can inform on potential omitted variable - how much of the variance in the dependent variable is not explained by the covariates." but honestly idk what i am really looking at
+
+# Other model plots
+plot(model1_ndvi, single = TRUE) # look into how to interpret?
+
+```
+
+INLA - model selection of covariates for NDVI
+```{r}
+### Model selection 
+# Model selection with WAIC (other criteria can be used)
+
+# Create a vector of fixed effect covariates
+covariates <- c("med_income_ranked", "dt_dist")
+
+for(i in 1:length(covariates)) {
+  
+  # Build formula with random effect for county
+  f1 <- as.formula(paste0("y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + f(COUNTYFP10, model='iid') + ",
+                         paste0(covariates[1:i], collapse = " + ")))
+  
+  model1 <- inla(f1, 
+                 data = inla.stack.data(stk_ndvi, spde=spde),
+                 family = 'gaussian',
+                 control.predictor = list(A=inla.stack.A(stk_ndvi), compute=TRUE),
+                 control.compute = list(dic = TRUE, cpo=TRUE, waic = TRUE, config = TRUE))
+
+  
+  # Store model selection results
+  model_selection <- if(i==1) {
+    rbind(c(model = paste(covariates[1:i]), waic = model1$waic$waic))
+  } else {
+    rbind(model_selection, 
+          c(model = paste(covariates[1:i], collapse = " + "), 
+            waic = model1$waic$waic))
+  }
+}
+
+model_selection
+```
+
+INLA - setting priors in the model for NDVI
+```{r}
+## trying to set priors using GAM model results
+formula2_ndvi <- y ~ -1 + Intercept + score_0.5 + f(spatial.field, model=spde) + med_income_decile + dt_dist 
+
+# Using the estimates and standard errors to inform priors
+model2_ndvi <- inla(formula2_ndvi, 
+               data = inla.stack.data(stk_ndvi, spde=spde),
+               family = 'gaussian', 
+               control.fixed = list(
+                 mean = list(Intercept = -2.422e-02,
+                           score_0.5 = -2.128e-04,
+                           med_income_decile = -2.896e-06,
+                           dt_dist = 0),  # No prior info for dt_dist
+                 prec = list(Intercept = 1/(1.297e-03)^2,
+                           score_0.5 = 1/(8.675e-04)^2,
+                           med_income_decile = 1/(1.179e-06)^2,
+                           dt_dist = 1)  # Using default precision for dt_dist
+               ),
+               control.predictor = list(A=inla.stack.A(stk), compute=TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
+               verbose = FALSE)
+
+
+# Plot effect estimates and credible intervals
+graphics.off()
+Efxplot(list(model2_ndvi)) # not statistically significant compared to without priors
+Efxplot(list(model1_ndvi))
+
+plot(model2_ndvi, single = TRUE) #don't know what this plot is and don't know why output is different from model 1
+
+# Compare model 1 (no priors) and model 2 (priors) results
+model1_ndvi$summary.fix
+model1_ndvi$summary.hyperpar
+
+model2_ndvi$summary.fix
+model2_ndvi$summary.hyperpar
+
+```
+
+INLA model functions for all variables
+```{r}
+run_spatial_model <- function(response_var, data, spde, Mesh) {
+  # Create stack
+  stk <- inla.stack(
+    data = list(y = data[[response_var]]),
+    A = list(A, 1),
+    effects = list(
+      c(list(Intercept = 1), iset),
+      list(
+        score_0.5 = data$score_0.5,
+        med_income_decile = data$med_income_decile,
+        COUNTYFP10 = data$COUNTYFP10,
+        dt_dist = data$dt_dist
+      )
+    )
+  )
+  
+  # Formula
+  formula <- y ~ -1 + Intercept + score_0.5 +
+    med_income_decile + 
+    dt_dist +
+    f(spatial.field, model = spde) +
+    f(COUNTYFP10, model = "iid")
+  
+  # Fit model
+  model <- inla(formula, 
+                data = inla.stack.data(stk, spde = spde),
+                family = 'gaussian', 
+                control.predictor = list(A = inla.stack.A(stk), compute = TRUE), 
+                control.compute = list(cpo = TRUE, dic = TRUE, waic = TRUE))
+  
+  # Create spatial field results
+  model.res <- inla.spde2.result(model, 'spatial.field', spde, do.transf = TRUE)
+  
+  # Return model results
+  return(list(
+    model = model,
+    fixed_effects = round(model$summary.fixed, 3),
+    hyperpar = round(model$summary.hyperpar, 3),
+    range = model.res$summary.log.range.nominal,
+    variance = model.res$summary.log.variance.nominal,
+    waic = model$waic$waic,
+    response = response_var
+  ))
+} # waic doesn't mean much here bc not doing model selection, would need to do that separately
+
+# Run models for all response variables
+response_vars <- c("pm_change", "o3_change", "no2_change", "ndvi_change", "mean_temp")
+
+results <- map(response_vars, ~run_spatial_model(
+  response_var = .x,
+  data = all_data_inc,
+  spde = spde,
+  Mesh = Mesh
+)) %>%
+  setNames(response_vars)
+
+# Print summarized results
+print_model_results <- function(results_list) {
+  for(var in names(results_list)) {
+    cat("\n\n=== Results for", var, "===\n")
+    cat("\nFixed Effects:\n")
+    print(results_list[[var]]$fixed_effects)
+    cat("\nHyper Parameters:\n")
+    print(results_list[[var]]$hyperpar)
+    cat("\nRange:\n")
+    print(results_list[[var]]$range)
+    cat("\nVariance:\n")
+    print(results_list[[var]]$variance)
+    cat("\nWAIC:\n")
+    print(results_list[[var]]$waic)
+    cat("\n----------------------------------------\n")
+  }
+}
+
+# Print results
+print_model_results(results)
+
+
+### Effect estimate and credible interval plots
+
+# For PM2.5 change
+graphics.off()
+Efxplot(list(results$pm_change$model))
+
+# For O3 change
+graphics.off()
+Efxplot(list(results$o3_change$model))
+
+# For NO2 change
+graphics.off()
+Efxplot(list(results$no2_change$model))
+
+# For NDVI change
+graphics.off()
+Efxplot(list(results$ndvi_change$model))
+
+# For mean temperature
+graphics.off()
+Efxplot(list(results$mean_temp$model))
+```
+
+INLA - setting priors in the model for NO2
+```{r}
+# Create stack
+stk_no2<- inla.stack(
+  data=list(y=all_data_inc$no2_change), # the response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  #the spatial index
+                               #the covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                               dt_dist = all_data_inc$dt_dist)))
+
+formula2_no2 <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  dt_dist +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+
+model2_no2 <- inla(
+  formula2_no2, 
+  data = inla.stack.data(stk_no2, spde=spde), 
+  family = 'gaussian',
+  control.fixed = list(
+    mean = list(
+      Intercept = -14.54,
+      score_0.5 = -0.01881,
+      med_income_ranked = -0.0001338,
+      dt_dist = 0  # Keeping as is since no prior info
+    ),
+    prec = list(
+      Intercept = 1/(0.03376)^2,
+      score_0.5 = 1/(0.02485)^2,
+      med_income_ranked = 1/(0.00003092)^2,
+      dt_dist = 1  # Keeping default precision
+    )
+  ),
+  control.predictor = list(A=inla.stack.A(stk_no2), compute=TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
+  verbose = FALSE
+)
+graphics.off()
+Efxplot(list(model2_no2))
+
+```
+
+INLA tools set up
+```{r}
+# ip <- rownames(installed.packages())
+# if (!"remotes" %in% ip) {
+#   install.packages("remotes")
+# }
+# if (!"INLA" %in% ip) {
+#   install.packages(
+#     "INLA", 
+#     repos = c(getOption("repos"), "https://inla.r-inla-download.org/R/stable")
+#   )
+# }
+# remotes::install_github("inbo/inlatools")
+```
+INLA diagnostics
+```{r}
+distribution_check(model1, nsim = 1000)
+
+
+```
+
+Old INLA code 
+```{r}
+# # Making the A matrix (JH - A matrix is not the same as MeshA, this is using MeshB)
+# 
+# Matrix_A <- inla.spde.make.A(Mesh, loc = Locations) # Making A matrix
+# Hosts.spde = inla.spde2.pcmatern(mesh = Mesh, prior.range = c(10, 0.5), prior.sigma = c(.5, .5)) # Making SPDE ##JH- NOT SURE ABOUT PRIOR RANGE THIS WAS FROM THE TUTORIAL
+# 
+# Matrix_A_no_prior <- inla.spde.make.A(Mesh, loc = Locations) # Making A matrix
+# 
+# 
+# # use frequentist results to inform the priors for the inla - range of effect estimates from gam
+# #using the priors as a starting point for simulations 
+# #try a few different priors to see how stable results are in the posteriors --? pick a few different parameterizations of models and use them as the starting points.
+# 
+# w.Host <- inla.spde.make.index('w', n.spde = Hosts.spde$n.spde) # making the w
+# 
+# # Making the model matrix #### 
+# 
+# # make the model matrix using the final model selection formula without a response variable
+# #trying with IM_PM_1 specifications
+# X0 <- model.matrix(~ score_0.5 + med_income_ranked, family = "gaussian", data = all_data_inc) 
+# # convert to a data frame. Eliminate the base level of the first categorical variable if applicable (you will manually specify an intercept below)  (JH - not applicable?)
+# X <- as.data.frame(X0) 
+# 
+# head(X)
+# 
+# # Making the stack #### 
+# #did not add county as random effect here. if want to, need to first update X to include it. column names in X need to match effect names when specifying the stack and the vector length of A.
+# 
+# N <- nrow(all_data_inc)
+# 
+# # this code used to work?? but now gets an error.
+# # Stack <- inla.stack(
+# #   data = list(y = all_data_inc$pm_change), # specify the response variable
+# #   
+# #   A = list(1, 1, Matrix_A), # Vector of Multiplication factors for random and fixed effects              
+# #   
+# #   effects = list(
+# #     
+# #     Intercept = rep(1, N), # specify the manual intercept!
+# #     
+# #     X = X, # attach the model matrix
+# #     
+# #     w = w.Host)) # attach the w 
+# 
+# #revised above code that runs as o 16.12.24
+# Stack <- inla.stack(
+#   data = list(y = all_data_inc$pm_change),
+#   A = list(1, 1, Matrix_A_no_prior),
+#   effects = list(
+#     Intercept = rep(1, N),
+#     X = X[, c("score_0.5", "med_income_ranked")],  # Exclude intercept column
+#     spatial = w.Host$w
+#   )
+# )
+# # adding stack to model
+# f1 <- as.formula(paste0("y ~ -1 + Intercept + ", paste0(colnames(X), collapse = " + ")))
+# 
+# IM1 <- inla(f1, # Base model (no random effects)
+#             family = "gaussian",
+#             data = inla.stack.data(Stack),
+#             control.compute = list(dic = TRUE),
+#             control.predictor = list(A = inla.stack.A(Stack))
+# )
+# 
+# Efxplot(list(IM1))
+# summary(IM1)
+# 
+# ##look into the warnings.
+# 
+# #look into diagnostics e.g., convergence plots, measure of conversion  rhat - but don't rely on it - see if it's a thing in INLA
+
+# ### Model fitting
+# 
+# #maybe not supposed to include score_0.5 here??
+# #model0 not accounting for stack/covariates
+# formula0<- y ~ -1 + Intercept + f(spatial.field, model=spde) 
+# 
+# 
+# model0 <- inla(formula0,
+#                data = list (y = all_data_inc$pm_change,
+#                             Intercept = rep(1,spde$n.spde),
+#                             spatial.field = 1:spde$n.spde),
+#                control.predictor = list (A = A, compute = T),
+#                control.compute = list (cpo = T))
+# 
+# round(model0$summary.fixed,3)
+# round(model0$summary.hyperpar[1,],3)
+
+
+# model0<-inla(formula0, #the formula
+#              data= inla.stack.data(stk,spde=spde),  #the data stack
+#              family= 'gaussian',   #which family the data comes from
+#              control.predictor=list(A=inla.stack.A(stk),compute=TRUE),  #compute gives you the marginals of the linear predictor
+#              control.compute = list(dic = TRUE, waic = TRUE, config = TRUE), #model diagnostics and config = TRUE gives you the GMRF
+#              verbose = FALSE) #can include verbose=TRUE to see the log of the model runs
+
+
+```
+
+
+```{r}
+
+```
+
+
+
+
+Neighbor relationships for MRF smooth model
+```{r}
+# Establish neighbor relationships for MRF model
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+```
+
+PM 2.5 MRF smooth model
+```{r}
+# MRF smooth model for pm 2.5
+mrf_income_pm <- bam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=200, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+
+mrf_income_pm_15 <- bam(pm_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+
+
+#changing the k, whether or not income has a spline/log/nothing affects sig of score_0.5; k needs to be at least 15 for residuals etc to be okay (k=15 highest sig but maybe not best diagnostic plots); k needs to be at least ~400 for Moran's I to be insignificant
+
+summary(mrf_income_pm)
+gam.check(mrf_income_pm)
+concurvity(mrf_income_pm, full = TRUE)
+
+summary(mrf_income_pm_15)
+gam.check(mrf_income_pm_15)
+
+##### Calculating Moran's I to assess residual spatial autocorrelation #####
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_pm)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+### Create Moran's I plot ###
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+
+```
+
+O3 MRF smooth model
+```{r}
+#MRF smooth model for o3
+mrf_income_o3 <- bam(o3_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=450, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+
+summary(mrf_income_o3)
+gam.check(mrf_income_o3)
+concurvity(mrf_income_o3, full = TRUE)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_o3)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+### Create Moran's I plot ###
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+
+
+NO2 MRF smooth model
+```{r}
+#MRF smooth model for NO2
+mrf_income_no2 <- bam(no2_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+
+#at k=5 is significant but residuals weird, when k increases, residuals and stuff still patterned-ish but better overall and no longer sig
+
+summary(mrf_income_no2)
+gam.check(mrf_income_no2)
+concurvity(mrf_income_no2, full = TRUE)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_no2)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+### Create Moran's I plot ###
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+
+NDVI MRF smooth model
+```{r}
+#MRF smooth model for NDVI
+# Create clean dataset without 8 NA values (follow up)
+all_data_inc_clean <- all_data_inc[is.finite(all_data_inc$ndvi_change), ]
+
+# Create new neighborhood structure from cleaned data
+nb_clean <- poly2nb(all_data_inc_clean)
+names(nb_clean) <- all_data_inc_clean$GEOID
+
+mrf_income_ndvi <- bam(ndvi_change ~ score_0.5 + med_income_ranked + 
+                      s(GEOID, bs='mrf', k=300, xt=list(nb=nb_clean)), 
+                      family = scat, data = all_data_inc_clean, method = "REML")
+
+
+# 
+# mrf_income_ndvi <- bam(ndvi_change ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=300, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML") 
+
+summary(mrf_income_ndvi)
+gam.check(mrf_income_ndvi)
+concurvity(mrf_income_ndvi, full = TRUE) 
+
+#K NEEDS TO BE 300 FOR MORANS I TO BE INSIGNIFICANT
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_ndvi)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+### Create Moran's I plot ###
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+
+Mean Temp MRF smooth model
+```{r}
+#MRF smooth model for 2016 mean temp
+mrf_income_temp <- bam(mean_temp ~ score_0.5 + med_income_ranked + s(GEOID, bs='mrf', k=400, xt=list(nb=nb)), family = scat, data = all_data_inc, method = "REML")  
+#terrible residual plots
+
+summary(mrf_income_temp)
+gam.check(mrf_income_temp)
+concurvity(mrf_income_temp, full = TRUE)
+
+#####Calculating Moran's I to assess residual spatial autocorrelation
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_ndvi)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+### Create Moran's I plot ###
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+```
+
+Creating composite z-score for environmental exposures
+```{r}
+# Calculate z-scores for each variable
+all_data_inc$pm_z <- scale(all_data_inc$pm_change)
+all_data_inc$o3_z <- scale(all_data_inc$o3_change)
+all_data_inc$no2_z <- scale(all_data_inc$no2_change)
+all_data_inc$ndvi_z <- scale(all_data_inc$ndvi_change)
+all_data_inc$temp_z <- scale(all_data_inc$mean_temp)
+
+# Create composite z-score (average of all z-scores)
+all_data_inc$composite_z <- rowMeans(
+  cbind(
+    all_data_inc$pm_z,
+    all_data_inc$o3_z,
+    all_data_inc$no2_z,
+    all_data_inc$ndvi_z,
+    all_data_inc$temp_z
+  ),
+  na.rm = TRUE
+)
+
+summary(all_data_inc$composite_z)
+hist(all_data_inc$composite_z)
+shapiro.test(all_data_inc$composite_z)
+
+qqnorm(all_data_inc$composite_z)
+
+# Save composite_z to new data frame and export
+# composite_z <- all_data_inc  %>% 
+#   dplyr::select(GEOID, score_0.5, composite_z, med_income_2000_impute, med_income_ranked, lat, long)  
+# composite_z <- as.data.frame(composite_z)
+# 
+# # Write only the non-geometry columns
+# write.csv(composite_z[, 1:7], here("composite_z.csv"), 
+#           row.names = FALSE,
+#           quote = TRUE)  # Changed to TRUE to handle the GEOID factor
+# 
+# # Read it back 
+# composite_z <- read.csv(here("composite_z.csv"), 
+#          check.names = FALSE,
+#          stringsAsFactors = FALSE)
+
+
+```
+
+GAM model using composite z-score
+```{r}
+# Create new GAM model with composite z-score
+mrf_income_composite <- bam(
+  composite_z ~ score_0.5 + med_income_ranked + 
+    s(GEOID, bs='mrf', k=563, xt=list(nb=nb)),
+  family = scat,
+  data = all_data_inc,
+  method = "REML"
+) 
+
+#sig when k = 100 but Moran's I is 0.265, insig when k = 300, Moran's I is 0.074 but p is sig
+ 
+summary(mrf_income_composite)
+gam.check(mrf_income_composite)
+
+##### Calculating Moran's I to assess residual spatial autocorrelation ##### 
+
+# First identify areas with no neighbors
+no_neighbors <- which(card(nb) == 0)
+if(length(no_neighbors) > 0) {
+    print("Areas with no neighbors:")
+    print(no_neighbors)
+}
+
+# Use zero.policy = TRUE (keeping all observations - isolated tracts given a weight of zero?)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Get model residuals
+residuals <- residuals(mrf_income_composite)
+
+# Perform Moran's I test with zero.policy
+moran_test <- moran.test(residuals, listw, zero.policy = TRUE)
+print(moran_test)
+
+### Create Moran's I plot ###
+
+# Calculate lagged residuals with zero.policy
+lag_residuals <- lag.listw(listw, residuals, zero.policy = TRUE)
+
+# Create data frame for plotting
+moran_df <- data.frame(
+    residuals = residuals,
+    lag_residuals = lag_residuals
+)
+
+# Moran scatter plot
+ggplot(moran_df, aes(x = residuals, y = lag_residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        x = "Residuals",
+        y = "Spatially Lagged Residuals",
+        title = "Moran's I Scatter Plot of GAM Residuals",
+        subtitle = paste("Moran's I =", round(moran_test$estimate[1], 3),
+                        "\np-value =", round(moran_test$p.value, 3))
+    ) +
+    theme_minimal()
+
+```
+
+Testing k vs Moran's I for MRF composite model
+```{r}
+# Function to get number of unique locations
+n_locations <- length(unique(all_data_inc$GEOID))
+
+# Calculate minimum suggested k
+k_min <- ceiling(n_locations^(1/3))  # cube root rule of thumb
+
+# Define sequence of k values to test
+k_values <- seq(k_min, 500, by = 50)
+
+# Function to run k.check for multiple k values
+test_k_values <- function(data, k_values) {
+  results <- data.frame(
+    k = numeric(),
+    edf = numeric(),
+    k_index = numeric(),
+    p_value = numeric(),
+    gcv = numeric()
+  )
+  
+  for(k in k_values) {
+    cat(sprintf("\nTesting k = %d\n", k))
+    
+    # Fit model with current k
+    tryCatch({
+      test_model <- bam(
+        composite_z ~ score_0.5 + med_income_ranked + 
+          s(GEOID, bs='mrf', k=k, xt=list(nb=nb)),
+        family = scat,
+        data = data,
+        method = "REML"
+      )
+      
+      # Extract model summary
+      model_summary <- summary(test_model)
+      
+      # Get basic diagnostics that don't depend on gam.check
+      new_row <- data.frame(
+        k = k,
+        edf = sum(model_summary$edf),
+        k_index = NA,  # Will be filled if gam.check works
+        p_value = NA,  # Will be filled if gam.check works
+        gcv = test_model$gcv.ubre
+      )
+      
+      # Try to get gam.check results
+      tryCatch({
+        check <- gam.check(test_model)
+        new_row$k_index <- check$k.index
+        new_row$p_value <- check$s.table[4]
+      }, error = function(e) {
+        cat(sprintf("Warning: Could not compute gam.check for k=%d\n", k))
+      })
+      
+      results <- rbind(results, new_row)
+      
+    }, error = function(e) {
+      cat(sprintf("Error fitting model for k=%d: %s\n", k, e$message))
+    })
+  }
+  return(results)
+}
+
+# Print minimum suggested k
+cat(sprintf("Minimum suggested k based on number of locations: %d\n", k_min))
+
+# Test k values
+k_results <- test_k_values(all_data_inc, k_values)
+
+# Print results
+print(k_results)
+
+# Plot available results
+par(mfrow=c(2,2))
+
+# Only plot if we have results
+if(nrow(k_results) > 0) {
+  # P-value plot (if available)
+  if(!all(is.na(k_results$p_value))) {
+    plot(k_results$k, k_results$p_value, type="b", 
+         main="P-value vs k", xlab="k", ylab="p-value")
+  }
+  
+  # GCV plot
+  plot(k_results$k, k_results$gcv, type="b", 
+       main="GCV Score vs k", xlab="k", ylab="GCV")
+  
+  # EDF plot
+  plot(k_results$k, k_results$edf, type="b", 
+       main="EDF vs k", xlab="k", ylab="Effective Degrees of Freedom")
+  
+  # k-index plot (if available)
+  if(!all(is.na(k_results$k_index))) {
+    plot(k_results$k, k_results$k_index, type="b", 
+         main="k-index vs k", xlab="k", ylab="k-index")
+  }
+}
+
+# Function to get Moran's I for model residuals
+check_spatial_autocorr <- function(model, nb) {
+  residuals <- residuals(model)
+  moran_test <- spdep::moran.test(residuals, 
+                                 spdep::nb2listw(nb, zero.policy=TRUE),
+                                 zero.policy=TRUE)
+  return(c(
+    moran_i = moran_test$estimate[1],
+    p_value = moran_test$p.value
+  ))
+}
+
+# Check which areas have no neighbors
+n_neighbors <- sapply(nb, length)
+isolated_areas <- which(n_neighbors == 0)
+if(length(isolated_areas) > 0) {
+  cat("Areas with no neighbors:\n")
+  print(isolated_areas)
+}
+
+# Function to get Moran's I for model residuals
+check_spatial_autocorr <- function(model, nb) {
+  residuals <- residuals(model)
+  moran_test <- spdep::moran.test(residuals, 
+                                 spdep::nb2listw(nb, zero.policy=TRUE),
+                                 zero.policy=TRUE)
+  return(moran_test)  # Return the full test object
+}
+
+# Calculate Moran's I for raw composite z-score
+raw_moran <- spdep::moran.test(all_data_inc$composite_z, 
+                              spdep::nb2listw(nb, zero.policy=TRUE),
+                              zero.policy=TRUE)
+cat(sprintf("\nRaw data Moran's I:\n"))
+cat(sprintf("Moran's I statistic: %.3f\n", raw_moran$estimate["Moran I statistic"]))
+cat(sprintf("p-value: %.3e\n", raw_moran$p.value))
+
+# Test k values and check both model fit and spatial autocorrelation
+test_k_values <- function(data, k_values, raw_moran) {
+  results <- data.frame()
+  
+  # Store raw Moran's I value
+  raw_moran_i <- raw_moran$estimate["Moran I statistic"]
+  
+  for(k in k_values) {
+    cat(sprintf("\nTesting k = %d\n", k))
+    
+    # Fit model
+    test_model <- gam(
+      composite_z ~ score_0.5 + med_income_ranked + 
+        s(GEOID, bs='mrf', k=k, xt=list(nb=nb)),
+      family = scat,
+      data = data,
+      method = "REML"
+    )
+    
+    # Get model summary
+    model_summary <- summary(test_model)
+    
+    # Get Moran's I results
+    moran_results <- check_spatial_autocorr(test_model, nb)
+    residual_moran_i <- moran_results$estimate["Moran I statistic"]
+    
+    # Calculate reduction in Moran's I
+    moran_reduction <- ((raw_moran_i - residual_moran_i) / abs(raw_moran_i)) * 100
+    
+    # Store results
+    results <- rbind(results,
+      data.frame(
+        k = k,
+        edf = sum(model_summary$edf),
+        score = test_model$gcv.ubre,
+        moran_i = residual_moran_i,
+        moran_p = moran_results$p.value,
+        moran_reduction = moran_reduction
+      )
+    )
+    
+    # Print current results
+    cat(sprintf("EDF: %.1f\n", sum(model_summary$edf)))
+    cat(sprintf("Score: %.3f\n", test_model$gcv.ubre))
+    cat(sprintf("Residual Moran's I: %.3f (p=%.3e)\n", 
+                residual_moran_i, moran_results$p.value))
+    cat(sprintf("Reduction in Moran's I: %.1f%%\n", moran_reduction))
+  }
+  return(results)
+}
+
+# Test reasonable k values
+k_values <- c(113, 163, 213, 263, 313, 363, 413, 463, 513, 563)
+k_values_2 <- c(613, 663, 713, 763, 813)
+k_results <- test_k_values(all_data_inc, k_values, raw_moran)
+k_results_2 <- test_k_values(all_data_inc, k_values_2, raw_moran)
+
+
+# Print final comparison table
+cat("\nSummary Results:\n")
+print(data.frame(
+  k = k_results$k,
+  EDF = round(k_results$edf, 1),
+  Score = round(k_results$score, 3),
+  Morans_I = round(k_results$moran_i, 3),
+  Moran_p = format(k_results$moran_p, scientific = TRUE),
+  Reduction = sprintf("%.1f%%", k_results$moran_reduction)
+))
+
+# Plot results
+par(mfrow=c(2,3))
+
+# Score vs k
+plot(k_results$k, k_results$score, type="b", 
+     main="Score vs k", xlab="k", ylab="Score")
+
+# EDF vs k
+plot(k_results$k, k_results$edf, type="b", 
+     main="EDF vs k", xlab="k", ylab="Effective Degrees of Freedom")
+
+# Moran's I vs k
+plot(k_results$k, k_results$moran_i, type="b", 
+     main="Moran's I vs k", xlab="k", ylab="Moran's I")
+abline(h=raw_moran$estimate["Moran I statistic"], col="red", lty=2)
+text(k_values[1], raw_moran$estimate["Moran I statistic"], 
+     "Raw Data Moran's I", pos=3, col="red")
+
+# Moran's p-value vs k
+plot(k_results$k, k_results$moran_p, type="b", 
+     main="Moran's I p-value vs k", xlab="k", ylab="p-value")
+abline(h=0.05, col="red", lty=2)
+
+# Reduction in Moran's I
+plot(k_results$k, k_results$moran_reduction, type="b",
+     main="% Reduction in Moran's I",
+     xlab="k", 
+     ylab="Percent Reduction")
+```
+
+Hurricane evacuation zones
+```{r}
+# Load hurricane evauation zones shapefile 
+hurricane <- st_read(here("data", "hurricane_evacuation_zones.shp"))
+
+# Extract residuals and prepare data
+all_data_inc$mrf_residuals <- residuals(mrf_income_composite)
+
+# Clean geometries
+hurricane_clean <- hurricane %>%
+  st_make_valid() %>%
+  st_buffer(0) %>%
+  st_transform(st_crs(all_data_inc))
+
+all_data_inc_clean <- all_data_inc %>%
+  st_make_valid() %>%
+  st_buffer(0)
+
+# Use centroids for spatial join
+tract_centroids <- all_data_inc_clean %>%
+  st_centroid() %>%
+  select(GEOID, mrf_residuals)
+
+# Spatial join with hurricane zones
+combined_data <- st_join(
+  tract_centroids,
+  hurricane_clean %>% select(hurricane_),
+  join = st_intersects
+) %>%
+  filter(!is.na(hurricane_))
+
+# Statistical Analysis
+
+# ANOVA test
+anova_result <- aov(mrf_residuals ~ hurricane_, data = combined_data)
+anova_summary <- summary(anova_result)
+
+# Kruskal-Wallis test
+kw_result <- kruskal.test(mrf_residuals ~ hurricane_, data = combined_data)
+
+# Summary statistics by zone 
+zone_summary <- combined_data %>%
+  st_drop_geometry() %>%
+  group_by(hurricane_) %>%
+  summarise(
+    count = length(mrf_residuals),
+    mean_residual = mean(mrf_residuals, na.rm = TRUE),
+    median_residual = median(mrf_residuals, na.rm = TRUE),
+    sd_residual = sd(mrf_residuals, na.rm = TRUE),
+    extreme_count = sum(abs(mrf_residuals) > 2*sd(mrf_residuals, na.rm = TRUE), na.rm = TRUE)
+  ) %>%
+  mutate(
+    extreme_percentage = (extreme_count / count) * 100
+  )
+
+# Box plot
+residual_plot <- ggplot(combined_data %>% st_drop_geometry(), 
+                       aes(x = factor(hurricane_), y = mrf_residuals)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  theme_minimal() +
+  labs(
+    title = "MRF Model Residuals by Hurricane Evacuation Zone",
+    x = "Hurricane Zone",
+    y = "Residuals"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Spatial visualization
+viz_data <- all_data_inc_clean %>%
+  left_join(
+    combined_data %>% 
+      st_drop_geometry() %>%
+      select(GEOID, hurricane_),
+    by = "GEOID"
+  )
+
+spatial_plot <- ggplot() +
+  geom_sf(data = viz_data, aes(fill = hurricane_)) +
+  scale_fill_viridis_d(na.value = "grey80") +
+  theme_minimal() +
+  labs(
+    title = "Hurricane Evacuation Zones with MRF Model Residuals",
+    fill = "Hurricane Zone"
+  )
+
+# Scatter plot 
+scatter_plot <- ggplot(combined_data %>% st_drop_geometry(), 
+                      aes(x = factor(hurricane_), y = mrf_residuals)) +
+  geom_jitter(alpha = 0.5, width = 0.2) +
+  stat_summary(fun = mean, geom = "point", color = "red", size = 3) +
+  stat_summary(fun = mean, geom = "line", color = "red", group = 1) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +
+  theme_minimal() +
+  labs(
+    title = "Residuals Distribution by Hurricane Zone",
+    subtitle = "Red points and line show mean values",
+    x = "Hurricane Zone",
+    y = "Residuals"
+  )
+
+
+# Test for normality within each zone
+normality_tests <- combined_data %>%
+  st_drop_geometry() %>%
+  group_by(hurricane_) %>%
+  summarise(
+    sample_size = length(mrf_residuals),
+    shapiro_p_value = if(length(mrf_residuals) >= 3 && 
+                        length(mrf_residuals) <= 5000) {
+      shapiro.test(mrf_residuals)$p.value
+    } else {
+      NA
+    }
+  )
+
+# Print results
+cat("\nSummary Statistics by Hurricane Zone:\n")
+print(zone_summary)
+
+cat("\nANOVA Results:\n")
+print(anova_summary)
+
+cat("\nKruskal-Wallis Test Results:\n")
+print(kw_result)
+
+cat("\nNormality Test Results by Zone:\n")
+print(normality_tests)
+
+# Calculate effect size (Eta-squared)
+ss_total <- sum((combined_data$mrf_residuals - mean(combined_data$mrf_residuals))^2)
+eta_squared <- anova_summary[[1]]$"Sum Sq"[1] / ss_total
+
+cat("\nEffect Size (Eta-squared):", round(eta_squared, 4), "\n")
+
+# Display plots
+print(residual_plot)
+print(spatial_plot)
+print(scatter_plot)
+
+# Store all results in a list
+results <- list(
+  summary_stats = zone_summary,
+  anova_results = anova_summary,
+  kruskal_wallis = kw_result,
+  normality_tests = normality_tests,
+  effect_size = eta_squared
+)
+```
+
+```{r}
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(rstatix)
+library(dunn.test)
+library(effsize)
+
+# Perform pairwise t-tests with multiple comparison adjustment
+pairwise_tests <- pairwise.t.test(
+  combined_data$mrf_residuals,
+  combined_data$hurricane_,
+  p.adjust.method = "bonferroni"
+)
+
+pairwise_tests
+
+# Perform Dunn test (non-parametric alternative)
+dunn_test <- dunn.test(
+  combined_data$mrf_residuals,
+  combined_data$hurricane_,
+  method = "bonferroni"
+)
+
+# Create pairwise comparison visualization using ggplot2
+# Convert matrix to long format for plotting
+p_value_matrix <- as.matrix(pairwise_tests$p.value)
+p_value_df <- as.data.frame(p_value_matrix) %>%
+  mutate(group1 = rownames(.)) %>%
+  pivot_longer(
+    cols = -group1,
+    names_to = "group2",
+    values_to = "p_value"
+  ) %>%
+  filter(!is.na(p_value))
+
+# Create heatmap
+ggplot(p_value_df, aes(x = group1, y = group2, fill = -log10(p_value))) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", p_value)), size = 3) +
+  scale_fill_gradient2(
+    low = "white",
+    high = "red",
+    mid = "pink",
+    midpoint = -log10(0.05),
+    name = "-log10(p-value)"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Pairwise Comparisons of Hurricane Zone Residuals",
+    subtitle = "Bonferroni-adjusted p-values",
+    x = "Zone",
+    y = "Zone"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#interpret???
+```
+
+```{r}
+```
+
+#########################################
+########################################
+
+ANALYZE COOK DISTANCE AND RESIDUALS ETC FOR MRF MODELS
+```{r}
+# Calculate Cook's distance
+cooks_d <- cooks.distance(mrf_income_pm)
+plot(cooks_d, type = "h", main = "Cook's Distance")
+abline(h = 4/length(cooks_d), col = "red")  # Rule of thumb threshold
+
+# Identify potential influential points
+influential <- which(cooks_d > 4/length(cooks_d))
+
+influential_data <- all_data_inc[influential, ]
+print(influential_data)  # Look at characteristics of these points
+
+# Investigate why these points are influential:
+# Plot their locations
+plot(all_data_inc_na$long, all_data_inc_na$lat)
+points(all_data_inc_na$long[influential], 
+       all_data_inc_na$lat[influential], 
+       col = "red", pch = 16)
+
+```
+
+################################
+
+```{r}
+
+library(purrr)
+library(ggplot2)
+
+# List of model names
+model_names <- c(
+  "mrf_income_pm", "mrf_income_pm_baseline", "mrf_income_pm_5",
+  "mrf_income_o3", "mrf_income_o3_baseline",
+  "mrf_income_no2", "mrf_income_no2_baseline", "mrf_income_no2_15",
+  "mrf_income_ndvi", "mrf_income_ndvi_baseline", "mrf_income_ndvi_15",
+  "mrf_income_temp"
+)
+
+# Function to calculate Cook's Distance, plot results, and identify influential points
+process_model <- function(model_name) {
+  
+  # Retrieve the model from the global environment using get()
+  model <- get(model_name)
+  
+  # Calculate Cook's Distance
+  cooks_d <- cooks.distance(model)
+  
+  # Plot Cook's Distance with model name in title
+  plot(cooks_d, type = "h", main = paste("Cook's Distance:", model_name))
+  abline(h = 4/length(cooks_d), col = "red")  # Rule of thumb threshold
+  
+  # Identify influential points
+  influential <- which(cooks_d > 4/length(cooks_d))
+  
+  # Retrieve the data for the influential points
+  influential_data <- all_data_inc[influential, ]
+  print(paste("Influential points for", model_name))
+  print(influential_data)  # Look at characteristics of these points
+  
+  # Plot the locations of influential points on the map
+  plot(all_data_inc_na$long, all_data_inc_na$lat,
+       main = paste("Influential Points for", model_name),  # Add model name to the map plot title
+       xlab = "Longitude", ylab = "Latitude")
+  points(all_data_inc_na$long[influential], 
+         all_data_inc_na$lat[influential], 
+         col = "red", pch = 16)
+  
+  return(influential_data)
+}
+
+# Use purrr::map to apply the function to all models
+influential_points_list <- map(model_names, process_model)
+
+# If you want to inspect the influential points for each model, you can print the list
+influential_points_list
+
+```
+trying SLM and SEM models again (no spatial autocorrelation, but linear so qqplots bad)
+```{r}
+
+#### QQ plots with confidence intervals
+get_qq_plot <- function(model) {
+  
+  model_resid <- data.frame(residuals = model$residuals)
+  
+  plot <- ggplot(data = model_resid, mapping = aes(sample = residuals)) + 
+    geom_qq_band(bandType = "ks", mapping = aes(fill = "KS"), alpha = 0.5) +
+    geom_qq_band(bandType = "ts", mapping = aes(fill = "TS"), alpha = 0.5) +
+    geom_qq_band(bandType = "pointwise", mapping = aes(fill = "Normal"), alpha = 0.5) +
+    geom_qq_band(bandType = "boot", mapping = aes(fill = "Bootstrap"), alpha = 0.5) +
+    stat_qq_band() +
+    stat_qq_line() +
+    stat_qq_point()
+  
+  return(plot)
+}
+
+############## SLM and SEM models
+
+vars <- list("pm_change", "o3_change", "no2_change", "ndvi_change", "mean_temp")
+
+# build linear models to test spatial error and spatial lag terms
+pm_lm <- lm(pm_change ~ score_0.5 + med_income_ranked, data = all_data_inc)
+
+# testing spatial error model
+lm.RStests(pm_lm, ny.6, test="RSerr", zero.policy = T) # significant p value
+# testing spatial lag model
+lm.RStests(pm_lm, ny.6, test="RSerr", zero.policy = T) # significant p value
+
+# fit spatial error models
+get_sem <- function(var) {
+  
+  data_sem <- all_data_inc %>% 
+    rename(dv = all_of(var))
+  
+  sem <- errorsarlm(dv ~ score_0.5 + med_income_ranked, data = data_sem, listw = ny.6, zero.policy = TRUE)
+  
+  return(sem)
+}
+
+sem_list <- lapply(vars, get_sem)
+
+# fit spatial lag models
+get_slm <- function(var) {
+  
+  data_slm <- all_data_inc %>% 
+    rename(dv = all_of(var))
+  
+  slm <- lagsarlm(dv ~ score_0.5 + med_income_ranked, data = data_slm, listw = ny.6, zero.policy = TRUE)
+  
+  return(slm)
+}
+
+slm_list <- lapply(vars, get_slm)
+
+# test residuals
+moran_sem <- purrr::map(sem_list, ~ moran.test(.x$residuals, ny.6)) 
+moran_slm <- purrr::map(slm_list, ~ moran.test(.x$residuals, ny.6))
+
+# qq plots
+qq_sem <- lapply(sem_list, get_qq_plot)
+qq_slm <- lapply(slm_list, get_qq_plot)
+
+grid.arrange(qq_sem[[1]], qq_sem[[2]], qq_sem[[3]], qq_sem[[4]], qq_sem[[5]])
+grid.arrange(qq_slm[[1]], qq_slm[[2]], qq_slm[[3]], qq_slm[[4]], qq_slm[[5]])
+
+# stratified SLM
+get_slm_strat <- function(countyfp) {
+  
+  # filter data for county/borough
+  data_borough <- all_data_inc %>% 
+    filter(COUNTYFP %in% countyfp)
+  
+  # list all exposure variables for borough dataset
+  exposures <- list(data_borough$pm_change, data_borough$o3_change, data_borough$no2_change,
+                    data_borough$ndvi_change, data_borough$mean_temp)
+  
+  # identify neighbor relationships
+  spdat.sens_borough <- as_Spatial(data_borough)
+  ny.6_borough <- knearneigh(sp::coordinates(spdat.sens_borough), k=6)
+  ny.6_borough <- knn2nb(ny.6_borough)
+  ny.6_borough <- make.sym.nb(ny.6_borough)
+  ny.6_borough <- nb2listw(ny.6_borough, style="W")
+  
+  get_slm <- function(exposure) {
+    
+    # assign exposure of interest as "var" variable
+    data_borough <- data_borough %>% 
+      mutate(var = exposure)
+    
+    slm <- lagsarlm(var ~ score_0.5 + med_income_ranked, data = data_borough, listw = ny.6_borough, zero.policy = TRUE)
+    
+    return(slm)
+  }
+  
+  models <- lapply(exposures, get_slm)
+  
+  return(models)
+}
+
+countyfp <- list("005", "047", "061", "081", "085")
+
+  # filter data for county/borough
+  data_borough <- all_data_inc %>% 
+    filter(COUNTYFP %in% countyfp)
+  
+  # list all exposure variables for borough dataset
+  exposures <- list(data_borough$pm_change, data_borough$o3_change, data_borough$no2_change,
+                    data_borough$ndvi_change, data_borough$mean_temp)
+  
+ 
+
+slm_strat <- lapply(countyfp, get_slm_strat) %>% 
+  # flatten list of 25 models - PM2.5, O3, NO2, NDVI, temp, for 5 boroughs
+  unlist(recursive = FALSE)
+
+qq_slm_strat <- lapply(slm_strat, get_qq_plot)
+
+# Bronx
+grid.arrange(qq_slm_strat[[1]], qq_slm_strat[[2]], qq_slm_strat[[3]], qq_slm_strat[[4]], qq_slm_strat[[5]])
+# Brooklyn
+grid.arrange(qq_slm_strat[[6]], qq_slm_strat[[7]], qq_slm_strat[[8]], qq_slm_strat[[9]], qq_slm_strat[[10]])
+# Manhattan
+grid.arrange(qq_slm_strat[[11]], qq_slm_strat[[12]], qq_slm_strat[[13]], qq_slm_strat[[14]], qq_slm_strat[[15]])
+# Queens
+grid.arrange(qq_slm_strat[[16]], qq_slm_strat[[17]], qq_slm_strat[[18]], qq_slm_strat[[19]], qq_slm_strat[[20]])
+# Staten Island
+grid.arrange(qq_slm_strat[[21]], qq_slm_strat[[22]], qq_slm_strat[[23]], qq_slm_strat[[24]], qq_slm_strat[[25]])
+
+# stratified SEM
+get_sem_strat <- function(countyfp) {
+  
+  # filter data for county/borough
+  data_borough <- all_data_inc %>% 
+    filter(COUNTYFP %in% countyfp)
+  
+  # list all exposure variables for borough dataset
+  exposures <- list(data_borough$pm_change, data_borough$o3_change, data_borough$no2_change,
+                    data_borough$ndvi_change, data_borough$mean_temp)
+  
+  # identify neighbor relationships
+  spdat.sens_borough <- as_Spatial(data_borough)
+  ny.6_borough <- knearneigh(sp::coordinates(spdat.sens_borough), k=6)
+  ny.6_borough <- knn2nb(ny.6_borough)
+  ny.6_borough <- make.sym.nb(ny.6_borough)
+  ny.6_borough <- nb2listw(ny.6_borough, style="W")
+  
+  get_sem <- function(exposure) {
+    
+    # assign exposure of interest as "var" variable
+    data_borough <- data_borough %>% 
+      mutate(var = exposure)
+    
+    sem <- errorsarlm(var ~ score_0.5 +  + dt_dist, data = data_borough, listw = ny.6_borough, zero.policy = TRUE)
+    
+    return(sem)
+  }
+  
+  models <- lapply(exposures, get_sem)
+  
+  return(models)
+}
+
+sem_strat <- lapply(countyfp, get_sem_strat) %>% 
+  # flatten list of 25 models - PM2.5, O3, NO2, NDVI, temp, for 5 boroughs
+  un(recursive = FALSE)
+
+qq_sem_strat <- lapply(sem_strat, get_qq_plot)
+
+# Bronx
+grid.arrange(qq_sem_strat[[1]], qq_sem_strat[[2]], qq_sem_strat[[3]], qq_sem_strat[[4]], qq_sem_strat[[5]])
+# Brooklyn
+grid.arrange(qq_sem_strat[[6]], qq_sem_strat[[7]], qq_sem_strat[[8]], qq_sem_strat[[9]], qq_sem_strat[[10]])
+# Manhattan
+grid.arrange(qq_sem_strat[[11]], qq_sem_strat[[12]], qq_sem_strat[[13]], qq_sem_strat[[14]], qq_sem_strat[[15]])
+# Queens
+grid.arrange(qq_sem_strat[[16]], qq_sem_strat[[17]], qq_sem_strat[[18]], qq_sem_strat[[19]], qq_sem_strat[[20]])
+# Staten Island
+grid.arrange(qq_sem_strat[[21]], qq_sem_strat[[22]], qq_sem_strat[[23]], qq_sem_strat[[24]], qq_sem_strat[[25]])
+```
+
+```{r}
+# Spatial Error Model with shifted data
+library(spatialreg)
+library(MASS)
+
+# Find minimum value and shift data to positive
+min_o3 <- min(all_data_inc$o3_change)
+shift_value <- abs(min_o3) + 1  # add 1 to ensure all positive values
+o3_shifted <- all_data_inc$o3_change + shift_value
+
+# Create model matrix for initial regression
+X <- model.matrix(~ score_0.5 + med_income_ranked + flood_hazard, data = all_data_inc)
+
+# Perform Box-Cox transformation on shifted data
+bc <- boxcox(lm(o3_shifted ~ X - 1), 
+             lambda = seq(-2, 2, by = 0.1),
+             plotit = TRUE)
+lambda <- bc$x[which.max(bc$y)]
+
+# Transform the shifted dependent variable
+if(abs(lambda) < 0.01) {
+    o3_transformed <- log(o3_shifted)
+    transform_type <- "log of shifted data"
+} else {
+    o3_transformed <- (o3_shifted^lambda - 1)/lambda
+    transform_type <- paste("Box-Cox with lambda =", round(lambda, 3), "on shifted data")
+}
+
+# Fit spatial error model
+spatial_error <- errorsarlm(o3_transformed ~ 
+                           score_0.5 + 
+                           med_income_ranked + flood_hazard,
+                           data = all_data_inc,
+                           listw = listw,
+                           zero.policy = TRUE)
+
+# Function to back-transform predictions
+back_transform <- function(pred) {
+    if(abs(lambda) < 0.01) {
+        return(exp(pred) - shift_value)
+    } else {
+        return((pred * lambda + 1)^(1/lambda) - shift_value)
+    }
+}
+
+# Check residuals
+residuals_sem <- residuals(spatial_error)
+listw <- nb2listw(nb, style="W", zero.policy=TRUE)
+moran_sem <- moran.test(residuals_sem, listw, zero.policy=TRUE)
+print("SEM Moran's I test:")
+print(moran_sem)
+
+
+# Print summaries
+print("Data transformation details:")
+print(paste("Minimum PM change value:", min_pm))
+print(paste("Shift applied:", shift_value))
+print(paste("Transformation type:", transform_type))
+print("\nSpatial Error Model Summary:")
+print(summary(spatial_error))
+
+# Function for spatial error model diagnostics
+spatial_diagnostics <- function(model, data) {
+    # Extract residuals and fitted values safely
+    resids <- residuals(model)  # Simplified residuals extraction
+    fitted_vals <- fitted(model)
+    
+    par(mfrow=c(2,2))
+    
+    # 1. Residuals vs Fitted
+    plot(fitted_vals, resids,
+         xlab="Fitted values",
+         ylab="Residuals",
+         main="Residuals vs Fitted",
+         type="n")  # Set up empty plot first
+    points(fitted_vals, resids, pch=19)  # Add points
+    abline(h=0, col="red", lty=2)
+    lines(lowess(fitted_vals, resids), col="blue")
+    
+    # 2. Normal Q-Q plot (simplified)
+    qqnorm(resids, main="Normal Q-Q Plot")  # Basic Q-Q plot
+    qqline(resids, col="red")
+    
+    # 3. Scale-Location plot
+    sqrt_abs_resids <- sqrt(abs(resids))
+    plot(fitted_vals, sqrt_abs_resids,
+         xlab="Fitted values",
+         ylab=expression(sqrt("|Standardized residuals|")),
+         main="Scale-Location",
+         type="n")  # Set up empty plot first
+    points(fitted_vals, sqrt_abs_resids, pch=19)  # Add points
+    lines(lowess(fitted_vals, sqrt_abs_resids), col="blue")
+    
+    # 4. Residual distribution plot
+    hist(resids, 
+         main="Distribution of Residuals",
+         xlab="Residuals",
+         breaks=30,
+         probability=TRUE)
+    lines(density(resids), col="blue", lwd=2)
+}
+
+# Generate predictions first
+spatial_preds <- back_transform(fitted(spatial_error))
+
+# Now create all plots
+# Spatial Error model diagnostics
+par(mfrow=c(2,2))
+spatial_diagnostics(spatial_error, all_data_inc)
+mtext("Spatial Error Model Diagnostics", side=3, line=-2, outer=TRUE)
+
+
+# Plot Spatial Error predictions
+plot(all_data_inc$pm_change, spatial_preds,
+     main="Spatial Error: Observed vs Predicted",
+     xlab="Observed", ylab="Predicted",
+     type="n")  # Set up empty plot first
+points(all_data_inc$pm_change, spatial_preds, pch=19)  # Add points
+abline(0,1, col="red")
+lines(lowess(all_data_inc$pm_change, spatial_preds), col="blue")
+
+# Reset plotting parameters
+par(mfrow=c(1,1))
+
+# Print some summary statistics of the predictions
+cat("\nSummary of Spatial Error predictions:\n")
+print(summary(spatial_preds))
+```
+###############################
+######################LOOK AT QQ PLOTS FOR SEM MODELS (RN JUST THE NORMAL MODEL QQPLOT BEFORE SEM)
+```{r}
+# Function to perform spatial error analysis with Box-Cox transformation
+spatial_error_analysis <- function(var_name, data, listw) {
+    dependent_var <- data[[var_name]]
+    
+    # Find minimum value and shift data to positive
+    min_val <- min(dependent_var)
+    shift_value <- abs(min_val) + 1  # add 1 to ensure all positive values
+    shifted_data <- dependent_var + shift_value
+    
+    # Create temporary data frame for Box-Cox
+    temp_data <- data.frame(
+        y = shifted_data,
+        score_0.5 = data$score_0.5,
+        med_income_ranked = data$med_income_ranked
+    )
+    
+    # Perform Box-Cox transformation on shifted data
+    bc <- boxcox(y ~ score_0.5 + med_income_ranked, 
+                 data = temp_data,
+                 lambda = seq(-2, 2, by = 0.1),
+                 plotit = FALSE)
+    lambda <- bc$x[which.max(bc$y)]
+    
+    # Transform the shifted dependent variable
+    if(abs(lambda) < 0.01) {
+        transformed_data <- log(shifted_data)
+        transform_type <- "log of shifted data"
+    } else {
+        transformed_data <- (shifted_data^lambda - 1)/lambda
+        transform_type <- paste("Box-Cox with lambda =", round(lambda, 3), "on shifted data")
+    }
+    
+    # Create data frame with transformed response
+    model_data <- data
+    model_data$transformed_response <- transformed_data
+    
+    # Fit spatial error model
+    spatial_error <- errorsarlm(transformed_response ~ score_0.5 + med_income_ranked,
+                               data = model_data,
+                               listw = listw,
+                               zero.policy = TRUE)
+    
+    # Calculate residuals and perform Moran's I test
+    residuals_sem <- residuals(spatial_error)
+    moran_sem <- moran.test(residuals_sem, listw, zero.policy=TRUE)
+    
+    # Back-transform predictions
+    if(abs(lambda) < 0.01) {
+        predictions <- exp(fitted(spatial_error)) - shift_value
+    } else {
+        predictions <- (fitted(spatial_error) * lambda + 1)^(1/lambda) - shift_value
+    }
+    
+    # Create diagnostic plots
+    par(mfrow=c(2,2))
+    
+    # Residuals vs Fitted
+    plot(fitted(spatial_error), residuals_sem,
+         xlab="Fitted values", ylab="Residuals",
+         main="Residuals vs Fitted")
+    abline(h=0, col="red", lty=2)
+    lines(lowess(fitted(spatial_error), residuals_sem), col="blue")
+    
+    # Normal Q-Q plot
+    qqnorm(residuals_sem)
+    qqline(residuals_sem, col="red")
+    
+    # Scale-Location plot
+    sqrt_abs_resids <- sqrt(abs(residuals_sem))
+    plot(fitted(spatial_error), sqrt_abs_resids,
+         xlab="Fitted values",
+         ylab=expression(sqrt("|Standardized residuals|")),
+         main="Scale-Location")
+    lines(lowess(fitted(spatial_error), sqrt_abs_resids), col="blue")
+    
+    # Residual distribution
+    hist(residuals_sem, 
+         main="Distribution of Residuals",
+         xlab="Residuals",
+         breaks=30,
+         probability=TRUE)
+    lines(density(residuals_sem), col="blue", lwd=2)
+    
+    # Results list
+    results <- list(
+        model = spatial_error,
+        predictions = predictions,
+        moran_test = moran_sem,
+        transform_info = list(
+            min_value = min_val,
+            shift_value = shift_value,
+            lambda = lambda,
+            transform_type = transform_type
+        )
+    )
+    
+    return(results)
+}
+
+# Make sure required packages are loaded
+library(spatialreg)
+library(MASS)  # for boxcox function
+
+# Run analysis for each variable
+variables <- c("pm_change", "o3_change", "no2_change", "ndvi_change", "mean_temp")
+results_list <- list()
+
+for(var in variables) {
+    cat("\n\n=== Analysis for", var, "===\n")
+    
+    # Run analysis
+    results_list[[var]] <- spatial_error_analysis(
+        var_name = var,
+        data = all_data_inc,
+        listw = listw
+    )
+    
+    # Print summaries
+    cat("\nTransformation details:\n")
+    print(results_list[[var]]$transform_info)
+    cat("\nModel Summary:\n")
+    print(summary(results_list[[var]]$model))
+    cat("\nMoran's I test for residuals:\n")
+    print(results_list[[var]]$moran_test)
+    
+    # Add title to current plot
+    mtext(paste("Diagnostic Plots for", var), side=3, line=-2, outer=TRUE)
+    
+    # Create observed vs predicted plot
+    par(mfrow=c(1,1))
+    plot(all_data_inc[[var]], results_list[[var]]$predictions,
+         main=paste(var, ": Observed vs Predicted"),
+         xlab="Observed", ylab="Predicted")
+    abline(0,1, col="red")
+    lines(lowess(all_data_inc[[var]], results_list[[var]]$predictions), col="blue")
+}
+
+# Reset plotting parameters
+par(mfrow=c(1,1))
+```
+
+################################################
+#################################################
+Create model functions (NEW FOR MRF ONLY)
+```{r}
+# Create exposure list
+exposure_list <- list(
+  pm = list(
+    name = "pm",
+    baseline = "pm_2002",
+    change = "pm_change"
+  ),
+  o3 = list(
+    name = "o3",
+    baseline = "o3_2002",
+    change = "o3_change"
+  ),
+  no2 = list(
+    name = "no2",
+    baseline = "no2_2000",
+    change = "no2_change"
+  ),
+  ndvi = list(
+    name = "ndvi",
+    baseline = "ndvi_2000",
+    change = "ndvi_change"
+  ),
+  temp = list(
+    name = "mean_temp",
+    baseline = NULL,
+    change = "mean_temp"  # No change variable for temp
+  )
+)
+
+# Function to run GAM models
+run_gam_models <- function(data, exposure_info) {
+  # Extract exposure information
+  exp_var <- exposure_info$change
+  baseline_exposure <- exposure_info$baseline
+  
+  # Skip if data is missing the exposure variable - gives warning 
+  if (!exp_var %in% names(data)) {
+    warning(paste("Variable", exp_var, "not found in dataset"))
+    return(NULL)
+  }
+  
+  # Base components that will be in all models: gentrification score and county/borough
+  base_formula <- paste(exp_var, "~ score_0.5 + s(COUNTYFP10, bs='re')")
+  
+  # Create model formulas
+  formulas <- list(
+    # Base model (score + county + spatial) for mrf smooth
+    mrf_base = paste(base_formula, "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+    
+    # Models with income
+    mrf_income = paste(base_formula, "+ rank(med_income_2000_impute) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+
+    # Models with distance to downtown
+    mrf_dist = paste(base_formula, "+ s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  )
+  
+  # Add baseline models if baseline exposure level exists (all except temp)
+  if (!is.null(baseline_exposure) && baseline_exposure %in% names(data)) {
+    formulas$mrf_baseline <- paste(base_formula, "+", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    # Combinations with baseline
+    formulas$mrf_income_baseline <- paste(base_formula, "+ rank(med_income_2000_impute) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$mrf_dist_baseline <- paste(base_formula, "+ s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$mrf_full <- paste(base_formula, "+ rank(med_income_2000_impute) + s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  }
+  
+  # Add income + distance combinations
+  formulas$mrf_income_dist <- paste(base_formula, "+ rank(med_income_2000_impute) + s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  
+  # Convert formulas to formula objects
+  formulas <- lapply(formulas, as.formula)
+  
+  # Run models
+  models <- purrr::map(formulas, ~try(gam(., 
+                                        family = scat, 
+                                        data = data, 
+                                        method = "REML"), 
+                                    silent = TRUE))
+  
+  return(models)
+}
+
+# drop geometry from spatial data while keeping coordinates
+data_prepared <- all_data_inc %>%
+  mutate(
+    COUNTYFP10 = as.factor(COUNTYFP10),
+    GEOID = as.factor(GEOID)
+  ) %>%
+  st_drop_geometry()
+
+# Construct neighbors list for MRF models
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+
+# JH 10/25/24 Warning: some observations have no neighbours; if this seems unexpected, try increasing the snap argument.Warning: neighbour object has 4 sub-graphs; if this sub-graph count seems unexpected, try increasing the snap argument.
+```
+
+Run models and check models
+```{r}
+# Run models for each exposure
+all_models <- purrr::map(exposure_list, ~run_gam_models(data_prepared, .))
+
+# Function to check which models succeeded/failed
+check_models <- function(models) {
+  model_status <- map(models, ~!inherits(., "try-error"))
+  successful_models <- names(models)[unlist(model_status)]
+  failed_models <- names(models)[!unlist(model_status)]
+  
+  return(list(
+    successful = successful_models,
+    failed = failed_models
+  ))
+}
+
+# Check status of all models
+model_status <- map(all_models, check_models)
+model_status
+
+```
+```{r}
+# Function to check and summarize all GAM models
+check_and_summarize_models <- function(models) {
+  # Apply gam.check and summary to each model
+  purrr::map(models, function(model_list) {
+    purrr::map(model_list, ~ {
+      # Perform a check on the GAM model
+      gam_check_result <- try(gam.check(.), silent = TRUE)
+      
+      # If gam.check runs without error, print it
+      if (inherits(gam_check_result, "try-error")) {
+        message("Error in gam.check for model: ", deparse(substitute(.)))
+      } else {
+        print(gam_check_result)
+      }
+      
+      # Get the summary of the model
+      summary_result <- try(summary(.), silent = TRUE)
+      
+      # If summary runs without error, print it
+      if (inherits(summary_result, "try-error")) {
+        message("Error in summary for model: ", deparse(substitute(.)))
+      } else {
+        print(summary_result)
+      }
+    })
+  })
+}
+
+# Example usage:
+check_and_summarize_models(all_models)
+```
+
+
+
+
+
+######################################################################
+######################################################################
+#####################################################################
+2000 vs 2010 income checking
+```{r}
+library(tidyverse)
+library(stats)
+
+analyze_tract_incomes <- function(all_data, income_2000, income_2010) {
+  # Merge data
+  analysis_df <- all_data %>%
+    left_join(income_2000 %>% select(GEOID, med_income_2000), by = "GEOID") %>%
+    left_join(income_2010 %>% select(GEOID, med_income_2010), by = "GEOID")
+  
+  # Create summary statistics grouped by whether 2000 data exists
+  summary_stats <- analysis_df %>%
+    mutate(has_2000_data = !is.na(med_income_2000)) %>%
+    group_by(has_2000_data) %>%
+    summarise(
+      n_tracts = dplyr::n(),
+      mean_2010 = mean(med_income_2010, na.rm = TRUE),
+      median_2010 = median(med_income_2010, na.rm = TRUE),
+      sd_2010 = sd(med_income_2010, na.rm = TRUE),
+      q25_2010 = quantile(med_income_2010, 0.25, na.rm = TRUE),
+      q75_2010 = quantile(med_income_2010, 0.75, na.rm = TRUE)
+    )
+  
+  # Perform Wilcoxon rank sum test (Mann-Whitney U test)
+  test_result <- wilcox.test(
+    med_income_2010 ~ !is.na(med_income_2000),
+    data = analysis_df,
+    alternative = "two.sided"
+  )
+  
+  # Create visualization
+  plot <- analysis_df %>%
+    mutate(has_2000_data = if_else(!is.na(med_income_2000), 
+                                  "Has 2000 Data", 
+                                  "Missing 2000 Data")) %>%
+    ggplot(aes(x = has_2000_data, y = med_income_2010)) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(
+      title = "2010 Income Distribution: Tracts With vs Without 2000 Data",
+      x = "",
+      y = "2010 Median Income"
+    )
+  
+  # Calculate percent difference in means
+  pct_diff <- with(summary_stats, 
+                  (mean_2010[!has_2000_data] - mean_2010[has_2000_data]) / 
+                    mean_2010[has_2000_data] * 100)
+  
+  # Return results
+  list(
+    summary_stats = summary_stats,
+    wilcox_test = test_result,
+    percent_difference = pct_diff,
+    plot = plot
+  )
+}
+
+# Use the function
+results <- analyze_tract_incomes(all_data, income, income_2010)
+
+# Print results
+print("Summary Statistics:")
+print(results$summary_stats)
+
+print("\nWilcoxon Test Results:")
+print(results$wilcox_test)
+
+print(sprintf("\nPercent difference in means: %.2f%%", results$percent_difference))
+
+# Display plot
+print(results$plot)
+print(results$plot)
+
+#additional analysis based on average, variation, standard deviation- checking normality to see which statistical signifiancetest is appropriate
+
+# Create analysis dataset
+analysis_df <- all_data %>%
+  left_join(income %>% select(GEOID, med_income_2000), by = "GEOID") %>%
+  left_join(income_2010 %>% select(GEOID, med_income_2010), by = "GEOID") %>%
+  mutate(has_2000_data = !is.na(med_income_2000))
+
+# Calculate summary statistics
+stats_summary <- analysis_df %>%
+  group_by(has_2000_data) %>%
+  summarise(
+    n = dplyr::n(),
+    mean_2010 = mean(med_income_2010, na.rm = TRUE),
+    var_2010 = var(med_income_2010, na.rm = TRUE),
+    sd_2010 = sd(med_income_2010, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+# Test for normality using Shapiro-Wilk test
+normality_test_with_2000 <- shapiro.test(analysis_df$med_income_2010[analysis_df$has_2000_data])
+normality_test_without_2000 <- shapiro.test(analysis_df$med_income_2010[!analysis_df$has_2000_data])
+
+# Perform F-test for equality of variances
+var_test <- var.test(med_income_2010 ~ has_2000_data, data = analysis_df)
+
+# Perform t-test (both equal and unequal variance versions)
+t_test_equal_var <- t.test(med_income_2010 ~ has_2000_data, data = analysis_df, var.equal = TRUE)
+t_test_unequal_var <- t.test(med_income_2010 ~ has_2000_data, data = analysis_df, var.equal = FALSE)
+
+# Perform Wilcoxon rank sum test
+wilcox_test <- wilcox.test(med_income_2010 ~ has_2000_data, data = analysis_df)
+
+# Print results
+cat("Summary Statistics:\n")
+print(stats_summary)
+
+cat("\nNormality Tests (Shapiro-Wilk):\n")
+cat("Tracts with 2000 data: p =", normality_test_with_2000$p.value, "\n")
+cat("Tracts without 2000 data: p =", normality_test_without_2000$p.value, "\n")
+
+cat("\nF-test for Equal Variances:\n")
+cat("F =", round(var_test$statistic, 3), ", p =", var_test$p.value, "\n")
+
+cat("\nt-test (Equal Variances):\n")
+cat("t =", round(t_test_equal_var$statistic, 3), ", p =", t_test_equal_var$p.value, "\n")
+
+cat("\nt-test (Unequal Variances):\n")
+cat("t =", round(t_test_unequal_var$statistic, 3), ", p =", t_test_unequal_var$p.value, "\n")
+
+cat("\nWilcoxon Rank Sum Test:\n")
+cat("W =", wilcox_test$statistic, ", p =", wilcox_test$p.value, "\n")
+```
+
+```{r}
+# Construct neighbors list for MRF models
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+```
+
+
+testing tp model with med_income_2000 for pm2.5
+```{r}
+tp_income_pm_na <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+# Try increasing k for the tensor product smooth of longitude and latitude (from 24 default)
+tp_income_pm_na_2 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 100), method = 'REML', family = scat, data = all_data_inc_na) #when k=40 and k=100, p value still significant (= bad)
+
+tp_income_pm_na_3 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 150), method = 'REML', family = scat, data = all_data_inc_na) 
+
+tp_income_pm_na_4 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) 
+
+tp_income_pm_na_4 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) 
+
+tp_income_pm_na_5 <- gam(pm_change ~ score_0.5 + s(COUNTYFP10, bs = "re", k=10) + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) 
+
+
+
+#model diagnostics using gam.check
+gam.check(tp_income_pm_na)
+gam.check(tp_income_pm_na_2)
+gam.check(tp_income_pm_na_3)
+gam.check(tp_income_pm_na_4)
+gam.check(tp_income_pm_na_5)
+
+
+# First, let's get the fitted random effects properly
+fitted_terms <- predict(tp_income_pm_na_5, type="terms")
+county_term <- fitted_terms[,"s(COUNTYFP10)"]  # Extract county random effects
+
+# Create summary by county
+county_summary <- data.frame(
+    COUNTYFP10 = all_data_inc_na$COUNTYFP10,
+    effect = county_term
+) %>%
+    group_by(COUNTYFP10) %>%
+    summarize(mean_effect = mean(effect)) %>%
+    arrange(desc(abs(mean_effect)))
+
+# View the most extreme counties
+print(head(county_summary))
+
+# Visualize
+library(ggplot2)
+ggplot(county_summary, aes(y=mean_effect, x=reorder(COUNTYFP10, mean_effect))) +
+    geom_point() +
+    theme_minimal() +
+    theme(axis.text.x = element_blank()) +  # Hide county codes for clarity
+    labs(x="Counties", y="Random Effect")
+
+# Look at the data for the most extreme county
+extreme_county <- county_summary$COUNTYFP10[1]
+extreme_county_data <- all_data_inc_na %>%
+    filter(COUNTYFP10 == extreme_county) %>%
+    select(pm_change, score_0.5, med_income_2000, long, lat)
+
+print("Data for most extreme county:")
+print(summary(extreme_county_data)) #extreme county is 85 - Manhattan/NY county
+
+print("Overall data summary:")
+print(summary(all_data_inc_na[,c("pm_change", "score_0.5", "med_income_2000")]))
+####
+
+####
+
+# Calculate Cook's distance
+cooks_d <- cooks.distance(tp_income_pm_na)
+plot(cooks_d, type = "h", main = "Cook's Distance")
+abline(h = 4/length(cooks_d), col = "red")  # Rule of thumb threshold
+
+# Identify potential influential points
+influential <- which(cooks_d > 4/length(cooks_d))
+
+influential_data <- all_data_inc_na[influential, ]
+print(influential_data)  # Look at characteristics of these points
+
+# Options for handling influential points:
+# a. Fit model without them to compare
+tp_income_pm_na_reduced <- gam(
+  pm_change ~ score_0.5 + 
+    s(COUNTYFP10, bs = "re") + 
+    rank(med_income_2000) + 
+    te(long, lat, d = 2, bs = 'gp', m = 2, k = 150),
+  method = 'REML',
+  family = scat,
+  data = all_data_inc_na[-influential, ]
+)
+
+# Compare coefficients and predictions
+summary(tp_income_pm_na)
+summary(tp_income_pm_na_reduced)
+
+# b. Investigate why these points are influential:
+# Plot their locations
+plot(all_data_inc_na$long, all_data_inc_na$lat)
+points(all_data_inc_na$long[influential], 
+       all_data_inc_na$lat[influential], 
+       col = "red", pch = 16)
+
+
+# Checking that scat is indeed better (comparing t distribution to gaussian)
+model_scat <- gam(
+  pm_change ~ score_0.5 + 
+    s(COUNTYFP10, bs = "re") + 
+    rank(med_income_2000) + 
+    te(long, lat, d = 2, bs = 'gp', m = 2, k = 150),
+  method = 'REML',
+  family = scat,
+  data = all_data_inc_na
+)
+
+model_gaussian <- gam(
+  pm_change ~ score_0.5 + 
+    s(COUNTYFP10, bs = "re") + 
+    rank(med_income_2000) + 
+    te(long, lat, d = 2, bs = 'gp', m = 2, k = 150),
+  method = 'REML',
+  family = gaussian,
+  data = all_data_inc_na
+)
+
+# Compare QQ plots
+par(mfrow=c(1,2))
+qq.gam(model_scat, main="Scaled t")
+qq.gam(model_gaussian, main="Gaussian")
+
+# Compare predictions
+pred_scat <- predict(model_scat)
+pred_gaussian <- predict(model_gaussian)
+plot(pred_scat, pred_gaussian, 
+     xlab="Scaled t predictions", 
+     ylab="Gaussian predictions")
+abline(0,1, col="red")
+
+# Compare AIC (if models have same scale)
+AIC(model_scat, model_gaussian)
+# Check if residual patterns differ
+par(mfrow=c(2,2))
+gam.check(tp_income_pm_gaussian)
+
+
+```
+
+testing tp models for o3
+```{r}
+tp_income_o3_na <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+
+#increasing k in tp
+tp_income_o3_na_2 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 150), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_o3_na_3 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 250), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_o3_na_4 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na) # k still 0.02
+
+tp_income_o3_na_5 <- gam(o3_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 225), method = 'REML', family = scat, data = all_data_inc_na) #k no longer significant
+
+
+gam.check(tp_income_o3_na)
+gam.check(tp_income_o3_na_2)
+gam.check(tp_income_o3_na_3)
+gam.check(tp_income_o3_na_4)
+gam.check(tp_income_o3_na_5)
+
+
+
+
+```
+
+testing tp models for no2
+```{r}
+tp_income_no2_na <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_no2_na_2 <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k= 200), method = 'REML', family = scat, data = all_data_inc_na) #still significant
+
+tp_income_no2_na_3 <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k= 250), method = 'REML', family = scat, data = all_data_inc_na) #still significant
+ 
+tp_income_no2_na_4 <- gam(no2_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k= 450), method = 'REML', family = scat, data = all_data_inc_na) #takes forever to run - not feasible
+
+gam.check(tp_income_no2_na)
+gam.check(tp_income_no2_na_2)
+gam.check(tp_income_no2_na_3)
+gam.check(tp_income_no2_na_4)
+
+
+```
+testing tp models for ndvi
+```{r}
+tp_income_ndvi_na <- gam(ndvi_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_ndvi_na_2 <- gam(ndvi_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_ndvi_na_3 <- gam(ndvi_change ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 300), method = 'REML', family = scat, data = all_data_inc_na) # still very significant
+
+gam.check(tp_income_ndvi_na)
+gam.check(tp_income_ndvi_na_2)
+gam.check(tp_income_ndvi_na_3)
+
+```
+testing tp models for temp
+```{r}
+tp_income_temp_na <- gam(mean_temp ~ score_0.5 + s(COUNTYFP10, bs = "re") + s(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_temp_na_2<- gam(mean_temp ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 200), method = 'REML', family = scat, data = all_data_inc_na)
+
+tp_income_temp_na_3<- gam(mean_temp ~ score_0.5 + s(COUNTYFP10, bs = "re") + rank(med_income_2000) + te(long, lat, d = 2, bs = 'gp', m = 2, k = 300), method = 'REML', family = scat, data = all_data_inc_na) # still very significant
+
+
+gam.check(tp_income_temp_na)
+gam.check(tp_income_temp_na_2)
+gam.check(tp_income_temp_na_3)
+```
+
+Testing residuals using tp model for now
+```{r}
+# Extract residuals for each model
+resid_pm <- resid(tp_income_pm_na_5)
+resid_o3 <- resid(tp_income_o3_na_5)
+resid_no2 <- resid(tp_income_no2_na_3)
+resid_ndvi <- resid(tp_income_ndvi_na_3)
+resid_temp <- resid(tp_income_ndvi_na)
+
+
+# Add residuals to the original dataset (ensure this corresponds to the right model)
+all_data_inc_na$resid_pm <- resid_pm
+all_data_inc_na$resid_o3 <- resid_o3
+all_data_inc_na$resid_no2 <- resid_no2
+all_data_inc_na$resid_ndvi <- resid_ndvi
+all_data_inc_na$resid_temp <- resid_temp
+```
+
+Code for just PM to base function on
+```{r}
+# # Visualize residuals for PM model, for example
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = resid_pm)) +
+#   geom_point() +
+#   scale_color_gradient2(midpoint = 0, low = "blue", mid = "white", high = "red") +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residuals (PM)", color = "Residuals")
+#   
+# # Calculate the 10th and 90th percentiles of the residuals
+# lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
+# upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
+# 
+# # Create dichotomous variable based on thresholds
+# all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
+#                                         ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
+# 
+# # Visualize the result
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+#   geom_point() +
+#   scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+# 
+# 
+# # Calculate the 10th and 90th percentiles of the residuals
+# lower_threshold <- quantile(all_data_inc_na$resid_pm, 0.1)
+# upper_threshold <- quantile(all_data_inc_na$resid_pm, 0.9)
+# 
+# # Create dichotomous variable based on thresholds
+# all_data_inc_na$residual_gap <- ifelse(all_data_inc_na$resid_pm > upper_threshold, "High Residual", 
+#                                         ifelse(all_data_inc_na$resid_pm < lower_threshold, "Low Residual", "Normal"))
+# 
+# # Visualize the result
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+#   geom_point() +
+#   scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+# 
+# 
+# # Visualize gaps using the dichotomous color scale
+# ggplot(all_data_inc_na, aes(x = long, y = lat, color = residual_gap)) +
+#   geom_point() +
+#   scale_color_manual(values = c("High Residual" = "red", "Low Residual" = "blue", "Normal" = "grey")) +
+#   theme_minimal() +
+#   labs(title = "Spatial Distribution of Residual Gaps (PM)", color = "Residual Gap")
+# 
+# # Summary statistics for residuals (e.g., PM)
+# summary(all_data_inc_na$resid_pm)
+# 
+# # Identify the locations with extreme residuals
+# high_residuals <- all_data_inc_na[all_data_inc_na$resid_pm > threshold, ]
+# low_residuals <- all_data_inc_na[all_data_inc_na$resid_pm < -threshold, ]
+# 
+# # View the locations of high and low residuals
+# head(high_residuals[, c("long", "lat", "resid_pm")])
+# head(low_residuals[, c("long", "lat", "resid_pm")])
+
+
+```
+############################################
+function to analyze residuals for all exposures based on tp model (based on high and low quantiles)
+```{r}
+analyze_spatial_residuals <- function(data, residual_col, lon_col = "long", lat_col = "lat", 
+                                    lower_quantile = 0.1, upper_quantile = 0.9) {
+  # Input validation
+  if (!all(c(residual_col, lon_col, lat_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create analysis environment
+  results <- list()
+  
+  # Basic summary statistics
+  results$summary <- summary(data[[residual_col]])
+  
+  # Calculate thresholds
+  results$thresholds <- list(
+    lower = quantile(data[[residual_col]], lower_quantile, na.rm = TRUE),
+    upper = quantile(data[[residual_col]], upper_quantile, na.rm = TRUE)
+  )
+  
+  # Create categorical variable for residual gaps
+  data$residual_category <- case_when(
+    data[[residual_col]] > results$thresholds$upper ~ "High Residual",
+    data[[residual_col]] < results$thresholds$lower ~ "Low Residual",
+    TRUE ~ "Normal"
+  )
+  
+  # Generate plots
+  # 1. Continuous residual plot
+  results$continuous_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                            y = .data[[lat_col]], 
+                                            color = .data[[residual_col]])) +
+    geom_point(alpha = 0.6) +
+    scale_color_gradient2(midpoint = 0, 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red") +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residuals:", residual_col),
+         color = "Residuals") +
+    theme(legend.position = "right")
+  
+  # 2. Categorical residual plot
+  results$categorical_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                             y = .data[[lat_col]], 
+                                             color = residual_category)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = c("High Residual" = "red", 
+                                 "Low Residual" = "blue", 
+                                 "Normal" = "grey")) +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residual Gaps:", residual_col),
+         color = "Residual Category") +
+    theme(legend.position = "right")
+  
+  # Extract extreme locations
+  results$extreme_locations <- list(
+    high = data %>%
+      filter(residual_category == "High Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(desc(.data[[residual_col]])),
+    
+    low = data %>%
+      filter(residual_category == "Low Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(.data[[residual_col]])
+  )
+  
+  # Calculate summary statistics by category
+  results$category_stats <- data %>%
+    group_by(residual_category) %>%
+    summarise(
+      count = dplyr::n(),
+      mean_residual = mean(.data[[residual_col]], na.rm = TRUE),
+      sd_residual = sd(.data[[residual_col]], na.rm = TRUE),
+      min_residual = min(.data[[residual_col]], na.rm = TRUE),
+      max_residual = max(.data[[residual_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  return(results)
+}
+
+# Example usage for each environmental variable
+results_pm <- analyze_spatial_residuals(all_data_inc_na, "resid_pm")
+results_o3 <- analyze_spatial_residuals(all_data_inc_na, "resid_o3")
+results_no2 <- analyze_spatial_residuals(all_data_inc_na, "resid_no2")
+results_ndvi <- analyze_spatial_residuals(all_data_inc_na, "resid_ndvi")
+results_temp <- analyze_spatial_residuals(all_data_inc_na, "resid_temp")
+
+
+# Display results for pm2.5
+print(results_pm$summary)
+print(results_pm$category_stats)
+results_pm$continuous_plot
+results_pm$categorical_plot
+head(results_pm$extreme_locations$high)
+head(results_pm$extreme_locations$low)
+
+print(results_o3$summary)
+print(results_o3$category_stats)
+results_o3$continuous_plot
+results_o3$categorical_plot
+head(results_o3$extreme_locations$high)
+head(results_o3$extreme_locations$low)
+
+print(results_no2$summary)
+print(results_no2$category_stats)
+results_no2$continuous_plot
+results_no2$categorical_plot
+head(results_no2$extreme_locations$high)
+head(results_no2$extreme_locations$low)
+
+print(results_ndvi$summary)
+print(results_ndvi$category_stats)
+results_ndvi$continuous_plot
+results_ndvi$categorical_plot
+head(results_ndvi$extreme_locations$high)
+head(results_ndvi$extreme_locations$low)
+
+print(results_temp$summary)
+print(results_temp$category_stats)
+results_temp$continuous_plot
+results_temp$categorical_plot
+head(results_temp$extreme_locations$high)
+head(results_temp$extreme_locations$low)
+```
+function to analyze residuals for all exposures based on tp model (based on high and low quantiles, narrower limits)
+```{r}
+analyze_spatial_residuals <- function(data, residual_col, lon_col = "long", lat_col = "lat", 
+                                    lower_quantile = 0.05, upper_quantile = 0.95) {
+  # Input validation
+  if (!all(c(residual_col, lon_col, lat_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create analysis environment
+  results <- list()
+  
+  # Basic summary statistics
+  results$summary <- summary(data[[residual_col]])
+  
+  # Calculate thresholds
+  results$thresholds <- list(
+    lower = quantile(data[[residual_col]], lower_quantile, na.rm = TRUE),
+    upper = quantile(data[[residual_col]], upper_quantile, na.rm = TRUE)
+  )
+  
+  # Create categorical variable for residual gaps
+  data$residual_category <- case_when(
+    data[[residual_col]] > results$thresholds$upper ~ "High Residual",
+    data[[residual_col]] < results$thresholds$lower ~ "Low Residual",
+    TRUE ~ "Normal"
+  )
+  
+  # Generate plots
+  # 1. Continuous residual plot
+  results$continuous_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                            y = .data[[lat_col]], 
+                                            color = .data[[residual_col]])) +
+    geom_point(alpha = 0.6) +
+    scale_color_gradient2(midpoint = 0, 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red") +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residuals:", residual_col),
+         color = "Residuals") +
+    theme(legend.position = "right")
+  
+  # 2. Categorical residual plot
+  results$categorical_plot <- ggplot(data, aes(x = .data[[lon_col]], 
+                                             y = .data[[lat_col]], 
+                                             color = residual_category)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = c("High Residual" = "red", 
+                                 "Low Residual" = "blue", 
+                                 "Normal" = "grey")) +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Residual Gaps:", residual_col),
+         color = "Residual Category") +
+    theme(legend.position = "right")
+  
+  # Extract extreme locations
+  results$extreme_locations <- list(
+    high = data %>%
+      filter(residual_category == "High Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(desc(.data[[residual_col]])),
+    
+    low = data %>%
+      filter(residual_category == "Low Residual") %>%
+      select(all_of(c(lon_col, lat_col, residual_col))) %>%
+      arrange(.data[[residual_col]])
+  )
+  
+  # Calculate summary statistics by category
+  results$category_stats <- data %>%
+    group_by(residual_category) %>%
+    summarise(
+      count = dplyr::n(),
+      mean_residual = mean(.data[[residual_col]], na.rm = TRUE),
+      sd_residual = sd(.data[[residual_col]], na.rm = TRUE),
+      min_residual = min(.data[[residual_col]], na.rm = TRUE),
+      max_residual = max(.data[[residual_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  return(results)
+}
+
+# Example usage for each environmental variable
+results_pm <- analyze_spatial_residuals(all_data_inc_na, "resid_pm")
+results_o3 <- analyze_spatial_residuals(all_data_inc_na, "resid_o3")
+results_no2 <- analyze_spatial_residuals(all_data_inc_na, "resid_no2")
+results_ndvi <- analyze_spatial_residuals(all_data_inc_na, "resid_ndvi")
+results_temp <- analyze_spatial_residuals(all_data_inc_na, "resid_temp")
+
+
+# Display results for pm2.5
+print(results_pm$summary)
+print(results_pm$category_stats)
+results_pm$continuous_plot
+results_pm$categorical_plot
+head(results_pm$extreme_locations$high)
+head(results_pm$extreme_locations$low)
+
+print(results_o3$summary)
+print(results_o3$category_stats)
+results_o3$continuous_plot
+results_o3$categorical_plot
+head(results_o3$extreme_locations$high)
+head(results_o3$extreme_locations$low)
+
+print(results_no2$summary)
+print(results_no2$category_stats)
+results_no2$continuous_plot
+results_no2$categorical_plot
+head(results_no2$extreme_locations$high)
+head(results_no2$extreme_locations$low)
+
+print(results_ndvi$summary)
+print(results_ndvi$category_stats)
+results_ndvi$continuous_plot
+results_ndvi$categorical_plot
+head(results_ndvi$extreme_locations$high)
+head(results_ndvi$extreme_locations$low)
+
+print(results_temp$summary)
+print(results_temp$category_stats)
+results_temp$continuous_plot
+results_temp$categorical_plot
+head(results_temp$extreme_locations$high)
+head(results_temp$extreme_locations$low)
+```
+Analyze residual overlap between exposures
+```{r}
+analyze_residual_overlap <- function(data, residual_cols, lon_col = "long", lat_col = "lat", 
+                                   lower_quantile = 0.1, upper_quantile = 0.9) {
+  # Input validation
+  if (!all(c(residual_cols, lon_col, lat_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create category columns for each residual
+  results <- list()
+  data_enhanced <- data
+  
+  # Categorize each residual
+  for (col in residual_cols) {
+    thresholds <- quantile(data[[col]], c(lower_quantile, upper_quantile), na.rm = TRUE)
+    cat_col_name <- paste0(col, "_category")
+    
+    data_enhanced[[cat_col_name]] <- case_when(
+      data[[col]] > thresholds[2] ~ "High",
+      data[[col]] < thresholds[1] ~ "Low",
+      TRUE ~ "Normal"
+    )
+  }
+  
+  # Count overlapping high/low/extreme areas
+  data_enhanced$high_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "High"
+    })
+  )
+  
+  data_enhanced$low_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "Low"
+    })
+  )
+  
+  # Count either high or low (extreme) overlaps
+  data_enhanced$extreme_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] %in% c("High", "Low")
+    })
+  )
+  
+  # Create overlap visualizations
+  # 1. High residual overlap plot
+  results$high_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(high_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "magma", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of High Residuals",
+         color = "Number of\nOverlapping\nHigh Residuals") +
+    theme(legend.position = "right")
+  
+  # 2. Low residual overlap plot
+  results$low_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(low_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "mako", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of Low Residuals",
+         color = "Number of\nOverlapping\nLow Residuals") +
+    theme(legend.position = "right")
+  
+  # 3. Extreme (either high or low) residual overlap plot
+  results$extreme_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(extreme_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "viridis", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of Extreme Residuals (High or Low)",
+         color = "Number of\nOverlapping\nExtreme Residuals") +
+    theme(legend.position = "right")
+  
+  # Create summary of overlaps
+  results$overlap_summary <- data_enhanced %>%
+    summarise(
+      locations_with_no_extremes = sum(extreme_overlap_count == 0),
+      locations_with_one_extreme = sum(extreme_overlap_count == 1),
+      locations_with_multiple_extremes = sum(extreme_overlap_count > 1),
+      max_extreme_overlap = max(extreme_overlap_count),
+      locations_with_no_high = sum(high_overlap_count == 0),
+      locations_with_one_high = sum(high_overlap_count == 1),
+      locations_with_multiple_high = sum(high_overlap_count > 1),
+      max_high_overlap = max(high_overlap_count),
+      locations_with_no_low = sum(low_overlap_count == 0),
+      locations_with_one_low = sum(low_overlap_count == 1),
+      locations_with_multiple_low = sum(low_overlap_count > 1),
+      max_low_overlap = max(low_overlap_count)
+    )
+  
+  # Create detailed overlap patterns
+  results$overlap_patterns <- data_enhanced %>%
+    group_by(extreme_overlap_count) %>%
+    summarise(
+      count = dplyr::n(),
+      pct_of_total = round(100 * dplyr::n() / nrow(data_enhanced), 1),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(count))
+  
+  # Add the enhanced dataset to results
+  results$data <- data_enhanced
+  
+  return(results)
+}
+
+# Example usage
+residual_columns <- c("resid_pm", "resid_o3", "resid_no2", "resid_ndvi")
+overlap_results <- analyze_residual_overlap(all_data_inc_na, residual_columns)
+
+# Display summary statistics
+print("Summary of overlapping patterns:")
+print(overlap_results$overlap_summary)
+
+print("\nDistribution of extreme residual overlaps:")
+print(overlap_results$overlap_patterns)
+
+# Create a combined visualization using patchwork
+library(patchwork)
+combined_plot <- overlap_results$high_overlap_plot + 
+  overlap_results$low_overlap_plot +
+  overlap_results$extreme_overlap_plot +
+  plot_layout(ncol = 3) +
+  plot_annotation(
+    title = "Spatial Patterns of Overlapping Residuals",
+    subtitle = "Left: High Residuals, Center: Low Residuals, Right: Combined Extreme Residuals"
+  )
+
+print(combined_plot)
+
+# Find locations with multiple extreme residuals
+extreme_overlap_locations <- overlap_results$data %>%
+  filter(extreme_overlap_count >= 2) %>%
+  select(long, lat, extreme_overlap_count, 
+         ends_with("_category")) %>%
+  arrange(desc(extreme_overlap_count))
+
+print("Locations with multiple extreme residuals:")
+head(extreme_overlap_locations, 10)
+
+# Create a summary table of which combinations of exposures tend to have extreme residuals together
+exposure_combinations <- overlap_results$data %>%
+  filter(extreme_overlap_count >= 2) %>%
+  summarise(
+    PM_O3 = sum((resid_pm_category != "Normal") & (resid_o3_category != "Normal")),
+    PM_NO2 = sum((resid_pm_category != "Normal") & (resid_no2_category != "Normal")),
+    PM_NDVI = sum((resid_pm_category != "Normal") & (resid_ndvi_category != "Normal")),
+    O3_NO2 = sum((resid_o3_category != "Normal") & (resid_no2_category != "Normal")),
+    O3_NDVI = sum((resid_o3_category != "Normal") & (resid_ndvi_category != "Normal")),
+    NO2_NDVI = sum((resid_no2_category != "Normal") & (resid_ndvi_category != "Normal"))
+  )
+
+print("\nCommon pairs of exposures with extreme residuals:")
+print(exposure_combinations)
+```
+More detailed summaries on where residuals overlap
+```{r}
+analyze_residual_overlap <- function(data, residual_cols, lon_col = "long", lat_col = "lat", 
+                                   geoid_col = "geoid", county_col = "NAME", # 
+                                   lower_quantile = 0.1, upper_quantile = 0.9) {
+  # Input validation
+  if (!all(c(residual_cols, lon_col, lat_col, geoid_col, county_col) %in% names(data))) {
+    stop("One or more specified columns not found in data")
+  }
+  
+  # Create category columns for each residual
+  results <- list()
+  data_enhanced <- data
+  
+  # Categorize each residual
+  for (col in residual_cols) {
+    thresholds <- quantile(data[[col]], c(lower_quantile, upper_quantile), na.rm = TRUE)
+    cat_col_name <- paste0(col, "_category")
+    
+    data_enhanced[[cat_col_name]] <- case_when(
+      data[[col]] > thresholds[2] ~ "High",
+      data[[col]] < thresholds[1] ~ "Low",
+      TRUE ~ "Normal"
+    )
+  }
+  
+  # Count overlapping high/low/extreme areas
+  data_enhanced$high_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "High"
+    })
+  )
+  
+  data_enhanced$low_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] == "Low"
+    })
+  )
+  
+  # Count either high or low (extreme) overlaps
+  data_enhanced$extreme_overlap_count <- rowSums(
+    sapply(residual_cols, function(col) {
+      data_enhanced[[paste0(col, "_category")]] %in% c("High", "Low")
+    })
+  )
+  
+  # Create overlap visualizations
+  # 1. High residual overlap plot
+  results$high_overlap_plot <- ggplot(data_enhanced, 
+         aes(x = .data[[lon_col]], y = .data[[lat_col]], 
+             color = factor(high_overlap_count))) +
+    geom_point(alpha = 0.6) +
+    scale_color_viridis_d(option = "magma", direction = -1) +
+    theme_minimal() +
+    labs(title = "Overlap of High Residuals",
+         color = "Number of\nOverlapping\nHigh Residuals") +
+    theme(legend.position = "right")
+  
+  # Create location summaries with geoids and county names
+  results$location_summary <- data_enhanced %>%
+    filter(extreme_overlap_count > 0) %>%
+    select(
+      !!sym(geoid_col),
+      !!sym(county_col), # Added county name
+      !!sym(lon_col),
+      !!sym(lat_col),
+      extreme_overlap_count,
+      high_overlap_count,
+      low_overlap_count,
+      ends_with("_category")
+    ) %>%
+    arrange(desc(extreme_overlap_count))
+  
+  # Summary of overlap patterns by geoid and county
+  results$overlap_patterns <- data_enhanced %>%
+    group_by(extreme_overlap_count) %>%
+    summarise(
+      n_locations = dplyr::n(),
+      geoids = list(get(geoid_col)),
+      counties = list(unique(get(county_col))), # Added county names
+      pct_of_total = round(100 * dplyr::n() / nrow(data_enhanced), 1),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(extreme_overlap_count))
+  
+  # Create detailed overlap combinations for high overlap areas
+  results$overlap_combinations <- data_enhanced %>%
+    filter(extreme_overlap_count >= 2) %>%
+    group_by(!!sym(geoid_col)) %>%
+    summarise(
+      county = first(!!sym(county_col)), # Added county name
+      extreme_overlap_count = first(extreme_overlap_count),
+      combination = paste(names(which(sapply(residual_cols, function(col) {
+        first(get(paste0(col, "_category"))) != "Normal"
+      }))), collapse = ", "),
+      categories = paste(sapply(residual_cols, function(col) {
+        paste0(col, ": ", first(get(paste0(col, "_category"))))
+      }), collapse = "; "),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(extreme_overlap_count))
+  
+  # Add the enhanced dataset to results
+  results$data <- data_enhanced
+  
+  return(results)
+}
+
+overlap_results <- analyze_residual_overlap(
+   data = all_data_inc_na,
+   residual_cols = c("resid_pm", "resid_o3", "resid_no2", "resid_ndvi"),
+   geoid_col = "GEOID",
+   county_col = "NAME"
+ )
+
+# View locations with overlaps
+print(overlap_results$location_summary)
+
+# View overlap patterns
+print(overlap_results$overlap_patterns)
+
+# View detailed combinations
+print(overlap_results$overlap_combinations)
+
+
+
+```
+
+```{r}
+library(spdep)  # for spatial weights and Moran's I
+library(dbscan) # for DBSCAN clustering
+library(sf)     # for spatial operations
+library(ggplot2)
+library(dplyr)
+
+analyze_residual_clusters <- function(data, residual_cols, lon_col = "long", lat_col = "lat") {
+  results <- list()
+  
+  # Debug data structure
+  cat("Data structure diagnostics:\n")
+  cat("Class of input data:", class(data), "\n")
+  cat("Dimension of input data:", dim(data), "\n")
+  cat("Classes of coordinate columns:\n")
+  print(sapply(data[c(lon_col, lat_col)], class))
+  
+  # Input validation
+  if (!all(c(lon_col, lat_col) %in% names(data))) {
+    stop("Longitude and latitude columns not found in data")
+  }
+  
+  if (!all(residual_cols %in% names(data))) {
+    stop("One or more residual columns not found in data")
+  }
+  
+  # Function to safely convert potentially nested columns to numeric
+  safe_to_numeric <- function(x) {
+    if (is.list(x)) {
+      # If it's a list column, try to unlist it first
+      x <- unlist(x)
+    }
+    # Try to convert to character first, then to numeric
+    as.numeric(as.character(x))
+  }
+  
+  # Extract and validate coordinates
+  coords <- tryCatch({
+    # Create a clean data frame for coordinates
+    coords_df <- data.frame(
+      longitude = safe_to_numeric(data[[lon_col]]),
+      latitude = safe_to_numeric(data[[lat_col]])
+    )
+    
+    # Check for conversion success
+    if (any(is.na(coords_df$longitude)) && !all(is.na(coords_df$longitude))) {
+      warning(paste("Some longitude values could not be converted to numeric. First problematic value:",
+                   data[[lon_col]][which(!is.na(data[[lon_col]]) & is.na(coords_df$longitude))[1]]))
+    }
+    if (any(is.na(coords_df$latitude)) && !all(is.na(coords_df$latitude))) {
+      warning(paste("Some latitude values could not be converted to numeric. First problematic value:",
+                   data[[lat_col]][which(!is.na(data[[lat_col]]) & is.na(coords_df$latitude))[1]]))
+    }
+    
+    # Remove rows with NA coordinates
+    valid_rows <- complete.cases(coords_df)
+    if (sum(!valid_rows) > 0) {
+      warning(paste(sum(!valid_rows), "rows removed due to invalid coordinates"))
+    }
+    coords_df <- coords_df[valid_rows, ]
+    
+    # Validate coordinate ranges
+    invalid_lon <- coords_df$longitude < -180 | coords_df$longitude > 180
+    invalid_lat <- coords_df$latitude < -90 | coords_df$latitude > 90
+    
+    if (any(invalid_lon)) {
+      warning(paste("Found", sum(invalid_lon), "longitude values outside valid range (-180 to 180)"))
+    }
+    if (any(invalid_lat)) {
+      warning(paste("Found", sum(invalid_lat), "latitude values outside valid range (-90 to 90)"))
+    }
+    
+    # Remove invalid coordinates
+    coords_df <- coords_df[!invalid_lon & !invalid_lat, ]
+    
+    if (nrow(coords_df) == 0) {
+      stop("No valid coordinates remaining after cleaning")
+    }
+    
+    as.matrix(coords_df)
+  }, error = function(e) {
+    stop(paste("Error processing coordinates:", e$message, "\nPlease check your coordinate data structure."))
+  })
+  
+  # Function to analyze single residual with error handling
+  analyze_single_residual <- function(residual_col) {
+    tryCatch({
+      # Clean residual data
+      residual_values <- safe_to_numeric(data[[residual_col]])
+      if (all(is.na(residual_values))) {
+        stop("All values in residual column are NA")
+      }
+      
+      # Match residuals with valid coordinates
+      residual_values <- residual_values[valid_rows][!invalid_lon & !invalid_lat]
+      
+      # 1. Global Moran's I
+      knn <- knearneigh(coords, k = min(5, nrow(coords) - 1))
+      nb <- knn2nb(knn)
+      weights <- nb2listw(nb, style = "W")
+      
+      moran_result <- moran.test(residual_values, weights)
+      
+      # 2. Local Moran's I (LISA)
+      lisa_result <- localmoran(residual_values, weights)
+      
+      # 3. DBSCAN Clustering
+      clustering_data <- cbind(scale(coords), scale(residual_values))
+      eps <- 0.5 * sd(dist(clustering_data))
+      dbscan_result <- dbscan(clustering_data, eps = eps, minPts = min(5, nrow(clustering_data)/10))
+      
+      # Store results
+      results_df <- data.frame(
+        lisa_pvalue = lisa_result[, 5],
+        cluster = dbscan_result$cluster
+      )
+      
+      return(list(
+        moran = moran_result,
+        lisa = lisa_result,
+        dbscan = dbscan_result,
+        results_df = results_df
+      ))
+    }, error = function(e) {
+      warning(paste("Error analyzing", residual_col, ":", e$message))
+      return(NULL)
+    })
+  }
+  
+  # Analyze each residual
+  results$individual_analyses <- lapply(residual_cols, analyze_single_residual)
+  names(results$individual_analyses) <- residual_cols
+  
+  # Create summary
+  results$summary <- data.frame(
+    residual = residual_cols,
+    n_valid_points = sapply(results$individual_analyses, function(x) {
+      if (!is.null(x)) nrow(x$results_df) else NA
+    }),
+    moran_i = sapply(results$individual_analyses, function(x) {
+      if (!is.null(x)) x$moran$estimate[1] else NA
+    }),
+    moran_p = sapply(results$individual_analyses, function(x) {
+      if (!is.null(x)) x$moran$p.value else NA
+    })
+  )
+  
+  return(results)
+}
+
+# Check the structure of your data
+str(all_data_inc_na[c("long", "lat")])
+
+# If needed, unnest your coordinate columns
+if (is.list(all_data_inc_na$long)) {
+  all_data_inc_na$long <- unlist(all_data_inc_na$long)
+}
+if (is.list(all_data_inc_na$lat)) {
+  all_data_inc_na$lat <- unlist(all_data_inc_na$lat)
+}
+
+# Then run the analysis
+residual_columns <- c("resid_pm", "resid_o3", "resid_no2", "resid_ndvi")
+cluster_results <- analyze_residual_clusters(all_data_inc_na, residual_columns)
+
+# Check the results
+print(cluster_results$summary)
+```
+
+################################
+Create model functions
+```{r}
+# Create exposure list
+exposure_list <- list(
+  pm = list(
+    name = "pm",
+    baseline = "pm_2002",
+    change = "pm_change"
+  ),
+  o3 = list(
+    name = "o3",
+    baseline = "o3_2002",
+    change = "o3_change"
+  ),
+  no2 = list(
+    name = "no2",
+    baseline = "no2_2000",
+    change = "no2_change"
+  ),
+  ndvi = list(
+    name = "ndvi",
+    baseline = "ndvi_2000",
+    change = "ndvi_change"
+  ),
+  temp = list(
+    name = "mean_temp",
+    baseline = NULL,
+    change = "mean_temp"  # No change variable for temp
+  )
+)
+
+# Function to run GAM models
+run_gam_models <- function(data, exposure_info) {
+  # Extract exposure information
+  exp_var <- exposure_info$change
+  baseline_exposure <- exposure_info$baseline
+  
+  # Skip if data is missing the exposure variable - gives warning 
+  if (!exp_var %in% names(data)) {
+    warning(paste("Variable", exp_var, "not found in dataset"))
+    return(NULL)
+  }
+  
+  # Base components that will be in all models: gentrification score and county/borough
+  base_formula <- paste(exp_var, "~ score_0.5 + s(COUNTYFP10, bs='re')")
+  
+  # Create model formulas
+  formulas <- list(
+    # Base models (score + county + spatial) for tensor product and mrf smooth
+    tp_base = paste(base_formula, "+ te(long, lat, d = 2, bs = 'gp', m = 2)"),
+    mrf_base = paste(base_formula, "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+    
+    # Models with income
+    tp_income = paste(base_formula, "+ s(med_income_2016) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
+    mrf_income = paste(base_formula, "+ s(med_income_2016) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+    mrf_income_rank = paste(base_formula, "+ rank(med_income_2016) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))"),
+
+    # Models with distance to downtown
+    tp_dist = paste(base_formula, "+ s(dt_dist) + te(long, lat, d = 2, bs = 'gp', m = 2)"),
+    mrf_dist = paste(base_formula, "+ s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  )
+  
+  # Add baseline models if baseline exposure level exists (all except temp)
+  if (!is.null(baseline_exposure) && baseline_exposure %in% names(data)) {
+    formulas$tp_baseline <- paste(base_formula, "+", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_baseline <- paste(base_formula, "+", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    # Combinations with baseline
+    formulas$tp_income_baseline <- paste(base_formula, "+ s(med_income_2016) +", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_income_baseline <- paste(base_formula, "+ s(med_income_2016) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$tp_dist_baseline <- paste(base_formula, "+ s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_dist_baseline <- paste(base_formula, "+ s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+    
+    formulas$tp_full <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ te(long, lat, d = 2, bs = 'gp', m = 2)")
+    formulas$mrf_full <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) +", paste0("s(", baseline_exposure, ")"), "+ s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  }
+  
+  # Add income + distance combinations
+  formulas$tp_income_dist <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) + te(long, lat, d = 2, bs = 'gp', m = 2)")
+  formulas$mrf_income_dist <- paste(base_formula, "+ s(med_income_2016) + s(dt_dist) + s(GEOID, bs = 'mrf', k = 5, xt = list(nb = nb))")
+  
+  # Convert formulas to formula objects
+  formulas <- lapply(formulas, as.formula)
+  
+  # Run models
+  models <- purrr::map(formulas, ~try(gam(., 
+                                        family = scat, 
+                                        data = data, 
+                                        method = "REML"), 
+                                    silent = TRUE))
+  
+  return(models)
+}
+
+# drop geometry from spatial data while keeping coordinates
+data_prepared <- all_data_inc %>%
+  mutate(
+    COUNTYFP10 = as.factor(COUNTYFP10),
+    GEOID = as.factor(GEOID)
+  ) %>%
+  st_drop_geometry()
+
+# Construct neighbors list for MRF models
+nb <- poly2nb(all_data_inc, row.names = all_data_inc$GEOID)
+names(nb) <- attr(nb, "region.id") 
+
+# JH 10/25/24 Warning: some observations have no neighbours; if this seems unexpected, try increasing the snap argument.Warning: neighbour object has 4 sub-graphs; if this sub-graph count seems unexpected, try increasing the snap argument.
+```
+Checking neighbor relationships for MRF models
+```{r}
+# Visualize the sub-graphs
+plot(all_data_inc$geometry)
+colors <- rainbow(length(nb))
+plot(nb, st_coordinates(st_centroid(all_data_inc)), col=colors, add=TRUE)
+# the sub-graphs match the islands.
+# since we are adjusting by borough in the models, the 4 sub-graphs might be okay?? JH 10/26/24
+```
+
+Run models and check models
+```{r}
+# Run models for each exposure
+all_models <- purrr::map(exposure_list, ~run_gam_models(data_prepared, .))
+
+# Function to check which models succeeded/failed
+check_models <- function(models) {
+  model_status <- map(models, ~!inherits(., "try-error"))
+  successful_models <- names(models)[unlist(model_status)]
+  failed_models <- names(models)[!unlist(model_status)]
+  
+  return(list(
+    successful = successful_models,
+    failed = failed_models
+  ))
+}
+
+# Check status of all models
+model_status <- map(all_models, check_models)
+model_status
+
+```
+
+
+Model diagnostics (11/8/24)
+```{r}
+# Extract the mrf_income models
+mrf_income_models <- purrr::map(all_models, "mrf_income")
+
+# Check the summary of all mrf_income models
+purrr::walk(mrf_income_models, summary)
+
+summary(mrf_income_models$pm)
+plot(resid(mrf_income_models$pm))
+plot(mrf_income_models$pm, pages = 1)
+
+#gam check
+gam.check(mrf_income_models$pm)
+gam.check(mrf_income_models$o3)
+gam.check(mrf_income_models$no2)
+gam.check(mrf_income_models$ndvi)
+gam.check(mrf_income_models$temp)
+# p values all non sig fr checking which is good  for med income, but GEOID and county return NA p values?
+
+#concurvity - high worst between s(COUNTYFP10) and s(GEOID) - 0.86 -problematic?
+concurvity(mrf_income_models$pm, full = TRUE)
+concurvity(mrf_income_models$pm, full = FALSE)
+concurvity(mrf_income_models$o3, full = TRUE)
+concurvity(mrf_income_models$o3, full = FALSE)
+concurvity(mrf_income_models$no2, full = TRUE)
+concurvity(mrf_income_models$no2, full = FALSE)
+concurvity(mrf_income_models$ndvi, full = TRUE)
+concurvity(mrf_income_models$ndvi, full = FALSE)
+
+# Get the fitted values and residuals
+fitted_values <- fitted(mrf_income_models$pm)
+residuals <- resid(mrf_income_models$pm)
+
+# Create a data frame for plotting
+plot_data <- data.frame(fitted = fitted_values, residuals = residuals)
+
+# Plot Residuals vs Fitted
+ggplot(plot_data, aes(x = fitted, y = residuals)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals") +
+  theme_minimal()
+
+
+
+traceback()
+
+```
+# Plot the residuals for the "pm" mrf_income model
+
+
+Create basic QQ plots for models
+```{r}
+# Function to create QQ plots for a specific exposure
+create_exposure_qq_plots <- function(models_list, exposure_name) {
+  exposure_models <- models_list[[exposure_name]]
+  
+  plots <- names(exposure_models) %>%
+    purrr::map(function(model_name) {
+      model <- exposure_models[[model_name]]
+      
+      # Skip if model is an error
+      if (inherits(model, "try-error")) {
+        return(NULL)
+      }
+      
+      # Create QQ plot
+      resid_df <- data.frame(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model)
+      )
+      
+      ggplot(resid_df, aes(sample = residuals)) +
+        stat_qq() +
+        stat_qq_line(color = "red") +
+        labs(
+          title = paste0(exposure_name, "\n", model_name),
+          x = "Theoretical Quantiles",
+          y = "Sample Quantiles"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(size = 10, hjust = 0.5),
+          axis.title = element_text(size = 8),
+          axis.text = element_text(size = 7)
+        )
+    }) %>%
+    purrr::compact() # Remove NULL values from the list
+  
+  # Calculate grid layout
+  n_plots <- length(plots)
+  n_cols <- min(3, n_plots)
+  n_rows <- ceiling(n_plots / n_cols)
+  
+  # Combine plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = plots,
+    ncol = n_cols,
+    nrow = n_rows,
+    top = grid::textGrob(paste("QQ Plots for", exposure_name), 
+                        gp = grid::gpar(fontsize = 12))
+  )
+  
+  return(combined_plot)
+}
+
+# Function to create QQ plots for a specific model type across exposures
+create_model_type_qq_plots <- function(models_list, model_type) {
+  # Convert the for loop to purrr::map
+  plots <- names(models_list) %>%
+    purrr::map(function(exposure_name) {
+      exposure_models <- models_list[[exposure_name]]
+      
+      # Check if the model type exists for this exposure
+      if (!model_type %in% names(exposure_models)) {
+        return(NULL)
+      }
+      
+      model <- exposure_models[[model_type]]
+      
+      # Skip if model is an error
+      if (inherits(model, "try-error")) {
+        return(NULL)
+      }
+      
+      # Create QQ plot
+      resid_df <- data.frame(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model)
+      )
+      
+      ggplot(resid_df, aes(sample = residuals)) +
+        stat_qq() +
+        stat_qq_line(color = "red") +
+        labs(
+          title = paste0(exposure_name, "\n", model_type),
+          x = "Theoretical Quantiles",
+          y = "Sample Quantiles"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(size = 10, hjust = 0.5),
+          axis.title = element_text(size = 8),
+          axis.text = element_text(size = 7)
+        )
+    }) %>%
+    purrr::compact() # Remove NULL values from the list
+  
+  # Calculate grid layout
+  n_plots <- length(plots)
+  n_cols <- min(3, n_plots)
+  n_rows <- ceiling(n_plots / n_cols)
+  
+  # Combine plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = plots,
+    ncol = n_cols,
+    nrow = n_rows,
+    top = grid::textGrob(paste("QQ Plots for", model_type), 
+                        gp = grid::gpar(fontsize = 12))
+  )
+  
+  return(combined_plot)
+}
+
+# Function to list available model types
+list_model_types <- function(models_list) {
+  unique(unlist(lapply(models_list, names)))
+}
+
+# Function to list available exposures
+list_exposures <- function(models_list) {
+  names(models_list)
+}
+
+```
+
+
+Display basic QQ plots for models
+```{r}
+# List all model types
+model_types <- list_model_types(all_models)
+
+# Display all QQ plots
+purrr::walk(model_types, ~create_model_type_qq_plots(all_models, .))
+
+```
+
+Create functions for QQ plots with confidence intervals
+```{r}
+# Function to create a single QQ plot with confidence bands
+create_single_qq_plot <- function(model, title) {
+  if (inherits(model, "try-error")) return(NULL)
+  
+  data.frame(
+    residuals = residuals(model, type = "deviance"),
+    fitted = fitted(model)
+  ) %>%
+    ggplot(aes(sample = residuals)) +
+    geom_qq_band(bandType = "ks", mapping = aes(fill = "KS"), alpha = 0.5) +
+    geom_qq_band(bandType = "ts", mapping = aes(fill = "TS"), alpha = 0.5) +
+    geom_qq_band(bandType = "pointwise", mapping = aes(fill = "Normal"), alpha = 0.5) +
+    geom_qq_band(bandType = "boot", mapping = aes(fill = "Bootstrap"), alpha = 0.5) +  
+    stat_qq_line(color = "red") +
+    stat_qq_point(size = 1) +
+    labs(
+      title = title,
+      x = "Theoretical Quantiles",
+      y = "Sample Quantiles"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 10, hjust = 0.5),
+      axis.title = element_text(size = 8),
+      axis.text = element_text(size = 7)
+    )
+}
+
+# Function to arrange plots in a grid
+arrange_plots <- function(plots, main_title) {
+  n_plots <- length(plots)
+  n_cols <- min(3, n_plots)  
+  n_rows <- ceiling(n_plots / n_cols)
+  
+  gridExtra::grid.arrange(
+    grobs = plots,
+    ncol = n_cols,
+    nrow = n_rows,
+    top = grid::textGrob(
+      main_title,
+      gp = grid::gpar(fontsize = 12)  
+    )
+  )
+}
+
+# Main display function
+display_qq_plots_by_model_type <- function(models_list) {
+  # Get all unique model types
+  model_types <- models_list %>%
+    map(names) %>%
+    reduce(union)
+  
+  # Create plots for each model type
+  walk(model_types, function(model_type) {
+    # Extract all models of this type across exposures
+    plots <- models_list %>%
+      imap(function(exposure_models, exposure_name) {
+        if (!model_type %in% names(exposure_models)) return(NULL)
+        
+        create_single_qq_plot(
+          exposure_models[[model_type]], 
+          title = paste0(exposure_name, "\n", model_type)
+        )
+      }) %>%
+      compact()
+    
+    # Arrange and display plots for this model type
+    arrange_plots(
+      plots,
+      main_title = paste("QQ Plots for", model_type)
+    )
+  })
+}
+
+```
+
+Display QQ plots with confidence bands for models
+```{r}
+# Display QQ plots
+display_qq_plots_by_model_type(all_models)
+```
+
+Create comprehensive diagnostic plots (11/2 - need to change the scale of the plots for visibility)
+```{r}
+create_model_diagnostics_by_type <- function(models_list, model_type) {
+  # Create diagnostic plots for each exposure
+  diagnostic_plots <- models_list %>%
+    imap(function(exposure_models, exposure_name) {
+      # Skip if model type doesn't exist or is error
+      if (!model_type %in% names(exposure_models) || 
+          inherits(exposure_models[[model_type]], "try-error")) {
+        return(NULL)
+      }
+      
+      model <- exposure_models[[model_type]]
+      
+      # Create residuals dataframe
+      resid_df <- tibble(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model),
+        scale_residuals = residuals(model, type = "scaled.pearson"),
+        response = model$y
+      )
+      
+      # Create the four diagnostic plots
+      list(
+        # 1. QQ plot
+        qq = ggplot(resid_df, aes(sample = residuals)) +
+          stat_qq() +
+          stat_qq_line(color = "red") +
+          labs(title = paste(exposure_name, "- Normal Q-Q Plot")) +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8)),
+        
+        # 2. Residuals vs Fitted
+        resid = ggplot(resid_df, aes(x = fitted, y = residuals)) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +
+          labs(title = paste(exposure_name, "- Residuals vs Fitted"),
+               x = "Fitted values",
+               y = "Deviance residuals") +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8)),
+        
+        # 3. Scale-location plot
+        scale = ggplot(resid_df, 
+                      aes(x = fitted, y = sqrt(abs(scale_residuals)))) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Scale-Location"),
+               x = "Fitted values",
+               y = "√|Standardized residuals|") +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8)),
+        
+        # 4. Response vs Fitted
+        resp = ggplot(resid_df, aes(x = fitted, y = response)) +
+          geom_point(alpha = 0.5) +
+          geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Response vs Fitted"),
+               x = "Fitted values",
+               y = "Response") +
+          theme_minimal() +
+          theme(plot.title = element_text(size = 8))
+      )
+    }) %>%
+    compact() # Remove NULL entries
+  
+  # Stop if no valid models found
+  if (length(diagnostic_plots) == 0) {
+    stop("No valid models found for the specified model type")
+  }
+  
+  # Flatten the nested list of plots
+  all_plots <- diagnostic_plots %>%
+    flatten()
+  
+  # Calculate grid dimensions
+  n_exposures <- length(diagnostic_plots)
+  n_cols <- 4  # One column for each type of diagnostic plot
+  
+  # Combine all plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = all_plots,
+    ncol = n_cols,
+    nrow = n_exposures,
+    top = grid::textGrob(
+      paste("Diagnostic Plots for Model Type:", model_type),
+      gp = grid::gpar(fontsize = 12, fontface = "bold")
+    )
+  )
+  
+  return(combined_plot)
+}
+
+display_all_model_diagnostics <- function(models_list) {
+  # Get unique model types
+  model_types <- models_list %>%
+    map(names) %>%
+    flatten_chr() %>%
+    unique()
+  
+  # Create and display all plots at once
+  plots <- model_types %>%
+    map(~{
+      tryCatch({
+        create_model_diagnostics_by_type(models_list, .x)
+      }, error = function(e) {
+        message(paste("Error creating plots for model type:", .x))
+        message(e)
+        return(NULL)
+      })
+    }) %>%
+    compact()
+  
+  # Calculate grid layout for all model types
+  n_types <- length(plots)
+  grid_dims <- c(ceiling(sqrt(n_types)), floor(sqrt(n_types)))
+  if (prod(grid_dims) < n_types) grid_dims[2] <- grid_dims[2] + 1
+  
+  # Display all plots in a single grid
+  do.call(gridExtra::grid.arrange, 
+          c(plots, 
+            list(ncol = grid_dims[1],
+                 nrow = grid_dims[2])))
+}
+display_all_model_diagnostics(all_models)
+
+```
+```{r}
+
+create_model_diagnostics_by_type <- function(models_list, model_type) {
+  # Create diagnostic plots for each exposure
+  diagnostic_plots <- models_list %>%
+    imap(function(exposure_models, exposure_name) {
+      # Skip if model type doesn't exist or is error
+      if (!model_type %in% names(exposure_models) || 
+          inherits(exposure_models[[model_type]], "try-error")) {
+        return(NULL)
+      }
+      
+      model <- exposure_models[[model_type]]
+      
+      # Create residuals dataframe
+      resid_df <- tibble(
+        residuals = residuals(model, type = "deviance"),
+        fitted = fitted(model),
+        scale_residuals = residuals(model, type = "scaled.pearson"),
+        response = model$y
+      )
+      
+      # Create the four diagnostic plots
+      list(
+        # 1. QQ plot
+        qq = ggplot(resid_df, aes(sample = residuals)) +
+          stat_qq() +
+          stat_qq_line(color = "red") +
+          labs(title = paste(exposure_name, "- Normal Q-Q Plot")) +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12)),
+        
+        # 2. Residuals vs Fitted
+        resid = ggplot(resid_df, aes(x = fitted, y = residuals)) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +
+          labs(title = paste(exposure_name, "- Residuals vs Fitted"),
+               x = "Fitted values",
+               y = "Deviance residuals") +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12)),
+        
+        # 3. Scale-location plot
+        scale = ggplot(resid_df, 
+                      aes(x = fitted, y = sqrt(abs(scale_residuals)))) +
+          geom_point(alpha = 0.5) +
+          geom_smooth(se = FALSE, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Scale-Location"),
+               x = "Fitted values",
+               y = "√|Standardized residuals|") +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12)),
+        
+        # 4. Response vs Fitted
+        resp = ggplot(resid_df, aes(x = fitted, y = response)) +
+          geom_point(alpha = 0.5) +
+          geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+          labs(title = paste(exposure_name, "- Response vs Fitted"),
+               x = "Fitted values",
+               y = "Response") +
+          theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(size = 16, face = "bold"),
+                axis.title = element_text(size = 12),
+                axis.text = element_text(size = 12))
+      )
+    }) %>%
+    compact() # Remove NULL entries
+  
+  # Stop if no valid models found
+  if (length(diagnostic_plots) == 0) {
+    stop("No valid models found for the specified model type")
+  }
+  
+  # Flatten the nested list of plots
+  all_plots <- diagnostic_plots %>%
+    flatten()
+  
+  # Calculate grid dimensions
+  n_exposures <- length(diagnostic_plots)
+  n_cols <- 4  # One column for each type of diagnostic plot
+  
+  # Combine all plots
+  combined_plot <- gridExtra::grid.arrange(
+    grobs = all_plots,
+    ncol = n_cols,
+    nrow = n_exposures,
+    top = grid::textGrob(
+      paste("Diagnostic Plots for Model Type:", model_type),
+      gp = grid::gpar(fontsize = 18, fontface = "bold")
+    ),
+    heights = rep(1, n_exposures),  # Adjust height of each row to ensure plots are not squished
+    padding = unit(1, "cm")  # Add padding between plots
+  )
+  
+  return(combined_plot)
+}
+
+display_all_model_diagnostics <- function(models_list) {
+  # Get unique model types
+  model_types <- models_list %>%
+    map(names) %>%
+    flatten_chr() %>%
+    unique()
+  
+  # Create and display all plots at once
+  plots <- model_types %>%
+    map(~{
+      tryCatch({
+        create_model_diagnostics_by_type(models_list, .x)
+      }, error = function(e) {
+        message(paste("Error creating plots for model type:", .x))
+        message(e)
+        return(NULL)
+      })
+    }) %>%
+    compact()
+  
+  # Calculate grid layout for all model types
+  n_types <- length(plots)
+  grid_dims <- c(ceiling(sqrt(n_types)), floor(sqrt(n_types)))
+  if (prod(grid_dims) < n_types) grid_dims[2] <- grid_dims[2] + 1
+  
+  # Display all plots in a single grid
+  do.call(gridExtra::grid.arrange, 
+          c(plots, 
+            list(ncol = grid_dims[1],
+                 nrow = grid_dims[2],
+                 top = grid::textGrob("All Model Diagnostics", 
+                                      gp = grid::gpar(fontsize = 18, fontface = "bold")))))
+}
+display_all_model_diagnostics(all_models)
+
+
+```
+
+Create effects summary data frame and forest plot
+```{r}
+# Function to extract effect estimates for score_0.5
+get_score_effects <- function(models_list, model_type = "mrf_income") {
+  effects_list <- list()
+  
+  for (exposure_name in names(models_list)) {
+    model <- models_list[[exposure_name]][[model_type]]
+    
+    if (!inherits(model, "try-error")) {
+      # Get predicted values across range of scores
+      score_seq <- seq(min(model$model$score_0.5), max(model$model$score_0.5), length.out = 100)
+      pred_data <- data.frame(
+        score_0.5 = score_seq,
+        med_income_2016 = mean(model$model$med_income_2016),
+        COUNTYFP10 = levels(model$model$COUNTYFP10)[1],
+        GEOID = levels(model$model$GEOID)[1]
+      )
+      
+      # Get predictions with standard errors
+      preds <- predict(model, pred_data, type = "terms", se.fit = TRUE)
+      
+      # Extract effect for score_0.5 smooth term
+      score_effect <- data.frame(
+        exposure = exposure_name,
+        estimate = diff(range(preds$fit[,"s(score_0.5)"])),
+        se = diff(range(preds$se.fit[,"s(score_0.5)"])),
+        p_value = summary(model)$s.table["s(score_0.5)", "p-value"]
+      )
+      
+      effects_list[[exposure_name]] <- score_effect
+    }
+  }
+  
+  # Combine all effects into one dataframe
+  effects_df <- do.call(rbind, effects_list)
+  
+  # Calculate confidence intervals
+  effects_df$lower <- effects_df$estimate - 1.96 * effects_df$se
+  effects_df$upper <- effects_df$estimate + 1.96 * effects_df$se
+  
+  return(effects_df)
+}
+
+# Get effects
+effects_df <- get_score_effects(all_models)
+
+# Create forest plot
+library(ggplot2)
+
+# Create exposure labels with significance indicators
+effects_df$exposure_label <- paste0(
+  toupper(effects_df$exposure), 
+  ifelse(effects_df$p_value < 0.001, "***",
+         ifelse(effects_df$p_value < 0.01, "**",
+                ifelse(effects_df$p_value < 0.05, "*", "")))
+)
+
+# Create the forest plot
+ggplot(effects_df, aes(y = exposure_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = estimate), size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  labs(
+    title = "Estimated Effects of Gentrification Score on Environmental Exposures",
+    subtitle = "MRF Income Model Results",
+    x = "Effect Size (Range of Smooth Term)",
+    y = "Exposure Type",
+    caption = "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+    plot.caption = element_text(size = 8, hjust = 0),
+    panel.grid.minor = element_blank()
+  )
+
+# Print numerical results
+print(effects_df[, c("exposure_label", "estimate", "se", "p_value", "lower", "upper")])
+```
+
+
+Scale mrf_income models by IQR and create scaled forest plot
+```{r}
+# Function to extract IQR-scaled effect estimates for score_0.5
+get_score_effects_scaled <- function(models_list, model_type = "mrf_income") {
+  effects_list <- list()
+  
+  for (exposure_name in names(models_list)) {
+    model <- models_list[[exposure_name]][[model_type]]
+    
+    if (!inherits(model, "try-error")) {
+      # Get model data
+      model_data <- model$model
+      
+      # Calculate IQRs
+      score_iqr <- IQR(model_data$score_0.5)
+      exposure_var <- exposure_list[[exposure_name]]$change
+      exposure_iqr <- IQR(model_data[[exposure_var]])
+      
+      # Get predicted values across range of scores
+      score_seq <- seq(min(model_data$score_0.5), max(model_data$score_0.5), length.out = 100)
+      pred_data <- data.frame(
+        score_0.5 = score_seq,
+        med_income_2016 = mean(model_data$med_income_2016),
+        COUNTYFP10 = levels(model_data$COUNTYFP10)[1],
+        GEOID = levels(model_data$GEOID)[1]
+      )
+      
+      # Get predictions with standard errors
+      preds <- predict(model, pred_data, type = "terms", se.fit = TRUE)
+      
+      # Extract and scale effect for score_0.5 smooth term
+      raw_effect <- diff(range(preds$fit[,"s(score_0.5)"]))
+      raw_se <- diff(range(preds$se.fit[,"s(score_0.5)"]))
+      
+      # Scale effects by IQRs
+      scaled_effect <- (raw_effect * score_iqr) / exposure_iqr
+      scaled_se <- (raw_se * score_iqr) / exposure_iqr
+      
+      score_effect <- data.frame(
+        exposure = exposure_name,
+        estimate = scaled_effect,
+        se = scaled_se,
+        p_value = summary(model)$s.table["s(score_0.5)", "p-value"],
+        exposure_iqr = exposure_iqr,
+        score_iqr = score_iqr
+      )
+      
+      effects_list[[exposure_name]] <- score_effect
+    }
+  }
+  
+  # Combine all effects into one dataframe
+  effects_df <- do.call(rbind, effects_list)
+  
+  # Calculate confidence intervals
+  effects_df$lower <- effects_df$estimate - 1.96 * effects_df$se
+  effects_df$upper <- effects_df$estimate + 1.96 * effects_df$se
+  
+  return(effects_df)
+}
+
+# Get scaled effects
+effects_df_scaled <- get_score_effects_scaled(all_models)
+
+# Create forest plot with scaled effects
+effects_df_scaled$exposure_label <- paste0(
+  toupper(effects_df_scaled$exposure), 
+  ifelse(effects_df_scaled$p_value < 0.001, "***",
+         ifelse(effects_df_scaled$p_value < 0.01, "**",
+                ifelse(effects_df_scaled$p_value < 0.05, "*", "")))
+)
+
+ggplot(effects_df_scaled, aes(y = exposure_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(x = estimate), size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  labs(
+    title = "IQR-Scaled Effects of Gentrification Score on Environmental Exposures",
+    subtitle = "MRF Income Model Results",
+    x = "Effect Size (Change in Exposure IQR per Score IQR)",
+    y = "Exposure Type",
+    caption = "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+    plot.caption = element_text(size = 8, hjust = 0),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+Understanding direction and magnitude of exposure changes 
+```{r}
+# Function to analyze changes in exposures
+analyze_exposure_changes <- function(data, exposure_list) {
+  results <- list()
+  
+  for (exp_name in names(exposure_list)) {
+    exp_info <- exposure_list[[exp_name]]
+    change_var <- exp_info$change
+    
+    # Skip temperature which doesn't have baseline/change structure
+    if (exp_name != "temp") {
+      baseline_var <- exp_info$baseline
+      
+      # Calculate summary statistics
+      change_stats <- data %>%
+        summarise(
+          n = nrow(data),
+          mean_change = mean(.data[[change_var]], na.rm = TRUE),
+          median_change = median(.data[[change_var]], na.rm = TRUE),
+          sd_change = sd(.data[[change_var]], na.rm = TRUE),
+          pct_positive = mean(.data[[change_var]] > 0, na.rm = TRUE) * 100,
+          q25 = quantile(.data[[change_var]], 0.25, na.rm = TRUE),
+          q75 = quantile(.data[[change_var]], 0.75, na.rm = TRUE)
+        )
+      
+      # Create histogram
+      hist_plot <- ggplot(data, aes(x = .data[[change_var]])) +
+        geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+        geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+        labs(
+          title = paste("Distribution of Changes in", toupper(exp_name)),
+          x = "Change",
+          y = "Count"
+        ) +
+        theme_minimal()
+      
+      # Store results
+      results[[exp_name]] <- list(
+        stats = change_stats,
+        plot = hist_plot
+      )
+    }
+  }
+  
+  return(results)
+}
+
+# Run the analysis
+change_analysis <- analyze_exposure_changes(data_prepared, exposure_list)
+
+# Print summary statistics 
+print(change_analysis)
+
+# Create a combined plot of all histograms
+plot_list <- lapply(names(change_analysis), function(exp_name) {
+  change_analysis[[exp_name]]$plot
+})
+
+# Arrange all plots in a grid
+library(gridExtra)
+grid.arrange(grobs = plot_list, ncol = 2)
+
+# Create boxplots for another view of the distributions
+combined_changes <- data.frame(
+  Exposure = character(),
+  Change = numeric()
+)
+
+for (exp_name in names(exposure_list)) {
+  if (exp_name != "temp") {
+    change_var <- exposure_list[[exp_name]]$change
+    tmp_data <- data.frame(
+      Exposure = toupper(exp_name),
+      Change = data_prepared[[change_var]]
+    )
+    combined_changes <- rbind(combined_changes, tmp_data)
+  }
+}
+
+# Create boxplot
+ggplot(combined_changes, aes(x = Exposure, y = Change)) +
+  geom_boxplot(fill = "skyblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Distribution of Changes Across All Exposures",
+    x = "Exposure Type",
+    y = "Change"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```

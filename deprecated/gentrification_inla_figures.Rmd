@@ -1,0 +1,916 @@
+---
+title: "Environmental Gentrification - INLA Analysis Overview"
+author: "Joyce Hu"
+date: "2025-4-18"
+output: html_document
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, progress = FALSE)
+```
+
+# Project overview
+This project examines the relationship between gentrification and environmental changes in New York City between 2000 and 2016, investigating whether census tracts experiencing higher levels of gentrification are associated with patterns of environmental improvement or degradation. This analysis informs the basis of a second part of the project which evaluates the relationship between environmental gentrification (as a combined exposure) and the change in prevalence of health-relevant endpoints.
+
+## Research questions
+The first research question we seek to answer with this project is, “does environmental gentrification impact New York City?” More specifically, do areas undergoing gentrification experience different environmental changes compared to non-gentrifying areas?
+
+## Data inputs
+We use a census tract-level index of gentrification (Johnson et al., 2021) as the independent variable and examines its relationship with several environmental factors (dependent variables): Air quality indicators (PM2.5,O3, NO2), vegetation measured through NDVI - Normalized Difference Vegetation Index, mean temperature in 2016.
+
+<details>
+<summary><h3>Click to expand - background on environmental gentrification and hypothesis</h3></summary>
+Although gentrification has been differentially conceptualized in the literature, it is broadly recognized as the process where wealthier populations enter a neighborhood of historical disinvestment, contributing to the displacement of existing residents via increasing prices of housing, goods, services. In analyses, the following characteristics are often linked to gentrification: capital reinvestment in previously disinvested neighborhoods, demographic shifts with influx of higher-income residents, physical landscape transformation, changes in commercial services and amenities.
+
+Green or environmental gentrification is the idea that initiatives and policies seeking to improve environmental conditions (e.g., urban greening like parks and street trees, air pollution and brownfield site remediation) may contribute to, or in some cases even drive, gentrification e.g., driving up the housing prices in a neighborhood. This has implications for environmental and health justice. For example, urban green space is associated with improved mental health and increased physical activity but if greening initiatives also contribute to gentrification, existing residents may not experience these health benefits.
+
+We hypothesize that NYC census tracts with higher gentrification levels between 2000-2016 will be associated with: decreased concentrations of PM2.5 and NO2, increased vegetation (higher NDVI values), smaller increases in ozone (O3) concentrations, lower mean temperatures
+</details>
+
+<details>
+<summary><h3> Load packages </h3></summary>
+```{r}
+library(tidyverse)
+library(here) 
+library(arrow)          # Reading parquet files
+library(readxl)         # Reading excel files
+library(tidycensus)     # Census data access
+library(tigris)         # Census tract boundaries
+library(terra)          # Raster processing
+library(exactextractr)  # Raster aerial interpolation
+library(tidyterra)      # For terra objects in tidyverse
+library(sf)             # Spatial data 
+library(spdep)          # Spatial dependence tests
+library(spatialreg)     # Spatial regression models
+library(INLA)           # Integrated nested laplace approximation models
+
+# Unused packages for this code (keeping for now)
+# library(mgcv) library(fixest) library(lmtest) library(mgcViz) library(DHARMa) library(qqplotr)
+# library(lattice)library(distr) #for qqbounds() 
+# library(gridExtra) library(qgam)  library(ggfields) # for plotting spatial field
+# library(ggregplot) #INLA compatible plotting library (efxplot)
+# library(kableExtra)library(inlatools) # for INLA diagnostics
+```
+</details>
+
+
+# Data acquisition and processing
+This section loads and prepares all the necessary datasets for analysis.
+We combine NYC census tract boundaries with:
+1. Gentrification scores (2000-2016) sourced from [Johnson et al.'s (2021) gentrifiction index](https://doi.org/10.1080/13658816.2021.1931873) 2. Air pollutant measures (PM2.5, NO2, O3) 3. Normalized Difference Vegetation Index (NDVI) as the measure of vegetative greening  4. Temperature data (not used in final analysis) 5. Median income
+
+<details>
+<summary>Click to expand</summary>
+```{r}
+# Check if 'data' directory exists; if not, create it
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+# Load gentrification score by tract
+gentrification <- read.csv(here("data", "Data_NYC_Gentrification_2000_16.csv")) %>% 
+  mutate(tractid = as.character(tractid)) %>% 
+  dplyr::select(tractid, score_0.5)
+
+# Load gentrification score if using xlsx file:
+# gentrification <- read_xlsx(here("Gentrification","Data_NYC_Gentrification_2000_16.xlsx")) %>%
+#   mutate(tractid = as.character(tractid)) %>%
+#   dplyr::select(tractid, score_0.5)
+
+# Pull NYC tract IDs/fips from gentrification index dataset for filtering
+nyc_fips <- gentrification$tractid
+
+# Load NYC tracts shapefile
+nyc_tracts <- tracts(state = "NY", county = c("Bronx", "Kings", "New York", "Queens", "Richmond"), year = 2010) %>%
+  # clean lat and long for Conley SEs
+  mutate(lat = as.numeric(INTPTLAT10), long = as.numeric(INTPTLON10), GEOID = GEOID10) %>% 
+  # filter for FIPS codes included in gentrification index dataset
+  filter(GEOID %in% nyc_fips)
+
+
+# Load NY tracts populatuion weighted centroid points from Census data
+nyc_weighted_centroids <- read.table("https://www2.census.gov/geo/docs/reference/cenpop2010/tract/CenPop2010_Mean_TR36.txt", 
+                         header = TRUE, sep = ",", stringsAsFactors = FALSE, 
+                         colClasses = c("character", "character", "character", "numeric", "numeric", "numeric")) %>%
+  mutate(FIPS = paste(STATEFP, COUNTYFP, TRACTCE, sep = "")) %>% 
+  ## filter for only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%  
+  rename(Longitude_weighted = LONGITUDE, 
+         Latitude_weighted = LATITUDE)
+
+# JH - 10/12/24 warning persists 10/13, 10/14 Warning: R metadata may have unsafe or invalid elements ℹ Type: "externalptr" options(arrow.unsafe_metadata = TRUE) #
+
+# Temperature data
+if(!file.exists(here("data","summarized_daily_temp_preds.parquet"))){download.file("https://zenodo.org/records/10557980/files/summarized_daily_temp_preds.parquet?download=1", 
+                                                                                   destfile = here("data","summarized_daily_temp_preds.parquet"))}
+
+# Temperature by tract
+temp <- read_parquet(here("data","summarized_daily_temp_preds.parquet")) %>%
+  filter(str_detect(date, "2016")) %>%
+  mutate(temp_c = mean_temp_daily_cK/100-273.15) %>% 
+  mutate(temp_f = temp_c*9/5+32) %>% 
+  group_by(GEOID, date) %>%
+  ungroup() %>% 
+  group_by(GEOID) %>% 
+  summarize(mean_temp = mean(mean_temp_daily_cK/100))
+
+# NDVI by tract (need to have it downloaded and stored locally)
+ndvi_mean_2016 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_mean_2000 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "mean")
+
+ndvi_sd_2016 <- rast(here("data", "ndvi_c2_2000_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "stdev")
+
+ndvi_sd_2000 <- rast(here("data", "ndvi_c2_2016_2.tif")) %>% 
+  exact_extract(nyc_tracts, fun = "stdev")
+
+# PM2.5 data
+# Download data from URL
+download_data <- function() {
+  # set longer timeout
+  options(timeout = 7200)
+  if(!file.exists(here("data", "2016_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_pm25_daily_average.txt.gz", destfile = here("data", "2016_pm25_daily_average.txt.gz"))} #2016
+  if(!file.exists(here("data", "2002_pm25_daily_average.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_pm25_daily_average.txt.gz", destfile = here("data", "2002_pm25_daily_average.txt.gz"))}} #2002
+download_data()
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2002
+pm_tract_2002 <- read.delim(gzfile(here("data", "2002_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## Include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>%
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## Calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(pm_mean_2002 = mean(pm25_daily_average.ug.m3.),
+            pm_sd_2002 = sd(pm25_daily_average.ug.m3.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in PM2.5 daily average by census tract from EPA FAQSD - 2016
+pm_tract_2016 <- read.delim(gzfile(here("data", "2016_pm25_daily_average.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(pm_mean_2016 = mean(Prediction),
+            pm_sd_2016 = sd(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+  
+# Combine 2002 and 2016 pm data for nyc_tracts
+pm_tract <- pm_tract_2002 %>%
+  inner_join(pm_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# NO2 CACES
+no2_2016_caces <- read.csv(here("data", "2016_no2_caces.csv")) %>% 
+  mutate(no2_2016 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_2000_caces <- read.csv(here("data", "2000_no2_caces.csv")) %>% 
+  mutate(no2_2000 = as.numeric(pred_wght)) %>%  
+  mutate(fips = as.character(fips))
+
+no2_caces <- left_join(no2_2000_caces, no2_2016_caces, by = "fips") %>% 
+  select(no2_2000, no2_2016, fips)
+
+#O3 data download
+options(timeout = 7200)
+if(!file.exists(here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2016_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2016_ozone_daily_8hour_maximum.txt.gz"))} #2016
+if(!file.exists(here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))){download.file("https://ofmpub.epa.gov/rsig/rsigserver?data/FAQSD/outputs/2002_ozone_daily_8hour_maximum.txt.gz", destfile = here("data", "2002_ozone_daily_8hour_maximum.txt.gz"))} #2002
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2002
+o3_tract_2002 <- read.delim(gzfile(here("data", "2002_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>% 
+  ## include only NYC tracts
+  filter(FIPS %in% nyc_fips) %>% 
+  ## Convert FIPS to character for compatibility
+  mutate(FIPS = as.character(FIPS)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = "FIPS") %>%
+  ## calculate annual average by tract using population weighted centroid
+  group_by(FIPS) %>%
+  summarize(o3_mean_2002 = mean(ozone_daily_8hour_maximum.ppb.),
+            o3_sd_2002 = sd(ozone_daily_8hour_maximum.ppb.),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+# Read in ozone daily 8-hour maximum by census tract from EPA FAQSD (external file) - 2016
+o3_tract_2016 <- read.delim(gzfile(here("data", "2016_ozone_daily_8hour_maximum.txt.gz")), sep = ",") %>%
+  ## include only NYC tracts
+  filter(Loc_Label1 %in% nyc_fips) %>% 
+  ## Convert Loc_Label1 to character for compatibility
+  mutate(Loc_Label1 = as.character(Loc_Label1)) %>%
+  ## Join with population-weighted centroids
+  left_join(nyc_weighted_centroids, by = c("Loc_Label1" = "FIPS")) %>% 
+  ## calculate annual average by tract using  population weighted centroid
+  group_by(Loc_Label1) %>%
+  summarize(o3_mean_2016 = mean(Prediction),
+            o3_sd_2016 = sd(Prediction),
+            Longitude = first(Longitude_weighted),
+            Latitude = first(Latitude_weighted))
+
+o3_tract <- o3_tract_2002 %>%
+  left_join(o3_tract_2016, by = c("FIPS" = "Loc_Label1", "Longitude", "Latitude")) %>% 
+  mutate(FIPS = as.character(FIPS))
+
+# Merge all exposure data
+all_data <- nyc_tracts %>% 
+  # join gentrification index by tract
+  right_join(gentrification, by = c("GEOID10" = "tractid")) %>%
+  left_join(pm_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(pm_2016 = pm_mean_2016, pm_2002 = pm_mean_2002, pm_change = pm_2016-pm_2002) %>% 
+  left_join(o3_tract, by = c("GEOID" = "FIPS"))  %>% 
+  mutate(o3_2016 = o3_mean_2016, o3_2002 = o3_mean_2002, o3_change = o3_2016-o3_2002, o3_sd_2016 = o3_sd_2016, o3_sd_2002 = o3_sd_2002) %>% 
+  left_join(no2_caces, by = c("GEOID" = "fips")) %>% 
+  mutate(no2_change = no2_2016-no2_2000) %>% 
+  mutate(ndvi_mean_2016 = ndvi_mean_2016, ndvi_mean_2000 = ndvi_mean_2000, ndvi_change = ndvi_mean_2016-ndvi_mean_2000) %>%
+  mutate(ndvi_sd_2016 = ndvi_sd_2016, ndvi_sd_2000 = ndvi_sd_2000) %>%
+  left_join(temp, by = "GEOID")
+
+
+############# Median income ###############################
+# Find median household income variable in 2000 decennial census
+all_vars_dec <- 
+  load_variables(year = 2000, dataset = "sf3")
+
+# Models adjusting for median income in 2000 (note: 2000 decennial census is 1999 data)
+income_2000 <- get_decennial(variables = "P053001", year = 2000,  sumfile = "sf3", state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2000 = value)
+#results in 226 missing tracts in terms of 2010 tracts.
+
+# Find median household income variable in 2010 American Community Survey
+income_2010 <- get_acs(variables = "B06011_001", year = 2010, state = "NY", 
+                  county = c("Queens", "King", "New York", "Richmond", "Bronx"), geography = "tract") %>% 
+  rename(med_income_2010 = estimate)
+
+# Joining both income sets with data and imputing 2010 data where 2000 data is missing
+all_data_inc <- all_data %>%
+  left_join(income_2000, by = "GEOID") %>%
+  left_join(income_2010, by = "GEOID") %>%
+  mutate(med_income_2000_impute = coalesce(med_income_2000, med_income_2010)) %>% 
+  # coerce GEOID to numeric then factor class to avoid error in MRF smooth
+  mutate(GEOID = as.numeric(GEOID)) %>% 
+  mutate(GEOID = factor(GEOID)) %>% 
+ # coerce COUNTYFP10 to numeric then factor class to avoid error ?
+  mutate(COUNTYFP10 = as.numeric(COUNTYFP10)) %>% 
+  mutate(COUNTYFP10 = factor(COUNTYFP10))
+
+# Ranking median income 
+all_data_inc$med_income_ranked <- rank(all_data_inc$med_income_2000_impute)
+
+
+# Converting median income to deciles and scaling
+# Create deciles
+income_quantiles <- quantile(all_data_inc$med_income_2000_impute, probs = seq(0, 1, by = 0.1))
+all_data_inc$med_income_decile <- findInterval(all_data_inc$med_income_2000_impute, 
+                                             income_quantiles,
+                                             rightmost.closed = TRUE)
+```
+</details>
+
+
+# Spatial Modeling with INLA
+### We use Integrated Nested Laplace Approximation (INLA) to fit Bayesian spatial models that account for spatial autocorrelation in our variables.
+
+## INLA set up for all variables
+Currently, need to use INLA version 21.02.23 to be compatible with R version 4.2
+<details>
+<summary>Click to expand</summary>
+```{r}
+# Set INLA repository
+options(repos = c(getOption("repos"),
+   INLA="https://inla.r-inla-download.org/R/stable"))
+# 
+# # Install INLA and dependencies (from CRAN)
+# install.packages("INLA", dep = TRUE)
+
+# Need to download an older version of INLA to be compatible with HPC R version and GLIBC compatibility
+
+# remotes::install_version("INLA", 
+#                          version="21.02.23", 
+#                          repos=c(getOption("repos"),
+#                                  INLA="https://inla.r-inla-download.org/R/stable"), 
+#                          dep=TRUE)
+
+```
+</details>
+
+
+## Creating spatial mesh for INLA (to be used for all variables)
+```{r}
+graphics.off()
+
+# Create matrix of population-weighted tract centroid locations
+Locations <- as.matrix(cbind(
+  as.numeric(nyc_weighted_centroids$Longitude_weighted),
+  as.numeric(nyc_weighted_centroids$Latitude_weighted)
+))
+
+# Create mesh options for spatial modeling
+# Various mesh option specifications 
+MeshA <- inla.mesh.2d(jitter(Locations), max.edge = c(20, 40))
+MeshB <- inla.mesh.2d(Locations, max.edge = c(20, 40))
+MeshC <- inla.mesh.2d(Locations, max.edge = c(50, 100))
+mesh_simple <- inla.mesh.create(Locations)
+
+# Visualize mesh structure options
+plot(MeshA)
+points(Locations, col = "red", pch = 2)
+
+plot(MeshB)
+points(Locations, col = "red", pch = 2)
+
+plot(MeshC)
+points(Locations, col = "red", pch = 2)
+
+
+# "Generally, the mesh function automatically creates a mesh like mesh A, where closer-together sampling locations produce smaller triangles. When exploring/setting up preliminary analyses, use a mesh like mesh B. For analyses to be reported in a paper, use a mesh like mesh C. Be careful of edges, and try to allow some space around your sampling area for INLA to estimate. The edge triangles can be bigger to reduce computing power."
+
+# Set chosen mesh to use for analysis
+Mesh <- MeshB
+```
+
+## INLA - Creating the A Matrix and Stochastic Partial Differential Equation (SPDE) object (to be used for all variables)
+```{r}
+# Create A matrix
+A <- inla.spde.make.A(Mesh, loc = Locations) 
+# "the A matrix maps the Gaussian Markov Random Field (GMRF) from the mesh nodes to the n observation location. This is represented by a matrix with the number of observations as column and the number of nodes as rows."
+
+
+# Create spatial structure (SPDE object)
+spde <- inla.spde2.matern(Mesh, alpha=2) # Tutorial fixed alpha as 2
+
+# Create all the required indexes for the SPDE model, naming the spatial field as “spatial.field”, which facilitates the extraction of the estimated values of the spatial field after the fitting process.
+iset <- inla.spde.make.index(name = "spatial.field", spde$n.spde)
+```
+
+## Create INLA stacks
+INLA uses a concept called "stacks" to organize data for spatial modeling. Each stack contains the response variable, spatial projector matrices, and covariates i.e., a separate stack needs to be created for each of the environmental variables. 
+
+Each stack is specific to the variables included in the model. The final model we have chosen incorporates the standard deviations for our environmental variables.
+
+```{r}
+# Create INLA stack for PM2.5
+stk_pm_sd <- inla.stack(
+  data=list(y=all_data_inc$pm_change), # PM2.5 change 2002-2016 as response
+                  A=list(A,1),  #the A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), #the Intercept
+                                 iset),  # The spatial index
+                               # Covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 pm_sd_2002 = all_data_inc$pm_sd_2002, #2002 std devs
+                                 pm_sd_2016 = all_data_inc$pm_sd_2016))) # 2016 std devs
+
+# Create INLA stack for NDVI
+stk_ndvi_sd <- inla.stack(
+  data=list(y=all_data_inc$ndvi_change), 
+                  A=list(A,1),  
+                  effects=list(c(list(Intercept=1), 
+                                 iset),  
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 ndvi_sd_2000 = all_data_inc$ndvi_sd_2000,
+                                 ndvi_sd_2016 = all_data_inc$ndvi_sd_2016)))
+# Create INLA stack for O3
+stk_o3_sd <- inla.stack(
+  data=list(y=all_data_inc$o3_change), 
+                  A=list(A,1),  
+                  effects=list(c(list(Intercept=1), 
+                                 iset),  
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 o3_sd_2002 = all_data_inc$o3_sd_2002, # 2002 O3 std dev
+                                 o3_sd_2016 = all_data_inc$o3_sd_2016))) # 2016 O3 std dev
+
+# The NO2 data did not come with standard deviations. Here, we try using O3 standard deviations as a proxy as O3 and NO2 often have an inverse relationship. 
+stk_no2_sd <- inla.stack(
+  data=list(y=all_data_inc$no2_change), 
+                  A=list(A,1),  
+                  effects=list(c(list(Intercept=1), 
+                                 iset),  
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10,
+                                 o3_sd_2002 = all_data_inc$o3_sd_2002, #2002 O3 std dev
+                                 o3_sd_2016 = all_data_inc$o3_sd_2016))) #2016 O3 std dev
+
+# Create stack for temp - no standard deviation
+stk_temp <- inla.stack(
+  data=list(y=all_data_inc$mean_temp), # The response - 2016 mean temperatures
+                  A=list(A,1),  # The A matrix; the 1 is included to make the list (covariates)
+                  effects=list(c(list(Intercept=1), # The intercept
+                                 iset),  # The spatial index
+                               #Covariates
+                               list(
+                                 score_0.5 = all_data_inc$score_0.5,
+                                 med_income_decile = all_data_inc$med_income_decile,
+                                 COUNTYFP10 = all_data_inc$COUNTYFP10)))
+
+# Note: The A matrix structure consists of two components:
+# 1. The projector matrix for the spatial random field
+# 2. A one-to-one mapping for fixed effect covariates (indicated by the '1')
+
+```
+ 
+
+## INLA Model Fitting
+
+### Model fitting for PM2.5
+```{r}
+# Specify formula
+formula_pm_sd <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  pm_sd_2002 +                          # Standard deviation 2002 
+  pm_sd_2016 +                          # Standard deviation 2016
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid")
+
+#Specify model 
+model_pm_sd <- inla(formula_pm_sd, 
+             data = inla.stack.data(stk_pm_sd, spde=spde),
+             family = 'gaussian', 
+             control.predictor = list(A = inla.stack.A(stk_pm_sd), compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
+```
+
+### Model fitting for NDVI
+<details>
+<summary>Click to expand</summary>
+```{r}
+# Specify formula
+formula_ndvi_sd <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  ndvi_sd_2000 + # Standard deviation 2000
+  ndvi_sd_2016 + # Standard deviation 2016
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") 
+
+#Specify model 
+model_ndvi_sd <-inla(formula_ndvi_sd, 
+             data = inla.stack.data(stk_ndvi_sd, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_ndvi_sd),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
+```
+</details>
+
+### Model fitting for O3
+<details>
+<summary>Click to expand</summary>
+```{r}
+# Specify formula
+formula_o3_sd <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  o3_sd_2002 + # Standard deviation 2002
+  o3_sd_2016 + # Standard deviation 2016
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") #random effect
+ 
+# Specify model
+model_o3_sd <-inla(formula_o3_sd, 
+             data = inla.stack.data(stk_o3_sd, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_o3_sd),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
+
+```
+</details>
+
+### Model fitting for NO2
+<details>
+<summary>Click to expand</summary>
+```{r}
+# Specify formula
+formula_no2_sd <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  o3_sd_2002 +
+  o3_sd_2016 +
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") 
+ 
+# Specify model 
+model_no2_sd<-inla(formula_no2_sd, 
+             data = inla.stack.data(stk_no2_sd, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_no2_sd),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
+
+```
+</details>
+
+### Model fitting for mean temperature (2016)
+<details>
+<summary>Click to expand</summary>
+```{r}
+formula1_temp <- y ~ -1 + Intercept + score_0.5 +
+  med_income_decile + 
+  f(spatial.field, model = spde) +
+  f(COUNTYFP10, model = "iid") 
+ 
+model1_temp <-inla(formula1_temp, 
+             data = inla.stack.data(stk_temp, spde=spde),
+             family= 'gaussian', 
+             control.predictor=list(A = inla.stack.A(stk_temp),compute = TRUE), 
+             control.compute = list(dic = TRUE, cpo = TRUE))
+```
+</details>
+
+## INLA model results and diagnostics
+This code defines functions to analyze spatial autocorrelation using Moran's I statistic to evaluate residual spatial autocorrelation. Next, it creates functions to analyze the INLA models, extracting fixed effects, hyperparameters, and spatial field characteristics, generating diagnostic plots and tables for model evaluation. 
+<details>
+<summary>Click to expand</summary>
+```{r}
+# List the available models (one per variable)
+pm_models <- list(model_pm_sd)
+pm_names <- c("model_pm_sd")
+
+o3_models <- list(model_o3_sd)
+o3_names <- c("model_o3_sd")
+
+no2_models <- list(model_no2_sd)
+no2_names <- c("model_no2_sd")
+
+ndvi_models <- list(model_ndvi_sd)
+ndvi_names <- c("model_ndvi_sd")
+
+temp_models <- list(model1_temp)
+temp_names <- c("model1_temp")
+
+# Function to calculate Moran's I 
+analyze_spatial_autocorrelation <- function(models, model_names, observed_values, coords, k = 5) {
+  # Initialize results dataframe
+  results <- data.frame(
+    model = character(),
+    morans_i = numeric(),
+    p_value = numeric(),
+    z_score = numeric(),
+    significance = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each model
+  for (i in 1:length(models)) {
+    model <- models[[i]]
+    model_name <- model_names[i]
+    
+    # Skip NULL models
+    if (is.null(model)) {
+      next
+    }
+    
+    # Extract fitted values
+    fitted_values <- model$summary.fitted.values$mean
+    
+    # Calculate residuals
+    residuals <- observed_values - fitted_values[1:length(observed_values)]
+    
+    # Create neighbors list
+    knn <- knearneigh(coords, k = k)
+    nb <- knn2nb(knn)
+    lw <- nb2listw(nb, style = "W")
+    
+    # Calculate Moran's I 
+    mi_test <- moran.test(residuals, lw, zero.policy = TRUE)
+    moran_i <- round(mi_test$estimate[1], 4)
+    p_value <- mi_test$p.value
+    z_score <- round(mi_test$statistic, 4)
+    
+    # Add significance 
+    sig_indicator <- ifelse(p_value < 0.001, "***", 
+                     ifelse(p_value < 0.01, "**",
+                     ifelse(p_value < 0.05, "*", "ns")))
+    
+    # Create Moran scatter plot 
+    plot_title <- paste("Moran's I Scatter Plot -", model_name)
+    mp <- moran.plot(residuals, lw, main = plot_title,
+                    xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+    
+    # Add regression line with the Moran's I slope
+    abline(lm(mp$wx ~ mp$x), col = "red", lwd = 2)
+    
+    # Add stats to plot
+    legend_text <- c(
+      paste("Moran's I:", moran_i),
+      paste("p-value:", format.pval(p_value, digits = 4), sig_indicator),
+      paste("z-score:", z_score)
+    )
+    
+    legend("topright", legend = legend_text, bty = "n", cex = 0.9)
+    
+    # Add to results dataframe
+    results <- rbind(results, data.frame(
+      model = model_name,
+      morans_i = moran_i,
+      p_value = p_value,
+      z_score = z_score,
+      significance = sig_indicator,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  return(results)
+}
+
+# Function to analyze INLA models - simplified for single model analysis
+analyze_inla_models <- function(models, model_names = NULL, include_spatial = TRUE) {
+  # Make sure model_names are available
+  if (is.null(model_names)) {
+    model_names <- paste0("Model", 1:length(models))
+  }
+  
+  if (length(model_names) != length(models)) {
+    warning("Number of model names doesn't match number of models. Using default names.")
+    model_names <- paste0("Model", 1:length(models))
+  }
+  
+  # Create result lists
+  results <- list()
+  
+  # Loop through each model
+  for (i in seq_along(models)) {
+    model <- models[[i]]
+    name <- model_names[i]
+    model_results <- list()
+    
+    # Handle NULL models
+    if (is.null(model)) {
+      results[[name]] <- list(
+        fixed_summary = NULL,
+        hyper_summary = NULL,
+        dic = NA
+      )
+      next
+    }
+    
+    # Fixed effects summary
+    model_results$fixed_summary <- round(model$summary.fixed, 3)
+    
+    # Hyperparameter summary
+    model_results$hyper_summary <- round(model$summary.hyperpar, 3)
+    
+    # DIC 
+    model_results$dic <- model$dic$dic
+    
+    # Extract spatial field info
+    if (include_spatial && !is.null(model$summary.random$spatial.field)) {
+      if ("spde" %in% ls(.GlobalEnv) && !is.null(model$summary.random$spatial.field)) {
+        tryCatch({
+          spde_obj <- get("spde", envir = .GlobalEnv)
+          model.res <- inla.spde2.result(model, 'spatial.field', spde_obj, do.transf = TRUE)
+          model_results$spatial_range <- model.res$summary.log.range.nominal
+          model_results$spatial_variance <- model.res$summary.log.variance.nominal
+          model_results$marginals_var <- model.res$marginals.var
+          model_results$marginals_kap <- model.res$marginals.kap
+          model_results$marginals_range <- model.res$marginals.range
+        }, error = function(e) {
+          message(paste("Could not calculate spatial field parameters for model", name, "- Error:", e$message))
+        })
+      }
+      
+      # Extract spatial field mean and sd for residual analysis
+      model_results$spatial_field_mean <- model$summary.random$spatial.field$mean
+      model_results$spatial_field_sd <- model$summary.random$spatial.field$sd
+    }
+    
+    # Store results
+    results[[name]] <- model_results
+  }
+  
+  # Return the results
+  return(results)
+}
+
+# Function to plot model diagnostics 
+plot_model_diagnostics <- function(model, model_name) {
+  if (is.null(model)) {
+    cat("Model is NULL, cannot generate diagnostics\n")
+    return(invisible(NULL))
+  }
+  
+  if (!is.null(model$summary.random$spatial.field)) {
+    par(mfrow = c(2, 2))
+    
+    # Extract spatial field mean as proxy for residuals
+    residuals <- model$summary.random$spatial.field$mean
+    
+    # Time series plot of residuals
+    plot(residuals, type = "p", main = paste("Spatial Field Values -", model_name), 
+         xlab = "Index", ylab = "Value", pch = 19, cex = 0.5)
+    abline(h = 0, col = "red", lty = 2)
+    
+    # QQplot
+    qqnorm(residuals, main = paste("Normal Q-Q Plot -", model_name))
+    qqline(residuals, col = "red")
+    
+    # Histogram
+    hist(residuals, main = paste("Histogram -", model_name), 
+         xlab = "Spatial Field Value", breaks = 20, 
+         col = "lightblue", border = "white")
+    
+    # Boxplot
+    boxplot(residuals, main = paste("Boxplot -", model_name), 
+            ylab = "Spatial Field Value", col = "lightblue")
+    
+    par(mfrow = c(1, 1))
+    return(invisible(residuals))
+  } else {
+    cat("No spatial field available for this model\n")
+    return(invisible(NULL))
+  }
+}
+
+# Function to create a summary table of all Moran's I results
+create_morans_summary <- function(results_list, model_type_names) {
+  combined_results <- data.frame()
+  
+  for (i in 1:length(results_list)) {
+    results <- results_list[[i]]
+    results$model_type <- model_type_names[i]
+    combined_results <- rbind(combined_results, results)
+  }
+  
+  # Reorder columns to put model_type first
+  combined_results <- combined_results[, c("model_type", "model", "morans_i", 
+                                          "p_value", "z_score", "significance")]
+  
+  return(combined_results)
+}
+
+# Run Moran's I analysis for all models
+# PM model
+cat("## Moran's I Analysis for PM Model\n")
+pm_morans <- analyze_spatial_autocorrelation(
+  pm_models, 
+  pm_names, 
+  all_data_inc$pm_change, 
+  Locations, 
+  k = 5
+)
+knitr::kable(pm_morans, caption = "Moran's I Results for PM Model")
+
+# O3 model
+cat("## Moran's I Analysis for O3 Model\n")
+o3_morans <- analyze_spatial_autocorrelation(
+  o3_models, 
+  o3_names, 
+  all_data_inc$o3_change, 
+  Locations, 
+  k = 5
+)
+knitr::kable(o3_morans, caption = "Moran's I Results for O3 Model")
+
+# NO2 model
+cat("## Moran's I Analysis for NO2 Model\n")
+no2_morans <- analyze_spatial_autocorrelation(
+  no2_models, 
+  no2_names, 
+  all_data_inc$no2_change, 
+  Locations, 
+  k = 5
+)
+knitr::kable(no2_morans, caption = "Moran's I Results for NO2 Model")
+
+# NDVI model
+cat("## Moran's I Analysis for NDVI Model\n")
+ndvi_morans <- analyze_spatial_autocorrelation(
+  ndvi_models, 
+  ndvi_names, 
+  all_data_inc$ndvi_change, 
+  Locations, 
+  k = 5
+)
+knitr::kable(ndvi_morans, caption = "Moran's I Results for NDVI Model")
+
+# Temperature model
+cat("## Moran's I Analysis for Temperature Model\n")
+temp_morans <- analyze_spatial_autocorrelation(
+  temp_models, 
+  temp_names, 
+  all_data_inc$mean_temp, 
+  Locations, 
+  k = 5
+)
+knitr::kable(temp_morans, caption = "Moran's I Results for Temperature Model")
+
+# Create summary of all results
+cat("## Combined Moran's I Results for All Models\n")
+all_morans_summary <- create_morans_summary(
+  list(pm_morans, o3_morans, no2_morans, ndvi_morans, temp_morans),
+  c("PM", "O3", "NO2", "NDVI", "Temperature")
+)
+knitr::kable(all_morans_summary, caption = "Combined Moran's I Results")
+
+# Get model results
+cat("## Model Diagnostics\n")
+
+# PM Model
+cat("### PM Model Diagnostics\n")
+plot_model_diagnostics(pm_models[[1]], pm_names[1])
+
+# O3 Model
+cat("### O3 Model Diagnostics\n")
+plot_model_diagnostics(o3_models[[1]], o3_names[1])
+
+# NO2 Model
+cat("### NO2 Model Diagnostics\n")
+plot_model_diagnostics(no2_models[[1]], no2_names[1])
+
+# NDVI Model
+cat("### NDVI Model Diagnostics\n")
+plot_model_diagnostics(ndvi_models[[1]], ndvi_names[1])
+
+# Temperature Model
+cat("### Temperature Model Diagnostics\n")
+plot_model_diagnostics(temp_models[[1]], temp_names[1])
+
+# Create DIC comparison table
+cat("## Model Comparison using DIC\n")
+model_comparison <- data.frame(
+  Model_Type = character(),
+  Model = character(),
+  DIC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Add PM model
+if (!is.null(pm_models[[1]]) && !is.null(pm_models[[1]]$dic)) {
+  model_comparison <- rbind(model_comparison, 
+                           data.frame(
+                             Model_Type = "PM",
+                             Model = pm_names[1],
+                             DIC = pm_models[[1]]$dic$dic,
+                             stringsAsFactors = FALSE
+                           ))
+}
+
+# Add O3 model
+if (!is.null(o3_models[[1]]) && !is.null(o3_models[[1]]$dic)) {
+  model_comparison <- rbind(model_comparison, 
+                           data.frame(
+                             Model_Type = "O3",
+                             Model = o3_names[1],
+                             DIC = o3_models[[1]]$dic$dic,
+                             stringsAsFactors = FALSE
+                           ))
+}
+
+# Add NO2 model
+if (!is.null(no2_models[[1]]) && !is.null(no2_models[[1]]$dic)) {
+  model_comparison <- rbind(model_comparison, 
+                           data.frame(
+                             Model_Type = "NO2",
+                             Model = no2_names[1],
+                             DIC = no2_models[[1]]$dic$dic,
+                             stringsAsFactors = FALSE
+                           ))
+}
+
+# Add NDVI model
+if (!is.null(ndvi_models[[1]]) && !is.null(ndvi_models[[1]]$dic)) {
+  model_comparison <- rbind(model_comparison, 
+                           data.frame(
+                             Model_Type = "NDVI",
+                             Model = ndvi_names[1],
+                             DIC = ndvi_models[[1]]$dic$dic,
+                             stringsAsFactors = FALSE
+                           ))
+}
+
+# Add Temperature model
+if (!is.null(temp_models[[1]]) && !is.null(temp_models[[1]]$dic)) {
+  model_comparison <- rbind(model_comparison, 
+                           data.frame(
+                             Model_Type = "Temperature",
+                             Model = temp_names[1],
+                             DIC = temp_models[[1]]$dic$dic,
+                             stringsAsFactors = FALSE
+                           ))
+}
+
+# Display model comparison table
+knitr::kable(model_comparison, caption = "Model Comparison by DIC")
+```
+</details>
+
+```{r}
+```
+

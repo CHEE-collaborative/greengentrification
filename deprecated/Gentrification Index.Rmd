@@ -1,0 +1,193 @@
+---
+title: "Gentrification Index"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#read in data from excel worksheet, assuming it is located in the working directory
+knitr::opts_knit$set(root.dir = "C:/Users/Joyce Hu/OneDrive - National University of Singapore/YSPH/Research/Green gentrification/greengentrification/Gentrification")
+############################################################################################
+# R code for data processing and analysis to compute small area indices of gentrification. #
+# This application is for New York City census tracts.                                     #
+############################################################################################
+
+# All the code will work properly for the R - 3.6.2 and R- studio version - 1.2.5033 or higher 
+# download data and R code in the same folder
+# Apply the following if needed.
+#remove everything from workspace: 
+rm(list=ls(all=TRUE))
+# remove all plots:  dev.off()
+# remember to set working directory (e.g. setwd function)
+#setwd("C:\\Users\\Joyce Hu\\OneDrive - National University of Singapore\\YSPH\\Research")
+
+# install.packages("knitr")
+library(knitr)
+
+# Install the required packages- in case you don't have these packages, remove "#" and run the next statement
+#install.packages("dplyr", "tidyverse", "readxl", "factoextra", "matrixStats","remotes", "ggplot2", #
+#install.packages("maptools", "rgdal", "rgeos", "shapefiles", "sp", "spdep", "CARBayes")
+
+# STEP 1: PCA alternatives
+library(dplyr)
+library(tidyverse)
+library(readxl)
+library(factoextra)
+library(matrixStats)
+library(ggplot2)
+
+# STEP 2: Bayesian spatial smoothing
+#library(maptools) 
+#library(rgdal) 
+#library(rgeos) 
+library(shapefiles)
+#library(sp)
+library(spdep)
+library(CARBayes)
+library(sf) #to replace rgdal package
+if(!require('CARBayes')) {
+  install.packages('CARBayes')
+  library('CARBayes')
+}
+library(terra)
+```
+
+```{r PCA and its alternatives, echo = FALSE}
+# STEP 1: PCA
+data <-readxl::read_excel("Data_NYC_Gentrification_2000_16.xlsx") %>% 
+ dplyr::select(tractid, NHW00_16,	A20_34y00_16,	College00_16,	mdfami00_16,	mdrent00_16) %>% 
+  mutate(tractid = as.character(tractid),
+        logNHW00_16 = log(NHW00_16+1.01),
+        logA20_34y00_16 = log(A20_34y00_16+1.01),	
+        logCollege00_16 = log(College00_16+1.01),	
+        logmdfami00_16 = log(mdfami00_16+1.01),	
+        logmdrent00_16 = log(mdrent00_16+1.01))
+
+# extract numeric matrix and label rows with tract IDs, excl "036" for NYS
+rate00_16 <- data %>% 
+  remove_rownames %>% 
+  column_to_rownames(var="tractid")
+
+# prcomp (non-robust SVD on standardized log(input vars +1.01))
+  PCAlogstd <- dplyr::select(rate00_16, 6:10) %>% 
+    prcomp(., scale = TRUE, retx = TRUE)
+  summary(PCAlogstd) 
+  
+  PCAlogstd$rotation #columns are eigenvectors
+  
+# results for individuals (tracts)
+  scores<-as.matrix(PCAlogstd$x[,1])
+  colnames(scores) <- "rawscores"
+  
+  fviz_pca_biplot(PCAlogstd)
+
+```
+
+```{r Bayesian spatial smoothing, echo=FALSE}
+#STEP 2: Bayesian spatial smoothing
+
+
+#######ORIGINAL CODE WRITTEN FOR SP##############
+# Create a spatial data object that combines attributes with polygons from a shape file
+#shp <- read.shp(shp.name = "Gentrification.shp")
+#dbf <- (read.dbf(dbf.name = "Gentrification.dbf"))
+#dbf$dbf <- dbf$dbf[,1:2] #1st 2 columns are all that is needed
+#dbf$dbf <- dbf$dbf[,c(2,1)] 
+#dbf$dbf<-dbf$dbf[order(dbf$dbf$tractid), ] #ensure sorted by tract order
+#data.combined <- combine.data.shapefile(rate00_16, shp, dbf) 
+# Create a spatial weights matrix
+#W.nb <- poly2nb(data.combined, row.names = dbf$dbf[,1])
+#W.mat <- nb2mat(W.nb, style = "B", zero.policy=T) #basic binary weights, not standardized
+
+######EDITED SF CODE#############
+shp = st_read("Gentrification.shp")
+dbf = vect("Gentrification.dbf")
+dbf = data.frame(dbf$tractid, dbf[, 1:2])
+# Following places tractFIPS in the first column, whose values must match, row by row, with rownames of the attributes frame
+names(dbf) = c("tractid", "dbf")
+dbf = dbf[order(dbf$tractid), ] #ensure sorted by tract order
+
+# Merge attribute data with polygons 
+data.combined = merge(shp, dbf, by = "tractid")
+
+# Create a spatial weights matrix (using spdep)
+W.nb = poly2nb(data.combined, row.names = data.combined$tractid)
+W.mat = nb2mat(W.nb, style = "B", zero.policy = TRUE)
+###################################
+###ORIGINAL CODE###################
+
+# Manually associate neighbors with island tracts [NOTE: each polygon must be associated with at lest one other]
+# tracts = 36005051600 (City Island, Bronx), 36081107201 (in Jamaica Bay, near Rockaways), 36081092200 (Breezy Point)
+W.mat[326,193]<-W.mat[326,194]<-1 # City Island
+W.mat[1904,1872]<-W.mat[1904,1871]<-1 # Jamaica Bay
+W.mat[1861,1863]<-1 #Breezy Point
+#following maintains symmerty of W.mat
+W.mat[193,326]<-W.mat[194,326]<-1
+W.mat[1872,1904]<-W.mat[1871,1904]<-1
+W.mat[1863,1861]<-1
+
+# Apply the Leroux CAR model
+scores_1 <- as.data.frame(scores)
+form <- scores[,1] ~ 1
+
+PCA00_16CARBayes <- S.CARleroux(formula=form, 
+                                family="gaussian", 
+                                W=W.mat, burnin=100000, 
+                                n.sample= 300000, thin=20, 
+                                verbose=TRUE) 
+
+# summary stats for model fit: 
+PCA00_16CARBayes$modelfit
+# following plots posterior samples of coefficients for checking MCMC convergence
+plot(PCA00_16CARBayes$samples$beta)
+plot(PCA00_16CARBayes$samples$rho)
+
+# Extract quantiles of MCMC samples per tract
+Quants <- apply(PCA00_16CARBayes$samples$fitted,2,quantile, c(0.025, 0.5, 0.975))
+PCA00_16CARBayesQuants<-t(Quants)
+colnames(PCA00_16CARBayesQuants) <- c("score_0.025", "score_0.5", "score_0.975")
+
+# Combine input data with scores from PCA module and CARBayes output
+final_dataset <- cbind(rate00_16, scores, PCA00_16CARBayesQuants) #assure all sorted by tractid (FIPS code)
+
+# Export the final dataset as a csv file in the folder where this R code and it's required data are stored
+write.csv(final_dataset, "PCA00_16CARBayes.csv")
+```
+
+```{r}
+#Mapping (own code added)
+final_dataset
+final_dataset$tractid = shp$tractid
+final_dataset$geometry = shp$geometry
+
+library(ggplot2)
+library(classInt)
+library(RColorBrewer)
+
+# Set the number of breaks
+num_breaks = 5
+
+# Categorize into natural breaks (jenks)
+breaks = classIntervals(final_dataset$score_0.5, n = num_breaks, style = "jenks")
+
+# Assign colors
+color_palette = brewer.pal(num_breaks, "YlOrRd")
+color_palette = rev(color_palette)
+
+# Apply colors to  data
+final_dataset$colors = cut(final_dataset$score_0.5, breaks = breaks$brks, labels = FALSE)
+final_dataset$colors = color_palette[final_dataset$colors]
+
+category_labels = sprintf("%1.2f to %1.2f", head(breaks$brks, -1), tail(breaks$brks, -1))
+
+# Plot map
+ggplot()+
+  geom_sf(data=final_dataset,aes(geometry = geometry, fill = factor(final_dataset$colors))) +
+  scale_fill_brewer(palette="YlOrRd", labels = category_labels)+
+  labs(fill = "Categorized by Natural breaks",
+       title = "Gentrification Index")
+
+```
+
+```
