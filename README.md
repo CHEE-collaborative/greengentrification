@@ -5,13 +5,13 @@ This repository holds the code for the research project, “Environmental Gentri
 This project first examines the relationship between gentrification and environmental changes in New York City between 2000 and 2016, investigating whether census tracts experiencing higher levels of gentrification are associated with patterns of environmental improvement or degradation. This analysis informs the basis of a second part of the project which evaluates the relationship between environmental gentrification (as a combined exposure) and the change in prevalence of health-relevant endpoints.
 
 ## Data downloads
-We use a census tract-level index of gentrification (Johnson et al., 2021) as the independent variable and examines its relationship with several environmental factors (dependent variables): Air quality indicators (PM2.5,O3, NO2), vegetation measured through NDVI - Normalized Difference Vegetation Index, mean temperature in 2016. We use CDC PLACES health data for our health-relevant endpoints (CDC, 2024).
+We use a census tract-level index of gentrification (Johnson et al., 2021) as the independent variable and examine its relationship with several environmental factors (dependent variables): Air quality indicators (PM2.5, O3, NO2), vegetation measured through NDVI - Normalized Difference Vegetation Index, mean temperature in 2016. We use CDC PLACES health data for our health-relevant endpoints (CDC, 2024).
 
 The following datasets are downloaded and processed in the provided code:
 
 PM2.5 and O3 from Fused Air Quality Surface Using Downscaling (FAQSD) via the U.S. Environmental Protection Agency https://www.epa.gov/hesc/rsig-related-downloadable-data-files 
 
-Temperature – Population-weighted tract-level warm season daily temperature for the northeastern United States (Just, 2024)  https://doi.org/10.5281/zenodo.10557980  
+Temperature – population-weighted tract-level warm season daily temperature for the northeastern United States (Just, 2024)  https://doi.org/10.5281/zenodo.10557980  
 
 Median household income from the 2010 American Community Survey via the tidycensus package https://walker-data.com/tidycensus/ 
 
