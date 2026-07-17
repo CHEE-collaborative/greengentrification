@@ -131,6 +131,7 @@ if (file.exists("combined_data_sf.rds")) {
     st_as_sf()
   saveRDS(combined_data_sf, "combined_data_sf.rds")
 }
+saveRDS(W_matrix, "W_matrix.rds")                   
 
 
 # ==============================================================================

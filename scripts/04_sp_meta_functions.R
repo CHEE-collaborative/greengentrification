@@ -38,6 +38,10 @@ library(parallel)
 library(doParallel)
 ##############################################################################
 ##############################################################################
+
+combined_data_sf <- readRDS("/EDIT FILE PATH/combined_data_sf.rds")
+W_matrix <- readRDS("/EDIT FILE PATH/W_matrix.rds")
+
 # Set analysis parameters
 fast_mode <- FALSE  # Change to FALSE for full analysis, change to TRUE for testing
 save_csv <- TRUE
