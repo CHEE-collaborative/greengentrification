@@ -11,10 +11,13 @@ library(httr)
 
 set.seed(123)
 
+getwd()
+setwd("C:/Users/joyce.hu/Documents")
+here::set_here("C:/Users/joyce.hu/Documents")
+here::here() 
+
 if (!dir.exists(here("data"))) dir.create(here("data"))
 
-
-# ==============================================================================
 # Data acquisition and processing
 # ==============================================================================
 gent <- read_xlsx(here("data", "Data_NYC_Gentrification_2000_16.xlsx"), sheet = "Data") %>%
@@ -121,6 +124,7 @@ neighbors_mat <- nb2mat(neighbors, zero.policy = TRUE, style = "B")
 neighbors_mat[1287, 1586] <- 1
 neighbors_mat[1586, 1287] <- 1
 W_matrix <- neighbors_mat
+rownames(W_matrix) <- colnames(W_matrix) <- nyc_tracts$tractid
 
 if (file.exists("combined_data_sf.rds")) {
   combined_data_sf <- readRDS("combined_data_sf.rds")
