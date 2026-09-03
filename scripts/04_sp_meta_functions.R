@@ -43,7 +43,7 @@ combined_data_sf <- readRDS("/EDIT FILE PATH/combined_data_sf.rds")
 W_matrix <- readRDS("/EDIT FILE PATH/W_matrix.rds")
 
 # Set analysis parameters
-fast_mode <- FALSE  # Change to FALSE for full analysis, change to TRUE for testing
+fast_mode <- TRUE  # Change to FALSE for full analysis, change to TRUE for testing
 save_csv <- TRUE
 save_diagnostics <- TRUE
 
@@ -244,8 +244,7 @@ tune_rho_acceptance <- function(data, outcome, W_matrix, target_acceptance = 0.2
   
   # Create spatial weights matrix for sample
   n <- nrow(spmeta_data)
-  original_indices <- match(spmeta_data$GEOID, combined_data_sf$GEOID)
-  W_sample <- W_matrix[original_indices, original_indices]
+  W_sample <- W_matrix[spmeta_data$GEOID, spmeta_data$GEOID]
   neighbors <- list(W_sample)
   
   # Start with initial value
@@ -486,8 +485,7 @@ run_spmeta_analysis <- function(data, outcome, W_matrix) {
   
   # Create spatial weights matrix
   n <- nrow(spmeta_data)
-  original_indices <- match(spmeta_data$GEOID, combined_data_sf$GEOID)
-  W_sample <- W_matrix[original_indices, original_indices]
+  W_sample <- W_matrix[spmeta_data$GEOID, spmeta_data$GEOID]
   neighbors <- list(W_sample)
   
   # Tune rho acceptance for this outcome
