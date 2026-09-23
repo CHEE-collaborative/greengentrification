@@ -39,6 +39,72 @@ library(doParallel)
 ##############################################################################
 ##############################################################################
 
+################################################################################
+# added by SP
+census_api_key("a7039d631ed49f01684692eb70d4a1ae0590c919")
+
+create_design_matrix_typology <- function(data, outcome_prefix, modifier_var = NULL) {
+  X <- matrix(1, nrow = nrow(data), ncol = 1)
+  colnames(X) <- "intercept"
+  
+  # Exposure typology dummies (referent = "Referent (no gent, no AQ improvement)")
+  if ("exposure_group" %in% names(data)) {
+    exp_factor <- factor(data$exposure_group,
+                         levels = c("Referent (no gent, no AQ improvement)",
+                                    "Gentrified, no AQ improvement",
+                                    "AQ improvement, not gentrified",
+                                    "Gentrified + AQ improvement"))
+    exp_dummies <- model.matrix(~ exp_factor - 1)[, -1, drop = FALSE]
+    colnames(exp_dummies) <- c("gent_only", "aq_only", "gent_and_aq")
+    X <- cbind(X, exp_dummies)
+  }
+  
+  # Baseline (timepoint-1) health value for this outcome, as covariate
+  baseline_col <- paste0("prev_2016_", outcome_prefix)
+  if (baseline_col %in% names(data)) {
+    X <- cbind(X, baseline = as.numeric(scale(data[[baseline_col]]))) # edited by SP from Joyce's recommendation
+  }
+  
+  # NOTE: income covariate removed
+  
+  # Travel time as deciles (unchanged)
+  if ("time" %in% names(data)) {
+    travel_ecdf <- ecdf(data$time)
+    travel_deciles <- ceiling(travel_ecdf(data$time) * 10)
+    X <- cbind(X, time = travel_deciles)
+  }
+  
+  # Borough dummies (unchanged)
+  if ("borough" %in% names(data)) {
+    borough_factor <- as.factor(data$borough)
+    borough_levels <- levels(borough_factor)
+    borough_dummies <- model.matrix(~ borough_factor - 1)[, -1, drop = FALSE]
+    colnames(borough_dummies) <- paste0("borough_", borough_levels[-1])
+    X <- cbind(X, borough_dummies)
+  }
+  
+  # ---- STEP 4: optional equity effect-modification interaction ----
+  # modifier_var should be a binary/categorical column already on `data`
+  # (e.g. "poverty_high", "pct_poc_high") created in the equity section below.
+  # One modifier at a time, per the plan -- do not pass two at once.
+  if (!is.null(modifier_var) && modifier_var %in% names(data) &&
+      "exposure_group" %in% names(data)) {
+    mod_factor <- as.factor(data[[modifier_var]])
+    interaction_dummies <- model.matrix(~ exp_factor * mod_factor - 1)
+    # keep only the interaction columns (main effects already added above)
+    int_cols <- grep(":", colnames(interaction_dummies), value = TRUE)
+    if (length(int_cols) > 0) {
+      int_mat <- interaction_dummies[, int_cols, drop = FALSE]
+      colnames(int_mat) <- paste0("interact_", make.names(int_cols))
+      X <- cbind(X, int_mat)
+    }
+  }
+  
+  return(X)
+}
+
+################################################################################
+
 combined_data_sf <- readRDS("/EDIT FILE PATH/combined_data_sf.rds")
 W_matrix <- readRDS("/EDIT FILE PATH/W_matrix.rds")
 
