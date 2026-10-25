@@ -1,1 +1,325 @@
+---
+title: "Environmental Gentrification and Health (NYC): results summary"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    self_contained: true
+params:
+  a1_mode: full          # Analysis 1 outputs to read (fast | full)
+  health_mode: auto      # health-model outputs: auto (full if compiled, else fast) | fast | full
+---
 
+<!--
+R-5. Reads the pipeline's outputs only; it fits nothing. Knit with the Knit
+button in RStudio, or from the repo root:
+  RSTUDIO_PANDOC=/Applications/RStudio.app/Contents/Resources/app/quarto/bin/tools/aarch64 \
+    Rscript -e 'rmarkdown::render("reports/results_summary.Rmd", output_dir = "results")'
+The knitted HTML goes to the (gitignored) output directory. Core outputs (Table 1,
+Analysis 1) are required; the health, lagged, MODIS and NYCCAS sections say so
+when their outputs are missing.
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 5,
+                      dpi = 120)
+suppressMessages({library(tidyverse); library(here); library(knitr); library(sf)})
+source(here("scripts", "R", "config.R"))
+
+have <- function(f) file.exists(output_path(f))
+rd <- function(f) read.csv(output_path(f), check.names = FALSE, stringsAsFactors = FALSE)
+need <- function(f) {
+  if (!have(f)) stop(sprintf("Required output missing: %s. Run the pipeline first (CLAUDE.md, run order).", f))
+  rd(f)
+}
+# round first and add 0 so that -0.0001 prints as 0.000
+r0 <- function(x, k) round(x, k) + 0
+fmt_ci <- function(m, lo, hi, k = 3) sprintf("%.*f (%.*f to %.*f)", k, r0(m, k), k, r0(lo, k), k, r0(hi, k))
+tbl <- function(x, ...) kable(x, format = "html", ..., table.attr = 'class="table table-condensed"')
+note <- function(...) cat("\n> **Note:** ", ..., "\n\n", sep = "")
+stamp <- function(f) if (have(f)) format(file.mtime(output_path(f)), "%Y-%m-%d %H:%M") else "missing"
+git <- function(args) tryCatch(system2("git", args, stdout = TRUE, stderr = FALSE), error = function(e) NA_character_)
+stopifnot(params$a1_mode %in% c("fast", "full"), params$health_mode %in% c("auto", "fast", "full"))
+```
+
+*Knitted `r format(Sys.time(), "%Y-%m-%d %H:%M")` from branch `r git(c("rev-parse", "--abbrev-ref", "HEAD"))`, commit `r git(c("rev-parse", "--short", "HEAD"))`. Outputs read from `r dirname(output_path("x"))`. This report summarizes saved outputs; methods and settings are in `docs/methods_notes.md`, open decisions in `TASKS.md` and `CLAUDE.md`.*
+
+```{r inputs}
+inputs <- tibble(
+  output = c("table1_exposure_cells.csv", sprintf("analysis1_effects_%s.csv", params$a1_mode),
+             "health_runs_full.csv", "health_runs_fast.csv", "ndvi_modis_citywide.csv",
+             "lagged_effects_long.csv", "lagged_effects_long_ndvi.csv", "nyccas_compare_typology.csv",
+             "nyccas_analysis1_comparison_full.csv"),
+  role = c("Table 1", "Analysis 1", "Health models (full)", "Health models (local test runs)",
+           "NDVI cross-check", "Lagged design (air pollution)", "Lagged design (NDVI)",
+           "NYCCAS exploration", "NYCCAS exploration (Analysis 1)")) %>%
+  mutate(written = map_chr(output, stamp))
+tbl(inputs, caption = "Outputs this report reads, and when each was written")
+```
+
+# Data and exposure
+
+```{r data}
+d <- st_drop_geometry(readRDS(analytic_files$combined_data))
+cells <- need("descriptives_exposure_cells.csv")
+n_gent <- sum(d$gent_yn == "Yes")
+stopifnot("regression check: 311 gentrified" = n_gent == 311)
+```
+
+**Study units:** `r format(nrow(d), big.mark = ",")` NYC census tracts (2010 geography). **Gentrified:** `r n_gent` tracts (`r sprintf("%.1f", 100 * n_gent / nrow(d))`%), Pr(score > citywide 80th percentile) > 0.8. **AQ improvement:** AQ composite (mean of sign-reversed z-scores of the absolute changes in PM₂.₅ 2002→2016 and NO₂ 2000→2016) above the citywide median.
+
+```{r cells}
+cells %>%
+  transmute(Typology = typology, Cell = cell, Tracts = n_tracts, `% of tracts` = pct_tracts,
+            `Greened (dNDVI >= 0.05), n` = n_greened, `% greened` = pct_greened) %>%
+  tbl(caption = "Exposure cells, main typology and NO₂-only sensitivity (SA-5). The greening threshold is pinned.")
+```
+
+```{r borough-cells}
+d %>% count(Borough = borough, cell = exposure_group) %>%
+  pivot_wider(names_from = cell, values_from = n, values_fill = 0) %>%
+  left_join(d %>% group_by(Borough = borough) %>%
+              summarise(`% AQ improved` = round(100 * mean(aq_yn == "Yes"), 1), .groups = "drop"), by = "Borough") %>%
+  tbl(caption = "Exposure cells by borough. AQ improvement is strongly borough-patterned; the sparse 'gentrified, no AQ improvement' cell is almost entirely in Brooklyn.")
+```
+
+## Table 1
+
+```{r table1}
+need("table1_exposure_cells.csv") %>%
+  rename(Section = section, Characteristic = label) %>%
+  tbl(caption = "Tract characteristics by exposure cell: median (Q1 to Q3) or n (%). scripts/06_table1.R")
+```
+
+## Effect-modifier strata
+
+```{r modifiers}
+need("crosstab_cells_by_modifier.csv") %>%
+  filter(typology == "main") %>%
+  dplyr::select(Modifier = modifier, Stratum = stratum, cell, n_tracts) %>%
+  pivot_wider(names_from = cell, values_from = n_tracts, values_fill = 0) %>%
+  tbl(caption = "Exposure cells within each modifier stratum (main typology). Race: modeled in the majority-minority stratum only (1 majority-white gentrified-only tract). Poverty: interaction and stratified models; the < 20% gentrified-only cell is small.")
+```
+
+# Analysis 1: did gentrification track environmental change?
+
+```{r a1-read}
+a1 <- need(sprintf("analysis1_effects_%s.csv", params$a1_mode))
+a1_conv <- need(sprintf("analysis1_convergence_%s.csv", params$a1_mode))
+```
+
+Leroux CAR models (CARBayes) of the absolute change in PM₂.₅, NO₂, O₃ (FAQSD/CACES, 2000/2002→2016) and summer NDVI (three-summer Landsat composites, 1999–2001→2015–17), on the gentrification score (per IQR) or gentrified vs. not, without and with the outcome's baseline level; non-spatial OLS alongside. Changes are later − earlier, so a negative effect is a larger decline. Mode: **`r params$a1_mode`**.
+
+```{r a1-table}
+a1 %>%
+  mutate(cell = paste0(fmt_ci(estimate, lower, upper), ifelse(model == "CAR", sprintf("; Pr(>0) %.2f", pr_gt0), "")),
+         col = paste(ifelse(model == "CAR", "CAR", "OLS"), adjustment)) %>%
+  dplyr::select(Outcome = outcome, Exposure = contrast, col, cell) %>%
+  pivot_wider(names_from = col, values_from = cell) %>%
+  dplyr::select(Outcome, Exposure, `CAR unadjusted`, `CAR adjusted`, `OLS unadjusted`, `OLS adjusted`) %>%
+  tbl(caption = "Analysis 1 effects: posterior mean (95% CrI) for CAR, estimate (95% CI) for OLS; 'adjusted' = with the outcome's baseline level")
+```
+
+```{r a1-figure, fig.height = 5.5}
+a1 %>%
+  mutate(outcome = factor(outcome, levels = c("PM2.5", "NO2", "O3", "NDVI"),
+                          labels = c("PM2.5 (ug/m3)", "NO2 (ppb)", "O3 (ppb)", "NDVI")),
+         contrast = factor(contrast, levels = c("per IQR of gentrification score", "gentrified vs. not")),
+         adjustment = factor(adjustment, levels = c("adjusted", "unadjusted"))) %>%
+  ggplot(aes(x = estimate, xmin = lower, xmax = upper, y = adjustment, colour = model, shape = model)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_pointrange(position = position_dodge(width = 0.5), size = 0.3) +
+  facet_grid(contrast ~ outcome, scales = "free_x") +
+  scale_colour_manual(values = c("CAR" = "black", "non-spatial (OLS)" = "#D55E00")) +
+  labs(x = "Difference in change (outcome units; 95% CrI / CI)", y = NULL, colour = NULL, shape = NULL) +
+  theme_bw(base_size = 10) + theme(legend.position = "bottom")
+```
+
+```{r a1-rho}
+rho_range <- range(a1$rho, na.rm = TRUE)
+```
+
+ρ ranges from `r sprintf("%.3f", rho_range[1])` to `r sprintf("%.3f", rho_range[2])` across the CAR fits: near the intrinsic limit, so the spatial term absorbs most of the smooth PM₂.₅/O₃ signal (spatial confounding), which is why CAR and OLS differ.
+
+```{r a1-convergence}
+key_params <- grepl("score|gentrified|^rho$|^tau2$|^nu2$", a1_conv$parameter)
+a1_conv %>%
+  group_by(Outcome = outcome) %>%
+  summarise(Parameters = n(), `Meet bar` = sum(converged),
+            `Exposure, rho, tau2, nu2 meeting bar` = sprintf("%d / %d", sum(converged & key_params[cur_group_rows()]),
+                                                             sum(key_params[cur_group_rows()])),
+            `Failing (unique)` = paste(unique(parameter[!converged]), collapse = ", "), .groups = "drop") %>%
+  tbl(caption = sprintf("Analysis 1 convergence (bar: PSRF upper CI < 1.05 and ESS > 400): %d of %d parameters meet it",
+                        sum(a1_conv$converged), nrow(a1_conv)))
+```
+
+# Analysis 2: health models
+
+```{r health-mode, results = "asis"}
+health_mode <- switch(params$health_mode,
+                      auto = if (have("health_runs_full.csv")) "full" else if (have("health_runs_fast.csv")) "fast" else NA,
+                      params$health_mode)
+health_ok <- !is.na(health_mode) && have(sprintf("health_runs_%s.csv", health_mode))
+if (!health_ok) {
+  note("No compiled health-model results. Run 04 for each outcome x spec, then `scripts/07_compile_health_results.R`.")
+} else if (health_mode == "fast") {
+  cat('\n<div style="border: 2px solid #D55E00; padding: 8px; margin: 8px 0;"><b>LOCAL TEST RUNS (5,000 iterations), not results.</b> These check the pipeline; they do not meet the convergence bar by design. The full runs need the HPC batch.</div>\n\n')
+}
+```
+
+```{r health, eval = health_ok, results = "asis"}
+runs <- rd(sprintf("health_runs_%s.csv", health_mode))
+cat(sprintf("\nSpMeta (Leroux CAR on the true change; CDC standard errors). Mode **%s**: %d of %d outcome x spec runs found.\n\n",
+            health_mode, sum(runs$found), nrow(runs)))
+missing <- runs %>% filter(!found) %>% group_by(outcome) %>% summarise(specs = paste(spec, collapse = ", "), .groups = "drop")
+if (nrow(missing) > 0) print(tbl(missing, caption = "Missing runs"))
+print(rd(sprintf("health_table_main_%s.csv", health_mode)) %>%
+        rename(Outcome = outcome_label, Tracts = n_obs, `Gentrified only` = gent_only, `AQ improvement only` = aq_only,
+               `Gentrified + AQ` = gent_and_aq, `Interaction contrast` = interaction_contrast,
+               `Pr(undermining)` = pr_undermining, `rho` = rho) %>%
+        tbl(caption = "Main model: change in prevalence 2016→2023 (percentage points) vs. the referent (not gentrified, no AQ improvement), posterior mean (95% CrI). Interaction contrast = gentrified + AQ − gentrified only − AQ only. Pr(undermining) = Pr(contrast > 0) for adverse outcomes, Pr(< 0) for checkup."))
+```
+
+```{r health-contrasts, eval = health_ok}
+hc <- rd(sprintf("health_contrasts_%s.csv", health_mode))
+hc %>%
+  mutate(value = sprintf("%s; Pr %.2f", fmt_ci(posterior_mean, cred_low, cred_high, 2), pr_undermining),
+         value = ifelse(converged, value, paste(value, "[not converged]"))) %>%
+  dplyr::select(Group = group, `Model / contrast` = row_label, outcome_label, value) %>%
+  pivot_wider(names_from = outcome_label, values_from = value, values_fill = "not run") %>%
+  tbl(caption = "Interaction contrast by specification (posterior mean, 95% CrI; Pr = posterior probability of the undermining direction)")
+```
+
+```{r health-forest, eval = health_ok, fig.height = 7}
+lvl <- hc %>% filter(term != "gent_x_aq_z") %>% distinct(row_label) %>% pull(row_label)
+hc %>% filter(term != "gent_x_aq_z") %>%
+  mutate(row_label = factor(row_label, levels = rev(lvl)),
+         group = factor(group, levels = c("Main", "Sensitivity", "Modification"))) %>%
+  ggplot(aes(x = posterior_mean, xmin = cred_low, xmax = cred_high, y = row_label, colour = group,
+             shape = ifelse(converged, "meets bar", "not converged"))) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_pointrange(size = 0.25) +
+  facet_wrap(~ outcome_label, nrow = 1, scales = "free_x") +
+  scale_colour_manual(values = c(Main = "black", Sensitivity = "#0072B2", Modification = "#D55E00")) +
+  scale_shape_manual(values = c(`meets bar` = 16, `not converged` = 1)) +
+  labs(x = "Additive interaction contrast, percentage points (95% CrI)", y = NULL, colour = NULL, shape = NULL) +
+  theme_bw(base_size = 9) + theme(legend.position = "bottom")
+```
+
+```{r health-convergence, eval = health_ok}
+rd(sprintf("health_convergence_%s.csv", health_mode)) %>%
+  transmute(Outcome = outcome, Spec = spec, Tracts = n_obs, Iterations = iterations,
+            `Failing parameters` = n_failing, `Max R-hat` = round(max_rhat, 3), `Min ESS` = round(min_ess),
+            `rho acceptance` = sprintf("%.2f-%.2f", rho_acc_min, rho_acc_max)) %>%
+  tbl(caption = "Health-model convergence by run (bar: R-hat < 1.05 and ESS > 400 for every beta, contrast, tau2 and rho)")
+```
+
+# Supplementary analyses
+
+## NDVI: Landsat vs. MODIS
+
+```{r modis, results = "asis"}
+if (!have("ndvi_modis_citywide.csv")) {
+  note("MODIS cross-check outputs not found (scripts/diagnostics/ndvi_modis_check.R).")
+} else {
+  print(rd("ndvi_modis_citywide.csv") %>% mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+          tbl(caption = "Citywide summer NDVI, mean over study tracts (Landsat three-summer composites vs. MODIS MOD13Q1 single summers; 'same pixels' = MODIS-valid pixels only)"))
+  print(rd("ndvi_modis_agreement.csv") %>% mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+          tbl(caption = "Tract-level agreement, Landsat vs. MODIS (tracts with >= 80% MODIS coverage)"))
+  print(rd("ndvi_modis_gent_association.csv") %>% mutate(value = fmt_ci(per_iqr, lower, upper, 4)) %>%
+          dplyr::select(Source = source, Window = window, `dNDVI per IQR of score (OLS, baseline + borough)` = value) %>%
+          tbl(caption = "Gentrification and NDVI change by sensor: the association is method-dependent"))
+}
+```
+
+## Lagged design
+
+```{r lagged, results = "asis"}
+if (!have("lagged_effects_long.csv")) {
+  note("Lagged-design outputs not found (scripts/05*_lagged_*.R).")
+} else {
+  lag <- bind_rows(rd("lagged_effects_long.csv") %>% filter(pollutant != "NDVI"),
+                   if (have("lagged_effects_long_ndvi.csv")) rd("lagged_effects_long_ndvi.csv"))
+  print(lag %>% filter(scale == "standardized") %>%
+          mutate(value = paste0(fmt_ci(estimate, lower, upper, 3), ifelse(model == "CAR", sprintf("; Pr(>0) %.2f", pr_gt0), ""))) %>%
+          dplyr::select(Pollutant = pollutant, Direction = direction, model, value) %>%
+          pivot_wider(names_from = model, values_from = value) %>%
+          tbl(caption = "Cross-lagged effects, standardized (SD of outcome per SD of exposure). E1/G1 = first window, E2/G2 = second. Two waves: any asymmetry is suggestive only. Full write-up: docs/L-5_lagged_results.md"))
+  conv <- bind_rows(rd("lagged_convergence_long.csv") %>% filter(pollutant != "NDVI"),
+                    if (have("lagged_convergence_long_ndvi.csv")) rd("lagged_convergence_long_ndvi.csv"))
+  cat(sprintf("\nConvergence: %d of %d parameters meet the bar. Not meeting it: %s.\n\n", sum(conv$converged), nrow(conv),
+              paste(sprintf("%s %s %s (ESS %.0f, PSRF upper %.1f)", conv$pollutant[!conv$converged], conv$direction[!conv$converged],
+                            conv$parameter[!conv$converged], conv$ess[!conv$converged], conv$rhat_upper[!conv$converged]),
+                    collapse = "; ")))
+  if (have("lagged_reliability.csv")) {
+    print(rd("lagged_reliability.csv") %>% mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+            dplyr::select(Series = series, `Test-retest (Pearson)` = test_retest_pearson,
+                          `Test-retest (Spearman)` = test_retest_spearman, Note = note) %>%
+            tbl(caption = "Reliability of the lagged measures"))
+  }
+}
+```
+
+## NYCCAS as the AQ source (exploration)
+
+```{r nyccas, results = "asis"}
+if (!have("nyccas_compare_typology.csv")) {
+  note("NYCCAS outputs not found. They come from scripts on the `nyccas-explore` branch (01b, diagnostics/nyccas_compare.R, 01_carbayes.R with nyccas_A/B/C).")
+} else {
+  cat("\nNYCCAS (NYC Community Air Survey, 300 m land-use-regression surfaces) starts in December 2008, so it cannot reproduce the 2000/2002→2016 window. Candidate windows: A = years 1→8 (~2009→2016), B = years 8→15 (~2016→2023, the PLACES window), C = years 1→15. Years 1–9 were published together in 2019; later years were each added by a later release.\n\n")
+  print(rd("nyccas_compare_sources.csv") %>% mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+          rename(Pollutant = pollutant, Comparison = what, NYCCAS = nyccas, `FAQSD/CACES` = current) %>%
+          tbl(caption = "NYCCAS vs. FAQSD/CACES across tracts (r = Pearson correlation; means and between-tract SDs)"))
+  print(rd("nyccas_compare_typology.csv") %>% mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+          rename(Window = window, `Mean dPM2.5` = mean_dPM, `SD dPM2.5` = sd_dPM, `Mean dNO2` = mean_dNO2,
+                 `SD dNO2` = sd_dNO2, `r(dPM2.5, baseline)` = r_dPM_baseline, `r(dNO2, baseline)` = r_dNO2_baseline,
+                 `r(dPM2.5, dNO2)` = r_dPM_dNO2, `r with current composite` = r_composite_current,
+                 `Same AQ class as current` = same_class_as_current, `r with gentrification score` = r_composite_score,
+                 Cells = cells) %>%
+          tbl(caption = "AQ composite and 2x2 cells (referent / gentrified only / AQ only / both) by window"))
+  if (have("nyccas_compare_borough.csv")) {
+    print(rd("nyccas_compare_borough.csv") %>% mutate(across(where(is.numeric), ~ round(.x, 1))) %>%
+            rename(Window = window) %>%
+            tbl(caption = "% of tracts with AQ improvement, by borough and window"))
+  }
+}
+```
+
+```{r nyccas-a1, results = "asis"}
+nyccas_a1 <- have("nyccas_analysis1_comparison_full.csv")
+if (have("nyccas_compare_typology.csv") && !nyccas_a1) {
+  note("NYCCAS Analysis 1 CAR fits not found (01_carbayes.R full nyccas_{A,B,C}, then diagnostics/nyccas_analysis1_summary.R).")
+}
+if (nyccas_a1) {
+  ny1 <- rd("nyccas_analysis1_comparison_full.csv")
+  print(ny1 %>% filter(model == "CAR", contrast == "per IQR of gentrification score") %>%
+          mutate(value = sprintf("%s; Pr(>0) %.2f", fmt_ci(estimate, lower, upper, 3), pr_gt0),
+                 outcome = sub(" \\(.*", "", outcome)) %>%
+          dplyr::select(Source = source, Outcome = outcome, adjustment, value) %>%
+          pivot_wider(names_from = adjustment, values_from = value) %>%
+          arrange(Outcome, Source) %>%
+          tbl(caption = "Analysis 1 with each AQ source, CAR, per IQR of the gentrification score (positive = smaller decline / larger increase in more gentrified tracts)"))
+}
+```
+
+```{r nyccas-a1-figure, eval = nyccas_a1, fig.height = 8}
+ny1 %>%
+  mutate(source = factor(source, levels = rev(unique(source))),
+         adjustment = factor(adjustment, levels = c("without baseline", "with baseline")),
+         contrast = factor(contrast, levels = c("per IQR of gentrification score", "gentrified vs. not"))) %>%
+  ggplot(aes(x = estimate, xmin = lower, xmax = upper, y = source, colour = model, shape = model)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_pointrange(position = position_dodge(width = 0.5), size = 0.25) +
+  facet_grid(contrast + adjustment ~ outcome, scales = "free_x") +
+  scale_colour_manual(values = c("CAR" = "black", "non-spatial (OLS)" = "#D55E00")) +
+  labs(x = "Difference in absolute change, outcome units (95% CrI / CI)", y = NULL, colour = NULL, shape = NULL) +
+  theme_bw(base_size = 9) + theme(legend.position = "bottom", strip.text.y = element_text(size = 7))
+```
+
+# Session
+
+```{r session}
+cat(sprintf("R %s; %s\n", getRversion(), paste(sprintf("%s %s", c("tidyverse", "sf", "knitr"),
+    sapply(c("tidyverse", "sf", "knitr"), function(p) as.character(packageVersion(p)))), collapse = ", ")))
+```
