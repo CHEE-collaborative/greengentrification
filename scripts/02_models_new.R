@@ -11,16 +11,12 @@ library(httr)
 
 set.seed(123)
 
-getwd()
-setwd("C:/Users/joyce.hu/Documents")
-here::set_here("C:/Users/joyce.hu/Documents")
-here::here() 
-
-if (!dir.exists(here("data"))) dir.create(here("data"))
+source(here("scripts", "R", "config.R"))
+source(here("scripts", "R", "functions.R"))
 
 # Data acquisition and processing
 # ==============================================================================
-gent <- read_xlsx(here("data", "Data_NYC_Gentrification_2000_16.xlsx"), sheet = "Data") %>%
+gent <- read_xlsx(input_files$gent_index, sheet = "Data") %>%
   mutate(tractid = as.character(tractid))
 
 nyc_fips <- gent$tractid
@@ -38,38 +34,69 @@ nyc_boros <- c("36081", "36005", "36061", "36085", "36047")
 
 # ==============================================================================
 # Load health data 
-# updated PLACES years 
-# 2018 release provides 2016 data for our health outcomes, 2025 release provides 2023 data
+# 500 Cities 2018 release = 2016 BRFSS on 2010 tracts.
+# PLACES 2025 release = 2023 BRFSS on 2020 tracts -> crosswalked to 2010 tracts.
+# Measures are selected by MeasureId (see places_outcomes in functions.R).
 # ==============================================================================
 
-hlthdata_total_2016 <- read_csv(here("data", "500_Cities__Local_Data_for_Better_Health,_2018_release_20260717.csv"))
-hlthdata_nyc_2016 <- hlthdata_total_2016 %>%
+hlthdata_nyc_2016 <- read_csv(input_files$places_2016,
+                              col_types = cols(TractFIPS = col_character(),
+                                               CityFIPS = col_character(),
+                                               UniqueID = col_character())) %>%
+  filter(GeographicLevel == "Census Tract", MeasureId %in% names(places_outcomes)) %>%
   mutate(CountyFIPS = str_sub(TractFIPS, 1, 5)) %>%
   filter(CountyFIPS %in% nyc_boros) %>%
   rename(GEOID = TractFIPS) %>%
-  mutate(GEOID = as.character(GEOID)) %>%
   dplyr::select(Year, DataSource, Category, Measure, Data_Value_Unit, DataValueTypeID, Data_Value,
                 Low_Confidence_Limit, High_Confidence_Limit, Short_Question_Text, PopulationCount,
                 Geolocation, MeasureId, CityFIPS, GEOID, CountyFIPS)
+stopifnot(all(hlthdata_nyc_2016$Year == 2016),
+          all(hlthdata_nyc_2016$DataValueTypeID == "CrdPrv"),
+          !anyDuplicated(hlthdata_nyc_2016[c("GEOID", "MeasureId")]))
 
-hlthdata_total_2023 <- read_csv(here("data", "PLACES__Local_Data_for_Better_Health,_Census_Tract_Data,_2025_release_20260717.csv"))
-hlthdata_nyc_2023 <- hlthdata_total_2023 %>%
-  filter(CountyFIPS %in% nyc_boros) %>%
-  rename(GEOID = LocationName) %>%
-  mutate(GEOID = as.character(GEOID)) %>%
-  dplyr::select(Year, DataSource, Category, Measure, Data_Value_Unit, DataValueTypeID, Data_Value,
-                Low_Confidence_Limit, High_Confidence_Limit, Short_Question_Text, TotalPopulation,
-                Geolocation, MeasureId, GEOID, CountyFIPS)
+nhgis_xwalk <- read_csv(input_files$nhgis_xwalk,
+                        col_types = cols(tr2010gj = col_character(), tr2010ge = col_character(),
+                                         tr2020gj = col_character(), tr2020ge = col_character(),
+                                         .default = col_double()))
+
+# Keep every 2020 tract that receives weight from a study tract. Selecting by
+# borough would drop the few Nassau (36059) tracts that gained slivers of
+# Queens when the county line was redrawn in 2020.
+tr2020_needed <- unique(nhgis_xwalk$tr2020ge[nhgis_xwalk$tr2010ge %in% gent$tractid &
+                                               nhgis_xwalk$wt_adult > 0])
+
+hlthdata_nyc_2023_tr2020 <- read_csv(input_files$places_2023,
+                                     col_types = cols(LocationName = col_character(),
+                                                      CountyFIPS = col_character(),
+                                                      LocationID = col_character())) %>%
+  filter(LocationName %in% tr2020_needed, MeasureId %in% names(places_outcomes)) %>%
+  rename(GEOID = LocationName)
+stopifnot(all(hlthdata_nyc_2023_tr2020$Year == 2023),
+          all(hlthdata_nyc_2023_tr2020$DataValueTypeID == "CrdPrv"))
+
+hlthdata_nyc_2023 <- crosswalk_places_2020_to_2010(hlthdata_nyc_2023_tr2020, nhgis_xwalk, gent$tractid) %>%
+  rename(GEOID = tractid)
+
+# Crosswalk report: direct GEOID matches (the old string join) vs. after crosswalk
+xw_report <- hlthdata_nyc_2023 %>%
+  group_by(MeasureId) %>%
+  summarise(after_crosswalk = n(),
+            missing         = length(gent$tractid) - n(),
+            multi_piece     = sum(n_pieces > 1),
+            renormalised    = sum(w_covered < 1 - 1e-6),
+            min_w_covered   = min(w_covered)) %>%
+  left_join(hlthdata_nyc_2023_tr2020 %>% filter(GEOID %in% gent$tractid) %>%
+              count(MeasureId, name = "direct_id_match"), by = "MeasureId")
+print(xw_report)
+stopifnot("tracts lost in PLACES 2023 crosswalk" = all(xw_report$missing == 0))
 
 
-process_health_outcome <- function(health_outcome, hlth_2016, hlth_2023, gent_df) {
-  outcome_map <- c("Physical Health" = "phlth", "Physical Inactivity" = "pinactive",
-                   "Current Asthma" = "asthma", "Mental Health" = "mhlth", "Annual Checkup" = "checkup")
-  outcome_prefix <- outcome_map[health_outcome]
+process_health_outcome <- function(measure_id, hlth_2016, hlth_2023, gent_df) {
+  outcome_prefix <- places_outcomes[[measure_id]]
   
-  nyc_sf_2016 <- gent_df %>% left_join(hlth_2016 %>% filter(Short_Question_Text == health_outcome),
+  nyc_sf_2016 <- gent_df %>% left_join(hlth_2016 %>% filter(MeasureId == measure_id),
                                        by = c("tractid" = "GEOID"))
-  nyc_sf_2023 <- gent_df %>% left_join(hlth_2023 %>% filter(Short_Question_Text == health_outcome),
+  nyc_sf_2023 <- gent_df %>% left_join(hlth_2023 %>% filter(MeasureId == measure_id),
                                        by = c("tractid" = "GEOID"))
   
   nyc_sf_2016 %>%
@@ -89,16 +116,19 @@ process_health_outcome <- function(health_outcome, hlth_2016, hlth_2023, gent_df
              !!sym(paste0("prev_2023_", outcome_prefix)) - !!sym(paste0("prev_2016_", outcome_prefix)))
 }
 
-health_outcomes <- c("Physical Health", "Physical Inactivity", "Current Asthma", "Mental Health", "Annual Checkup")
-health_outcomes_list <- lapply(health_outcomes, function(outcome) {
-  process_health_outcome(outcome, hlthdata_nyc_2016, hlthdata_nyc_2023, gent)
+health_outcomes_list <- lapply(names(places_outcomes), function(measure_id) {
+  process_health_outcome(measure_id, hlthdata_nyc_2016, hlthdata_nyc_2023, gent)
 })
 gent_env_hlth <- Reduce(function(x, y) left_join(x, y, by = "tractid"), health_outcomes_list)
+stopifnot(nrow(gent_env_hlth) == nrow(gent), !anyDuplicated(gent_env_hlth$tractid))
+
+# Tracts with a usable change value per outcome
+print(sapply(unname(places_outcomes), function(p) sum(is.finite(gent_env_hlth[[paste0("prev_abs_change_", p)]]))))
 
 # ==============================================================================
 # Environmental change and transit data
 # ==============================================================================
-env_cov_gent <- read.csv(here("data","env_cov_gent_wkt.csv"))
+env_cov_gent <- read.csv(analytic_files$env_cov_gent)  # written by 01a_build_env_data.R
 env_cov_gent$score_0.5   <- as.numeric(as.character(env_cov_gent$score_0.5))
 env_cov_gent$pm_change   <- as.numeric(as.character(env_cov_gent$pm_change))
 env_cov_gent$o3_change   <- as.numeric(as.character(env_cov_gent$o3_change))
@@ -106,7 +136,7 @@ env_cov_gent$no2_change  <- as.numeric(as.character(env_cov_gent$no2_change))
 env_cov_gent$ndvi_change <- as.numeric(as.character(env_cov_gent$ndvi_change))
 env_cov_gent$GEOID10     <- as.character(as.numeric(env_cov_gent$GEOID10))
 
-df_transit <- read.csv(here("data", "df_transit.csv")) %>%
+df_transit <- read.csv(input_files$transit) %>%
   filter(GEOID10 %in% env_cov_gent$GEOID10) %>%
   mutate(GEOID10 = as.character(as.numeric(GEOID10)))
 
@@ -117,25 +147,17 @@ gent_env_hlth <- gent_env_hlth %>%
   dplyr::select(-ends_with(".y"))
 
 # ==============================================================================
-# Spatial neighbors matrix (with manual fix for Rockaways)
+# Spatial neighbors matrix (queen contiguity + manual link, by GEOID; functions.R)
 # ==============================================================================
-neighbors <- poly2nb(nyc_tracts, queen = TRUE, snap = sqrt(0.00))
-neighbors_mat <- nb2mat(neighbors, zero.policy = TRUE, style = "B")
-neighbors_mat[1287, 1586] <- 1
-neighbors_mat[1586, 1287] <- 1
-W_matrix <- neighbors_mat
-rownames(W_matrix) <- colnames(W_matrix) <- nyc_tracts$tractid
+W_matrix <- build_tract_W(nyc_tracts, nyc_tracts$tractid)
 
-if (file.exists("combined_data_sf.rds")) {
-  combined_data_sf <- readRDS("combined_data_sf.rds")
-} else {
-  combined_data_sf <- gent_env_hlth %>%
-    mutate(GEOID = tractid) %>%
-    left_join(nyc_tracts %>% dplyr::select(GEOID10, geometry), by = c("GEOID" = "GEOID10")) %>%
-    st_as_sf()
-  saveRDS(combined_data_sf, "combined_data_sf.rds")
-}
-saveRDS(W_matrix, "W_matrix.rds")                   
+# Analytic dataset is assembled here, then completed (typology, equity
+# modifiers) below and saved once at the end of the script.
+combined_data_sf <- gent_env_hlth %>%
+  mutate(GEOID = tractid) %>%
+  left_join(nyc_tracts %>% dplyr::select(GEOID10, geometry), by = c("GEOID" = "GEOID10")) %>%
+  st_as_sf()
+                   
 
 
 # ==============================================================================
@@ -166,19 +188,25 @@ gent <- gent %>%
          score_0.5   = all_of(col_med),
          score_0.975 = all_of(col_high))
 
-# City-wide 80th percentile threshold, defined on the posterior median
-gent_threshold_80 <- quantile(gent$score_0.5, probs = 0.80, na.rm = TRUE)
-
-gent_prob_cutoff <- 0.8
-
+# Pr(true smoothed score_i > citywide 80th percentile) > 0.8, from tract i's
+# own posterior (classify_gentrified() in functions.R; shared with 01)
+gent_class <- classify_gentrified(gent$score_0.5, gent$score_0.025, gent$score_0.975, cutoff = 0.8)
 gent_typology <- gent %>%
-  mutate(
-    posterior_sd = (score_0.975 - score_0.025) / (2 * 1.96),
-    # Pr(true smoothed score_i > 80th pctile), from tract i's own posterior
-    prob_gentrified = 1 - pnorm(gent_threshold_80, mean = score_0.5, sd = posterior_sd),
-    gent_yn = ifelse(prob_gentrified > gent_prob_cutoff, "Yes", "No")
-  ) %>%
-  dplyr::select(tractid, score_0.5, posterior_sd, prob_gentrified, gent_yn)
+  mutate(posterior_sd = gent_class$posterior_sd,
+         prob_gentrified = gent_class$prob,
+         gent_yn = gent_class$yn,
+         # SA-2 threshold variations: Pr cutoffs 0.7 and 0.9
+         gent_yn_07 = classify_gentrified(score_0.5, score_0.025, score_0.975, cutoff = 0.7)$yn,
+         gent_yn_09 = classify_gentrified(score_0.5, score_0.025, score_0.975, cutoff = 0.9)$yn,
+         # SA-4: certainty of the gentrification classification
+         gent_certainty = factor(case_when(prob_gentrified > 0.8 ~ "Gentrified (Pr > 0.8)",
+                                           prob_gentrified < 0.2 ~ "Not gentrified (Pr < 0.2)",
+                                           TRUE ~ "Ambiguous (0.2 <= Pr <= 0.8)"),
+                                 levels = c("Not gentrified (Pr < 0.2)", "Ambiguous (0.2 <= Pr <= 0.8)",
+                                            "Gentrified (Pr > 0.8)"))) %>%
+  dplyr::select(tractid, score_0.5, posterior_sd, prob_gentrified, gent_yn, gent_yn_07, gent_yn_09,
+                gent_certainty)
+stopifnot("gentrified count changed from the 311 regression check" = sum(gent_typology$gent_yn == "Yes") == 311)
 
 # Sanity check: with gent_prob_cutoff = 0.8 this should mark ~14-15% of tracts
 # Yes (vs. ~20% under a naive median/point-estimate top-quintile cut) 
@@ -192,14 +220,23 @@ cat(sprintf("Gentrified (Yes): %d of %d tracts (%.1f%%)\n",
 # ==============================================================================
 # Air-quality improvement Y/N (PM2.5 + NO2 only -- O3 dropped)
 # ==============================================================================
+# Absolute changes (later - earlier; negative = improvement), no residualization:
+# health effects depend on the actual exposure reduction. Baseline levels
+# (pm_2002, no2_2000) are kept as separate variables and enter the health
+# models as covariates.
+stopifnot(!anyNA(env_cov_gent[c("pm_change", "no2_change")]),
+          !anyDuplicated(env_cov_gent$GEOID10))
+
 aq_typology <- env_cov_gent %>%
   mutate(
-    pm_change_adj  = -1 * scale(pm_change)[, 1],   # reverse: negative change = improvement -> positive
-    no2_change_adj = -1 * scale(no2_change)[, 1],  # reverse: negative change = improvement -> positive
-    aq_improvement_z = rowMeans(cbind(pm_change_adj, no2_change_adj)),
-    aq_yn = ifelse(aq_improvement_z > 0, "Yes", "No")
+    pm_change_adj  = -1 * scale(pm_change)[, 1],   # reverse: larger decline = improvement -> positive
+    no2_change_adj = -1 * scale(no2_change)[, 1],  # reverse: larger decline = improvement -> positive
+    aq_composite = rowMeans(cbind(pm_change_adj, no2_change_adj)),
+    aq_yn = ifelse(aq_composite > median(aq_composite), "Yes", "No"),
+    # Sensitivity (SA-5): absolute NO2 change alone, median split
+    aq_yn_no2 = ifelse(no2_change_adj > median(no2_change_adj), "Yes", "No")
   ) %>%
-  dplyr::select(GEOID10, pm_change, no2_change, aq_improvement_z, aq_yn)
+  dplyr::select(GEOID10, pm_change, no2_change, aq_composite, aq_yn, aq_yn_no2)
 
 # ==============================================================================
 #  NDVI increase Y/N (raw change, not z-scored; noise floor = 0.05) 
@@ -218,22 +255,13 @@ exposure_typology <- aq_typology %>%
   left_join(ndvi_typology, by = "GEOID10") %>%
   left_join(gent_typology, by = c("GEOID10" = "tractid")) %>%
   mutate(
-    exposure_group = case_when(
-      gent_yn == "No"  & aq_yn == "No"  ~ "Referent (no gent, no AQ improvement)",
-      gent_yn == "Yes" & aq_yn == "No"  ~ "Gentrified, no AQ improvement",
-      gent_yn == "No"  & aq_yn == "Yes" ~ "AQ improvement, not gentrified",
-      gent_yn == "Yes" & aq_yn == "Yes" ~ "Gentrified + AQ improvement",
-      TRUE ~ NA_character_
-    ),
-    exposure_group = factor(
-      exposure_group,
-      levels = c(
-        "Referent (no gent, no AQ improvement)",
-        "Gentrified, no AQ improvement",
-        "AQ improvement, not gentrified",
-        "Gentrified + AQ improvement"
-      )
-    )
+    exposure_group = make_exposure_group(gent_yn, aq_yn),
+    exposure_group_no2 = make_exposure_group(gent_yn, aq_yn_no2),  # SA-5 sensitivity
+    exposure_group_gent07 = make_exposure_group(gent_yn_07, aq_yn),  # SA-2: Pr > 0.7
+    exposure_group_gent09 = make_exposure_group(gent_yn_09, aq_yn),  # SA-2: Pr > 0.9
+    # SA-2: AQ improvement in citywide tertiles of the absolute composite (2x3)
+    aq_tertile = dplyr::ntile(aq_composite, 3),
+    exposure_group_aqtert = make_exposure_group_tertile(gent_yn, aq_tertile)
   )
 
 # Cell counts
@@ -243,6 +271,25 @@ cell_counts <- exposure_typology %>%
 
 print(cell_counts)
 
+cat("\nSA-5 sensitivity: 2x2 with NO2-only AQ improvement\n")
+print(exposure_typology %>% count(exposure_group_no2, name = "n_tracts") %>%
+        mutate(pct = round(100 * n_tracts / sum(n_tracts), 1)))
+cat("\nSA-2 sensitivity: 2x2 with gentrification cutoff Pr > 0.7 and Pr > 0.9\n")
+print(bind_rows(
+  exposure_typology %>% count(cell = exposure_group_gent07, name = "n_tracts") %>% mutate(cutoff = 0.7),
+  exposure_typology %>% count(cell = exposure_group_gent09, name = "n_tracts") %>% mutate(cutoff = 0.9)
+))
+cat("\nSA-2: 2x3 typology, gentrified x AQ-improvement tertile (T1 = least improvement)\n")
+print(table(gentrified = exposure_typology$gent_yn, aq_tertile = exposure_typology$aq_tertile))
+cat("\nSA-4: exposure cells by certainty of the gentrification classification\n")
+print(table(exposure_typology$exposure_group, exposure_typology$gent_certainty))
+cat("\nAQ improvement by borough: % Yes, main (PM2.5 + NO2) vs NO2-only\n")
+print(exposure_typology %>%
+        mutate(borough = substr(GEOID10, 1, 5)) %>%
+        group_by(borough) %>%
+        summarise(n = n(), main = round(100 * mean(aq_yn == "Yes"), 1),
+                  no2_only = round(100 * mean(aq_yn_no2 == "Yes"), 1)))
+
 sparse_cell_n <- cell_counts$n_tracts[cell_counts$exposure_group == "Gentrified, no AQ improvement"]
 if (length(sparse_cell_n) == 0 || sparse_cell_n < 10) {
   cat(sprintf(
@@ -251,25 +298,49 @@ if (length(sparse_cell_n) == 0 || sparse_cell_n < 10) {
   ))
   cat("This is treated as a substantive finding -- gentrification and citywide\n")
   cat("air-quality improvement were largely co-located in this sample -- rather\n")
-  cat("than a modeling problem. Report the count and interpret accordingly;\n")
-  cat("consider collapsing this cell with 'Gentrified + AQ improvement' only if\n")
-  cat("the model fails to converge because of it.\n")
+  cat("than a modeling problem. Report the count and interpret accordingly.\n")
+  cat("Do not collapse cells without Dan's decision.\n")
 }
 
 # ==============================================================================
-# Share of tracts that greened (NDVI Y) within each cell (descriptive)
+# A2-12 Descriptives: tracts and share greened (dNDVI >= +0.05, current NDVI)
+# in each cell, for the main typology and the NO2-only sensitivity (SA-5).
+# Empty cells are kept (n = 0). Written to the output directory.
 # ==============================================================================
+stopifnot(!anyNA(exposure_typology$ndvi_yn))
+describe_cells <- function(df, exposure_var, typology_label) {
+  df %>%
+    group_by(cell = .data[[exposure_var]], .drop = FALSE) %>%
+    summarise(n_tracts = n(), n_greened = sum(ndvi_yn == "Yes"), .groups = "drop") %>%
+    mutate(typology = typology_label,
+           pct_tracts = round(100 * n_tracts / sum(n_tracts), 1),
+           pct_greened = ifelse(n_tracts > 0, round(100 * n_greened / n_tracts, 1), NA_real_)) %>%
+    dplyr::select(typology, cell, n_tracts, pct_tracts, n_greened, pct_greened)
+}
+cell_descriptives <- bind_rows(
+  describe_cells(exposure_typology, "exposure_group", "main (PM2.5 + NO2)"),
+  describe_cells(exposure_typology, "exposure_group_no2", "SA-5 (NO2 only)")
+)
+cat("\nA2-12: tracts and % greened (dNDVI >= 0.05) by exposure cell\n")
+print(as.data.frame(cell_descriptives))
+write.csv(cell_descriptives, output_path("descriptives_exposure_cells.csv"), row.names = FALSE)
 
-ndvi_by_cell <- exposure_typology %>%
-  group_by(exposure_group) %>%
-  summarise(
-    n_tracts = n(),
-    n_greened = sum(ndvi_yn == "Yes", na.rm = TRUE),
-    pct_greened = round(100 * mean(ndvi_yn == "Yes", na.rm = TRUE), 1)
-  )
-
-print(ndvi_by_cell)
-# NDVI Y/N does NOT enter the health design matrix below -- descriptive only.
+# A2-13: 2x2x2 cells (gentrification x AQ improvement x greening), reported before
+# deciding whether greening enters as a third typology dimension or as a
+# covariate (pending; Dan decides). Greening uses the current NDVI (harmonization
+# pinned).
+cells_2x2x2 <- bind_rows(lapply(c("main (PM2.5 + NO2)" = "aq_yn", "SA-5 (NO2 only)" = "aq_yn_no2"),
+                                function(v) {
+  exposure_typology %>%
+    mutate(gentrified = factor(gent_yn, levels = c("No", "Yes")),
+           aq_improvement = factor(.data[[v]], levels = c("No", "Yes")),
+           greened = factor(ndvi_yn, levels = c("No", "Yes"))) %>%
+    count(gentrified, aq_improvement, greened, .drop = FALSE, name = "n_tracts")
+}), .id = "typology")
+cat("\nA2-13: 2x2x2 cells, gentrified x AQ improvement x greened (dNDVI >= 0.05)\n")
+print(as.data.frame(cells_2x2x2))
+write.csv(cells_2x2x2, output_path("crosstab_cells_2x2x2_greening.csv"), row.names = FALSE)
+# NDVI Y/N does NOT enter the health design matrix -- descriptive only.
 
 # ==============================================================================
 # Baseline health covariate 
@@ -279,73 +350,43 @@ print(ndvi_by_cell)
 combined_data_sf <- combined_data_sf %>%
   dplyr::select(-any_of("cluster")) %>%           # drop the old k-means cluster var
   left_join(
-    exposure_typology %>% dplyr::select(GEOID10, exposure_group, gent_yn, aq_yn),
+    exposure_typology %>% dplyr::select(GEOID10, exposure_group, gent_yn, aq_yn, aq_composite,
+                                        exposure_group_no2, aq_yn_no2,
+                                        exposure_group_gent07, exposure_group_gent09,
+                                        prob_gentrified, gent_certainty, exposure_group_aqtert),
     by = c("GEOID" = "GEOID10")
   )
 
 # ==============================================================================
-# Updated exposure typology (not cluster), baseline outcome covariate, income removed. Travel time + borough kept.
+# Health-model covariates (S-2): borough, 2000 income decile (mdfami00),
+# log 2000 population density, transit-time decile. Deciles use citywide cut
+# points so that subsets (strata, eligible tracts) keep the same definitions.
+# create_design_matrix_typology() lives in scripts/R/functions.R (sourced at top).
 # ==============================================================================
+# borough_names (county FIPS -> borough, Brooklyn first = referent) is in functions.R
+stopifnot(!anyNA(gent[c("mdfami00", "totpop00", "ALAND10")]),
+          all(gent$totpop00 > 0), all(gent$ALAND10 > 0),
+          all(substr(gent$tractid, 1, 5) %in% names(borough_names)))
+health_covariates <- gent %>%
+  transmute(GEOID = tractid,
+            borough = factor(unname(borough_names[substr(tractid, 1, 5)]), levels = borough_names),
+            income_decile_2000 = citywide_decile(mdfami00),
+            log_popdens_2000 = log(totpop00 / (ALAND10 / 1e6)),   # persons per km2 of land
+            # SA-3: gentrification-eligible = below the 2000 citywide median family income
+            eligible_2000 = factor(ifelse(mdfami00 < median(mdfami00),
+                                          "Eligible (below 2000 median family income)", "Not eligible"),
+                                   levels = c("Eligible (below 2000 median family income)", "Not eligible")))
 
-create_design_matrix_typology <- function(data, outcome_prefix, modifier_var = NULL) {
-  X <- matrix(1, nrow = nrow(data), ncol = 1)
-  colnames(X) <- "intercept"
-  
-  # Exposure typology dummies (referent = "Referent (no gent, no AQ improvement)")
-  if ("exposure_group" %in% names(data)) {
-    exp_factor <- factor(data$exposure_group,
-                         levels = c("Referent (no gent, no AQ improvement)",
-                                    "Gentrified, no AQ improvement",
-                                    "AQ improvement, not gentrified",
-                                    "Gentrified + AQ improvement"))
-    exp_dummies <- model.matrix(~ exp_factor - 1)[, -1, drop = FALSE]
-    colnames(exp_dummies) <- c("gent_only", "aq_only", "gent_and_aq")
-    X <- cbind(X, exp_dummies)
-  }
-  
-  # Baseline (timepoint-1) health value for this outcome, as covariate
-  baseline_col <- paste0("prev_2016_", outcome_prefix)
-  if (baseline_col %in% names(data)) {
-    X <- cbind(X, baseline = data[[baseline_col]])
-  }
-  
-  # NOTE: income covariate removed
-  
-  # Travel time as deciles (unchanged)
-  if ("time" %in% names(data)) {
-    travel_ecdf <- ecdf(data$time)
-    travel_deciles <- ceiling(travel_ecdf(data$time) * 10)
-    X <- cbind(X, time = travel_deciles)
-  }
-  
-  # Borough dummies (unchanged)
-  if ("borough" %in% names(data)) {
-    borough_factor <- as.factor(data$borough)
-    borough_levels <- levels(borough_factor)
-    borough_dummies <- model.matrix(~ borough_factor - 1)[, -1, drop = FALSE]
-    colnames(borough_dummies) <- paste0("borough_", borough_levels[-1])
-    X <- cbind(X, borough_dummies)
-  }
-  
-  # ---- STEP 4: optional equity effect-modification interaction ----
-  # modifier_var should be a binary/categorical column already on `data`
-  # (e.g. "poverty_high", "pct_poc_high") created in the equity section below.
-  # One modifier at a time, per the plan -- do not pass two at once.
-  if (!is.null(modifier_var) && modifier_var %in% names(data) &&
-      "exposure_group" %in% names(data)) {
-    mod_factor <- as.factor(data[[modifier_var]])
-    interaction_dummies <- model.matrix(~ exp_factor * mod_factor - 1)
-    # keep only the interaction columns (main effects already added above)
-    int_cols <- grep(":", colnames(interaction_dummies), value = TRUE)
-    if (length(int_cols) > 0) {
-      int_mat <- interaction_dummies[, int_cols, drop = FALSE]
-      colnames(int_mat) <- paste0("interact_", make.names(int_cols))
-      X <- cbind(X, int_mat)
-    }
-  }
-  
-  return(X)
-}
+combined_data_sf <- combined_data_sf %>%
+  left_join(health_covariates, by = "GEOID") %>%
+  mutate(time_decile = citywide_decile(time))
+stopifnot(!anyNA(st_drop_geometry(combined_data_sf)[c("borough", "income_decile_2000",
+                                                       "log_popdens_2000", "time_decile")]))
+cat("\nSA-3: exposure cells among gentrification-eligible tracts\n")
+print(table(st_drop_geometry(combined_data_sf)$exposure_group, combined_data_sf$eligible_2000))
+cat("\nHealth-model covariates:\n")
+print(table(borough = combined_data_sf$borough))
+print(summary(st_drop_geometry(combined_data_sf)[c("income_decile_2000", "log_popdens_2000", "time_decile")]))
 
 
 # ==============================================================================
@@ -353,38 +394,81 @@ create_design_matrix_typology <- function(data, outcome_prefix, modifier_var = N
 #          and 2000 baseline poverty rate (one at a time; NOT compositional change)
 # ------------------------------------------------------------------------------
 
-nyc_county_fips <- c("081", "005", "061", "085", "047")  # Queens, Kings, NY, Richmond, Bronx
+# Race/ethnicity (A2-10): 2000 non-Hispanic white share from the Johnson file,
+# which is already on 2010 tracts (replaces an SF3 pull on 2000 tracts joined
+# to 2010 IDs by string). Strata: majority NH white (> 50%) vs. majority-minority.
+stopifnot(!anyNA(gent[c("NHW00", "totpop00")]), all(gent$NHW00 <= gent$totpop00))
+race_2000 <- gent %>%
+  transmute(GEOID = tractid,
+            pct_nhw_2000 = 100 * NHW00 / totpop00,
+            race_stratum = factor(ifelse(pct_nhw_2000 > 50, "Majority NH white (2000)",
+                                         "Majority-minority (2000)"),
+                                  levels = c("Majority-minority (2000)", "Majority NH white (2000)")))
+cat("\nRace/ethnicity strata (2000 NHW share):\n")
+print(table(race_2000$race_stratum))
 
-race_2000 <- get_decennial(
-  variables = c(nhwhite = "P007003", total_race = "P007001"),
+# Poverty (A2-11): 2000 SF3 counts on 2000 tracts -- persons below poverty in
+# 1999 (P087002) and persons whose poverty status is determined (P087001) --
+# allocated to 2010 tracts with the NHGIS tr2000 -> tr2010 crosswalk
+# (population weights); the rate is computed after allocation. This replaces
+# joining the 2000-tract rates to 2010 IDs by string. Strata: >= 20% (Census
+# poverty area) vs. < 20%.
+stopifnot("Set CENSUS_API_KEY in .Renviron" = nzchar(Sys.getenv("CENSUS_API_KEY")))
+poverty_counts_2000 <- get_decennial(
+  variables = c(pov_below = "P087002", pov_universe = "P087001"),
   year = 2000, sumfile = "sf3", state = "NY",
   county = c("Queens", "Kings", "New York", "Richmond", "Bronx"),
   geography = "tract", output = "wide"
 ) %>%
-  mutate(pct_nhwhite_2000 = 100 * nhwhite / total_race) %>%
-  dplyr::select(GEOID, pct_nhwhite_2000)
+  dplyr::select(GEOID, pov_below, pov_universe)
 
-poverty_2000 <- get_decennial(
-  variables = c(poverty = "P087002", pov_universe = "P087001"),
-  year = 2000, sumfile = "sf3", state = "NY",
-  county = c("Queens", "Kings", "New York", "Richmond", "Bronx"),
-  geography = "tract", output = "wide"
-) %>%
-  mutate(poverty_rate_2000 = 100 * poverty / pov_universe) %>%
-  dplyr::select(GEOID, poverty_rate_2000)
+nhgis_xwalk_2000 <- read_csv(input_files$nhgis_xwalk_2000,
+                             col_types = cols(tr2000gj = col_character(), tr2000ge = col_character(),
+                                              tr2010gj = col_character(), tr2010ge = col_character(),
+                                              .default = col_double()))
+poverty_2010 <- allocate_2000_counts_to_2010(poverty_counts_2000, nhgis_xwalk_2000,
+                                             c("pov_below", "pov_universe"))
+poverty_2000 <- tibble(GEOID = gent$tractid) %>%
+  left_join(poverty_2010, by = "GEOID") %>%
+  mutate(poverty_rate_2000 = 100 * pov_below / pov_universe,
+         poverty_stratum = factor(ifelse(poverty_rate_2000 >= 20, ">= 20% poverty (2000)",
+                                         "< 20% poverty (2000)"),
+                                  levels = c("< 20% poverty (2000)", ">= 20% poverty (2000)")))
+cat(sprintf("\nPoverty 2000 on 2010 tracts: %d of %d study tracts with a rate (%d from > 1 2000 tract)\n",
+            sum(is.finite(poverty_2000$poverty_rate_2000)), nrow(poverty_2000),
+            sum(poverty_2000$n_2000_tracts > 1, na.rm = TRUE)))
+print(table(poverty_2000$poverty_stratum, useNA = "ifany"))
+stopifnot("study tracts without a 2000 poverty rate" = all(is.finite(poverty_2000$poverty_rate_2000)))
 
 equity_modifiers <- race_2000 %>%
-  left_join(poverty_2000, by = "GEOID") %>%
-  mutate(
-    # Median split; swap for terciles/quartiles if finer strata are preferred
-    pct_poc_high    = ifelse(pct_nhwhite_2000 <= median(pct_nhwhite_2000, na.rm = TRUE),
-                             "Higher % people of color (2000)", "Lower % people of color (2000)"),
-    poverty_high    = ifelse(poverty_rate_2000 >= median(poverty_rate_2000, na.rm = TRUE),
-                             "Higher poverty (2000)", "Lower poverty (2000)")
-  )
+  left_join(poverty_2000 %>% dplyr::select(GEOID, poverty_rate_2000, poverty_stratum), by = "GEOID")
 
 combined_data_sf <- combined_data_sf %>%
   left_join(equity_modifiers, by = "GEOID")
+stopifnot(!anyNA(combined_data_sf$race_stratum))
+
+# EM-1: typology cells x modifier strata, before any modifier model. Gentrification
+# is partly defined by growth in white share, so some cells may be empty or
+# sparse in the majority-white stratum.
+em_crosstab <- bind_rows(lapply(c("race_stratum", "poverty_stratum"), function(m) {
+  bind_rows(lapply(c(main = "exposure_group", "SA-5 (NO2 only)" = "exposure_group_no2"),
+                   function(v) {
+    st_drop_geometry(combined_data_sf) %>%
+      count(stratum = .data[[m]], cell = .data[[v]], .drop = FALSE, name = "n_tracts") %>%
+      group_by(stratum) %>%
+      mutate(pct_of_stratum = round(100 * n_tracts / sum(n_tracts), 1)) %>%
+      ungroup()
+  }), .id = "typology") %>%
+    mutate(modifier = m, .before = 1)
+}))
+cat("\nEM-1: exposure cells x modifier stratum (2000 race/ethnicity and poverty)\n")
+print(as.data.frame(em_crosstab))
+em_sparse <- em_crosstab %>% filter(n_tracts < 20)
+if (nrow(em_sparse) > 0) {
+  cat("\nEM-1: cells with fewer than 20 tracts (report as findings; do not collapse):\n")
+  print(as.data.frame(em_sparse))
+}
+write.csv(em_crosstab, output_path("crosstab_cells_by_modifier.csv"), row.names = FALSE)
 
 # ==============================================================================
 # Two ways to run equity effect modification
@@ -394,16 +478,40 @@ combined_data_sf <- combined_data_sf %>%
 #   result <- run_spmeta_analysis(combined_data_sf, "asthma", W_matrix)
 #     -> inside run_spmeta_analysis(), change the X <- create_design_matrix_typology(...)
 #        line to: X <- create_design_matrix_typology(spmeta_data, outcome_prefix = outcome,
-#                                            modifier_var = "poverty_high")
+#                                            modifier_var = "poverty_stratum")
 #     Interpret the interact_* coefficients as effect-modification terms.
 #
 # (b) STRATIFIED (separate model per modifier level):
-#   for (lvl in unique(na.omit(combined_data_sf$poverty_high))) {
-#     strat_data <- combined_data_sf %>% filter(poverty_high == lvl)
+#   for (lvl in unique(na.omit(combined_data_sf$poverty_stratum))) {
+#     strat_data <- combined_data_sf %>% filter(poverty_stratum == lvl)
 #     strat_W <- W_matrix[match(strat_data$GEOID, combined_data_sf$GEOID),
 #                          match(strat_data$GEOID, combined_data_sf$GEOID)]
 #     result <- run_spmeta_analysis(strat_data, "asthma", strat_W)
 #     # store result, tagged with `lvl`
 #   }
 #
-# Repeat (a) or (b) separately for pct_poc_high 
+# Repeat (a) or (b) separately for race_stratum 
+
+# ==============================================================================
+# Save the analytic dataset and W (once, after everything is joined)
+# ==============================================================================
+stopifnot(
+  nrow(combined_data_sf) == nrow(gent),
+  !anyDuplicated(combined_data_sf$GEOID),
+  setequal(combined_data_sf$GEOID, rownames(W_matrix)),
+  identical(rownames(W_matrix), colnames(W_matrix)),
+  isSymmetric(unname(W_matrix)),
+  !anyNA(W_matrix),
+  all(c("exposure_group", "exposure_group_no2", "gent_yn", "aq_yn", "time", "time_decile",
+        "borough", "income_decile_2000", "log_popdens_2000", "pm_2002", "no2_2000",
+        "ndvi_change", "exposure_group_gent07", "exposure_group_gent09",
+        "eligible_2000", "gent_certainty", "exposure_group_aqtert") %in% names(combined_data_sf)),
+  !anyNA(st_drop_geometry(combined_data_sf)[c("pm_2002", "no2_2000")]),
+  "race_stratum" %in% names(combined_data_sf),
+  "poverty_stratum" %in% names(combined_data_sf), !anyNA(combined_data_sf$poverty_stratum),
+  all(paste0("prev_2016_", places_outcomes) %in% names(combined_data_sf))
+)
+saveRDS(combined_data_sf, analytic_files$combined_data)
+saveRDS(W_matrix, analytic_files$W_matrix)
+cat(sprintf("Saved %s (%d tracts) and %s\n", analytic_files$combined_data,
+            nrow(combined_data_sf), analytic_files$W_matrix))
