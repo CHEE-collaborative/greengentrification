@@ -4,205 +4,181 @@
 
 # Load packages
 ##############################################################################
-library(tidyverse)
-library(tigris)
 library(here)
-library(mgcv)
-library(terra)
-library(exactextractr)
-library(tidyterra)
-library(sf)
-library(biscale) # for bivariate map
-library(cowplot)
-library(ggplot2)
-library(raster)
-library(car)
-library(spdep)
-library(arrow)
-library(dplyr)
-library(tidycensus)
-library(corrplot)
-library(scales)
-library(gridExtra)
-library(NbClust)
-library(cluster)
-library(gridExtra)
-library(viridis)  #  color scales
-library(patchwork)
-library(scales)
-library(forestplot)
+library(sf)      # combined_data_sf is an sf object; needed for its methods
 library(SpMeta)
-library(knitr)
-library(kableExtra)
-library(parallel)
-library(doParallel)
 ##############################################################################
 ##############################################################################
 
-################################################################################
-# added by SP
-census_api_key("a7039d631ed49f01684692eb70d4a1ae0590c919")
-
-create_design_matrix_typology <- function(data, outcome_prefix, modifier_var = NULL) {
-  X <- matrix(1, nrow = nrow(data), ncol = 1)
-  colnames(X) <- "intercept"
-  
-  # Exposure typology dummies (referent = "Referent (no gent, no AQ improvement)")
-  if ("exposure_group" %in% names(data)) {
-    exp_factor <- factor(data$exposure_group,
-                         levels = c("Referent (no gent, no AQ improvement)",
-                                    "Gentrified, no AQ improvement",
-                                    "AQ improvement, not gentrified",
-                                    "Gentrified + AQ improvement"))
-    exp_dummies <- model.matrix(~ exp_factor - 1)[, -1, drop = FALSE]
-    colnames(exp_dummies) <- c("gent_only", "aq_only", "gent_and_aq")
-    X <- cbind(X, exp_dummies)
-  }
-  
-  # Baseline (timepoint-1) health value for this outcome, as covariate
-  baseline_col <- paste0("prev_2016_", outcome_prefix)
-  if (baseline_col %in% names(data)) {
-    X <- cbind(X, baseline = as.numeric(scale(data[[baseline_col]]))) # edited by SP from Joyce's recommendation
-  }
-  
-  # NOTE: income covariate removed
-  
-  # Travel time as deciles (unchanged)
-  if ("time" %in% names(data)) {
-    travel_ecdf <- ecdf(data$time)
-    travel_deciles <- ceiling(travel_ecdf(data$time) * 10)
-    X <- cbind(X, time = travel_deciles)
-  }
-  
-  # Borough dummies (unchanged)
-  if ("borough" %in% names(data)) {
-    borough_factor <- as.factor(data$borough)
-    borough_levels <- levels(borough_factor)
-    borough_dummies <- model.matrix(~ borough_factor - 1)[, -1, drop = FALSE]
-    colnames(borough_dummies) <- paste0("borough_", borough_levels[-1])
-    X <- cbind(X, borough_dummies)
-  }
-  
-  # ---- STEP 4: optional equity effect-modification interaction ----
-  # modifier_var should be a binary/categorical column already on `data`
-  # (e.g. "poverty_high", "pct_poc_high") created in the equity section below.
-  # One modifier at a time, per the plan -- do not pass two at once.
-  if (!is.null(modifier_var) && modifier_var %in% names(data) &&
-      "exposure_group" %in% names(data)) {
-    mod_factor <- as.factor(data[[modifier_var]])
-    interaction_dummies <- model.matrix(~ exp_factor * mod_factor - 1)
-    # keep only the interaction columns (main effects already added above)
-    int_cols <- grep(":", colnames(interaction_dummies), value = TRUE)
-    if (length(int_cols) > 0) {
-      int_mat <- interaction_dummies[, int_cols, drop = FALSE]
-      colnames(int_mat) <- paste0("interact_", make.names(int_cols))
-      X <- cbind(X, int_mat)
-    }
-  }
-  
-  return(X)
-}
+source(here("scripts", "R", "functions.R"))
 
 ################################################################################
 
-combined_data_sf <- readRDS("/EDIT FILE PATH/combined_data_sf.rds")
-W_matrix <- readRDS("/EDIT FILE PATH/W_matrix.rds")
+source(here("scripts", "R", "config.R"))
+
+combined_data_sf <- readRDS(analytic_files$combined_data)
+W_matrix <- readRDS(analytic_files$W_matrix)
 
 # Set analysis parameters
-fast_mode <- TRUE  # Change to FALSE for full analysis, change to TRUE for testing
+valid_outcomes <- c("asthma", "phlth", "pinactive", "mhlth", "checkup")
+cli_args <- commandArgs(trailingOnly = TRUE)
+if (length(cli_args) == 0 && interactive()) cli_args <- c("asthma", "fast")  # RStudio testing
+stopifnot(
+  "Usage: Rscript 04_sp_meta_functions.R <outcome> [fast|full] [spec]" = length(cli_args) %in% 1:3,
+  "Unknown outcome; use asthma, phlth, pinactive, mhlth or checkup" = cli_args[1] %in% valid_outcomes
+)
+run_mode <- if (length(cli_args) >= 2) cli_args[2] else "fast"
+stopifnot("Mode must be 'fast' or 'full'" = run_mode %in% c("fast", "full"))
+fast_mode <- run_mode == "fast"  # fast = local testing, full = HPC run
+
+# Model specifications: main analysis and sensitivity analyses
+model_specs <- list(
+  main        = list(exposure_var = "exposure_group", include_baseline = TRUE),
+  aq_no2      = list(exposure_var = "exposure_group_no2", include_baseline = TRUE),  # SA-5
+  no_baseline = list(exposure_var = "exposure_group", include_baseline = FALSE),     # A2-8
+  # A2-9 effect modification by baseline (2000) neighbourhood context, one
+  # modifier at a time. Race: majority-minority stratum only, compared with
+  # main (only 1 majority-white tract is gentrified without AQ improvement).
+  # Poverty: interaction model and one model per stratum (the < 20% stratum has
+  # only 10 gentrified-without-AQ-improvement tracts: flag as imprecise).
+  race_minority   = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         subset = list(var = "race_stratum", levels = "Majority-minority (2000)")),
+  pov_interaction = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         modifier_var = "poverty_stratum"),
+  pov_low         = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         subset = list(var = "poverty_stratum", levels = "< 20% poverty (2000)")),
+  pov_high        = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         subset = list(var = "poverty_stratum", levels = ">= 20% poverty (2000)")),
+  # A2-13 greening sensitivity: continuous dNDVI (standardized) as a covariate
+  # (a third typology dimension would leave 4 tracts in one of 8 cells)
+  ndvi_cov        = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         extra_covariates = "ndvi_change"),
+  # SA-1: continuous gentrification score x absolute AQ composite (standardized)
+  cont_exposure   = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         exposure_mode = "continuous"),
+  # SA-2: gentrified = Pr(score > 80th percentile) > 0.7 or > 0.9 (main: 0.8),
+  # AQ split unchanged; and AQ improvement in 3 tertiles (2x3 typology)
+  gent_cut07      = list(exposure_var = "exposure_group_gent07", include_baseline = TRUE),
+  gent_cut09      = list(exposure_var = "exposure_group_gent09", include_baseline = TRUE),
+  aq_tertile      = list(exposure_var = "exposure_group_aqtert", include_baseline = TRUE,
+                         exposure_mode = "aq_tertile"),
+  # SA-3: gentrification-eligible tracts only (below the 2000 median family income)
+  eligible        = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         subset = list(var = "eligible_2000",
+                                       levels = "Eligible (below 2000 median family income)")),
+  # SA-4: drop the ambiguous tracts (0.2 <= Pr <= 0.8; all currently "not
+  # gentrified"), so the comparison group is confidently non-gentrified
+  unambiguous     = list(exposure_var = "exposure_group", include_baseline = TRUE,
+                         subset = list(var = "gent_certainty",
+                                       levels = c("Not gentrified (Pr < 0.2)", "Gentrified (Pr > 0.8)")))
+)
+spec <- if (length(cli_args) == 3) cli_args[3] else "main"
+stopifnot("Unknown spec; see model_specs" = spec %in% names(model_specs))
 save_csv <- TRUE
 save_diagnostics <- TRUE
 
+# Chains: dispersed starts, run in parallel worker processes when cores allow
+n_chains <- 3
+n_cores <- min(n_chains, as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = n_chains)))
+chain_seed <- 2026
+
+# Convergence bar for every monitored parameter (all beta, tau2, rho)
+rhat_max <- 1.05
+ess_min <- 400
+
 cat("Running analysis in sequential mode\n")
 
-# Define health outcomes - need to run as a separate R file for each health outcome
-# so that the HPC does not time out. This can be done concurrently for each
-# health outcome in separate R files by duplicating this script and changing to each outcome.
-outcomes <- c("asthma") 
+# One outcome per job (see header)
+outcomes <- cli_args[1]
 
-# Convergence functions
-calculate_split_rhat <- function(chain_samples) {
-  # Split chain in half and calculate R-hat
-  n <- length(chain_samples)
-  if(n < 100) return(NA)
-  
-  # Split chain into two halves
-  half1 <- chain_samples[1:floor(n/2)]
-  half2 <- chain_samples[ceiling(n/2):n]
-  
-  # Calculate between and within chain variance
-  chain_means <- c(mean(half1), mean(half2))
-  overall_mean <- mean(chain_samples)
-  
-  # Between chain variance
-  B <- 2 * var(chain_means)
-  
-  # Within chain variance
-  W <- (var(half1) + var(half2)) / 2
-  
-  # R-hat calculation
-  var_plus <- ((n/2 - 1) * W + B) / (n/2)
-  rhat <- sqrt(var_plus / W)
-  
-  return(rhat)
+
+# Additive interaction contrast (primary estimand), computed draw by draw:
+# beta_gent_and_aq - beta_gent_only - beta_aq_only. Positive = the combined
+# cell's change in prevalence exceeds the sum of the two single-exposure
+# effects. Direction depends on the outcome: for adverse outcomes (asthma,
+# phlth, mhlth, pinactive) positive = worse than additive, i.e. the
+# "gentrification undermines the AQ benefit" direction; for checkup
+# (beneficial) that direction is negative. prob_negative = Pr(< 0).
+# In an effect-modification model (A2-9) the exposure coefficients are the
+# effects in the reference stratum (s1); this also returns the effects in the
+# second stratum (*_s2), the contrast in s2, and the difference s2 - s1.
+add_interaction_contrast <- function(beta_draws, terms) {
+  # beta_draws: draws x terms matrix
+  stopifnot(ncol(beta_draws) == length(terms))
+  colnames(beta_draws) <- terms
+  # Continuous exposures (SA-1): the product term gent_x_aq_z is itself the
+  # interaction, so there is nothing to derive
+  if (!any(c("gent_and_aq", "gent_only", "aq_only") %in% terms) && "gent_x_aq_z" %in% terms) {
+    return(beta_draws)
+  }
+  # AQ tertiles (SA-2, 2x3; referent = not gentrified, T1): one contrast per
+  # higher tertile, e.g. T3: beta_gent_aqT3 - beta_gent_aqT1 - beta_aqT3_only
+  tert_terms <- c("aqT2_only", "aqT3_only", "gent_aqT1", "gent_aqT2", "gent_aqT3")
+  if (any(tert_terms %in% terms)) {
+    stopifnot("incomplete set of AQ-tertile terms" = all(tert_terms %in% terms))
+    b <- beta_draws
+    return(cbind(b,
+                 interaction_contrast_T2 = b[, "gent_aqT2"] - b[, "gent_aqT1"] - b[, "aqT2_only"],
+                 interaction_contrast_T3 = b[, "gent_aqT3"] - b[, "gent_aqT1"] - b[, "aqT3_only"]))
+  }
+  stopifnot("exposure dummies missing for the interaction contrast" =
+              all(c("gent_and_aq", "gent_only", "aq_only") %in% terms))
+  b <- beta_draws
+  out <- cbind(beta_draws,
+               interaction_contrast = b[, "gent_and_aq"] - b[, "gent_only"] - b[, "aq_only"])
+  mod_terms <- c("gent_only_x_mod", "aq_only_x_mod", "gent_and_aq_x_mod")
+  if (any(mod_terms %in% terms)) {
+    stopifnot("incomplete set of interaction terms" = all(mod_terms %in% terms))
+    s2 <- cbind(gent_only_s2   = b[, "gent_only"] + b[, "gent_only_x_mod"],
+                aq_only_s2     = b[, "aq_only"] + b[, "aq_only_x_mod"],
+                gent_and_aq_s2 = b[, "gent_and_aq"] + b[, "gent_and_aq_x_mod"])
+    out <- cbind(out, s2,
+                 interaction_contrast_s2 = s2[, "gent_and_aq_s2"] - s2[, "gent_only_s2"] -
+                   s2[, "aq_only_s2"],
+                 interaction_contrast_s2_minus_s1 = b[, "gent_and_aq_x_mod"] -
+                   b[, "gent_only_x_mod"] - b[, "aq_only_x_mod"])
+  }
+  out
 }
 
-assess_convergence <- function(spmeta_result, burn_in, outcome) {
-  keep_samples <- (burn_in + 1):ncol(spmeta_result$beta)
+# Convergence functions
+# Post-burn-in draws of every beta, the interaction contrast, tau2 and rho,
+# one coda::mcmc per chain
+chains_to_mcmc_list <- function(chains, keep_samples, terms) {
+  coda::mcmc.list(lapply(chains, function(f) {
+    m <- cbind(add_interaction_contrast(t(f$beta[, keep_samples, drop = FALSE]), terms),
+               tau2 = f$tau2[1, keep_samples], rho = f$rho[1, keep_samples])
+    coda::mcmc(m)
+  }))
+}
+
+# Cross-chain convergence: Gelman-Rubin potential scale reduction factor and
+# effective sample size of the pooled draws (coda), for every beta, the
+# interaction contrast, tau2 and rho.
+assess_convergence <- function(chains, keep_samples, terms, outcome, rhat_max, ess_min) {
+  stopifnot("need at least 2 chains for R-hat" = length(chains) >= 2)
+  mc <- chains_to_mcmc_list(chains, keep_samples, terms)
+  psrf <- coda::gelman.diag(mc, autoburnin = FALSE, multivariate = FALSE)$psrf
+  ess <- coda::effectiveSize(mc)
   
   convergence_summary <- data.frame(
-    parameter = character(),
-    rhat = numeric(),
-    ess = numeric(),
-    converged = logical(),
-    stringsAsFactors = FALSE
+    parameter = colnames(mc[[1]]),
+    rhat = psrf[, "Point est."],
+    rhat_upper = psrf[, "Upper C.I."],
+    ess = as.numeric(ess),
+    stringsAsFactors = FALSE,
+    row.names = NULL
   )
-  
-  # Check beta parameters
-  for(i in 1:nrow(spmeta_result$beta)) {
-    beta_samples <- spmeta_result$beta[i, keep_samples]
-    
-    # Calculate split R-hat
-    rhat <- calculate_split_rhat(beta_samples)
-    
-    # Calculate ESS
-    ess <- tryCatch({
-      acf_result <- acf(beta_samples, plot = FALSE, lag.max = min(100, length(beta_samples)/4))
-      length(beta_samples) / max(1, 1 + 2 * sum(acf_result$acf[-1]))
-    }, error = function(e) length(beta_samples))
-    
-    # Convergence criteria
-    converged <- !is.na(rhat) && rhat < 1.1 && ess > 100
-    
-    convergence_summary <- rbind(convergence_summary, data.frame(
-      parameter = paste0("beta_", i),
-      rhat = rhat,
-      ess = ess,
-      converged = converged,
-      stringsAsFactors = FALSE
-    ))
-  }
-  
-  # Check rho parameter
-  rho_samples <- spmeta_result$rho[1, keep_samples]
-  rho_rhat <- calculate_split_rhat(rho_samples)
-  rho_ess <- tryCatch({
-    acf_result <- acf(rho_samples, plot = FALSE, lag.max = min(100, length(rho_samples)/4))
-    length(rho_samples) / max(1, 1 + 2 * sum(acf_result$acf[-1]))
-  }, error = function(e) length(rho_samples))
-  
-  convergence_summary <- rbind(convergence_summary, data.frame(
-    parameter = "rho",
-    rhat = rho_rhat,
-    ess = rho_ess,
-    converged = !is.na(rho_rhat) && rho_rhat < 1.1 && rho_ess > 100,
-    stringsAsFactors = FALSE
-  ))
+  stopifnot("R-hat or ESS could not be computed" =
+              all(is.finite(convergence_summary$rhat)), all(is.finite(convergence_summary$ess)))
+  convergence_summary$converged <- convergence_summary$rhat < rhat_max &
+    convergence_summary$ess > ess_min
   
   # Overall convergence assessment
-  overall_converged <- all(convergence_summary$converged, na.rm = TRUE)
+  overall_converged <- all(convergence_summary$converged)
   
-  cat(sprintf("\n=== CONVERGENCE ASSESSMENT: %s ===\n", toupper(outcome)))
+  cat(sprintf("\n=== CONVERGENCE ASSESSMENT: %s (%d chains; bar: R-hat < %.2f, ESS > %.0f) ===\n",
+              toupper(outcome), length(chains), rhat_max, ess_min))
   print(convergence_summary)
   cat(sprintf("Overall convergence: %s\n", ifelse(overall_converged, "YES", "NO")))
   
@@ -216,7 +192,7 @@ assess_convergence <- function(spmeta_result, burn_in, outcome) {
   ))
 }
 
-# Function to prepare data and calculate population-weighted standard errors
+# Function to prepare data: change in prevalence and its CDC-derived standard error
 prepare_spmeta_data <- function(combined_data, outcome) {
   outcome_2016 <- paste0("prev_2016_", outcome)
   outcome_2023 <- paste0("prev_2023_", outcome)
@@ -232,430 +208,367 @@ prepare_spmeta_data <- function(combined_data, outcome) {
   # Calculate absolute change and propagate uncertainty
   combined_data$abs_change <- combined_data[[outcome_2023]] - combined_data[[outcome_2016]]
   combined_data$abs_change_se <- sqrt(combined_data$se_2023^2 + combined_data$se_2016^2)
-  
-  # Handle missing or invalid standard errors
-  median_se <- median(combined_data$abs_change_se[is.finite(combined_data$abs_change_se) & 
-                                                    combined_data$abs_change_se > 0], na.rm = TRUE)
-  if(is.na(median_se)) median_se <- 0.01
-  
-  min_se <- 0.001
-  combined_data$abs_change_se[is.na(combined_data$abs_change_se) | 
-                                is.infinite(combined_data$abs_change_se) | 
-                                combined_data$abs_change_se <= 0] <- max(median_se, min_se)
-  
-  combined_data$abs_change_se <- pmax(combined_data$abs_change_se, min_se)
-  
-  # POPULATION WEIGHTING attempt to do what GAM population weighting does under the hood: Adjust standard errors based on population size
-  if("totpop16" %in% names(combined_data) && any(!is.na(combined_data$totpop16))) {
-    # Calculate population weights so that larger populations get more weight = smaller SE
-    pop_data <- combined_data$totpop16[!is.na(combined_data$totpop16) & combined_data$totpop16 > 0]
-    
-    if(length(pop_data) > 0) {
-      # Use median population as reference 
-      reference_pop <- median(pop_data, na.rm = TRUE)
-      
-      # Calculate scaling factor: sqrt(population / reference_population)
-      # Areas with larger populations get smaller SE/ more precise
-      pop_scale_factor <- sqrt(pmax(combined_data$totpop16, reference_pop * 0.1, na.rm = TRUE) / reference_pop)
-      
-      # Apply population weighting to standard errors
-      combined_data$abs_change_se_original <- combined_data$abs_change_se  # Store original
-      combined_data$abs_change_se <- combined_data$abs_change_se / pop_scale_factor
-      
-      # Ensure minimum SE is maintained
-      combined_data$abs_change_se <- pmax(combined_data$abs_change_se, min_se)
-      
-      cat(sprintf("Population weighting applied:\n"))
-      cat(sprintf("  Reference population: %.0f\n", reference_pop))
-      cat(sprintf("  Population scale factor range: [%.3f, %.3f]\n", 
-                  min(pop_scale_factor, na.rm = TRUE), max(pop_scale_factor, na.rm = TRUE)))
-      cat(sprintf("  SE reduction range: [%.1f%%, %.1f%%]\n", 
-                  (1 - max(pop_scale_factor, na.rm = TRUE)) * 100,
-                  (1 - min(pop_scale_factor, na.rm = TRUE)) * 100))
-    } else {
-      cat("Warning: No valid population data found for weighting\n")
-    }
-  } else {
-    cat("Warning: Population column 'totpop16' not found or contains no valid data\n")
-  }
+  # No SE imputation: tracts with a non-finite or zero SE are dropped in
+  # run_spmeta_analysis() (complete cases), not given a made-up SE.
   
   return(combined_data)
 }
 
 
-# Function to calculate rho acceptance rate from samples
-calculate_rho_acceptance <- function(rho_samples) {
-  if(length(rho_samples) <= 1) return(NA)
-  
-  # Calculate acceptance rate as proportion of samples that changed
-  n_changed <- sum(diff(rho_samples) != 0)
-  total_proposals <- length(rho_samples) - 1
-  acceptance_rate <- n_changed / total_proposals
-  
-  return(acceptance_rate)
+# rho acceptance rate from SpMeta's own counter of accepted proposals.
+# (Counting changes in the rho draws is wrong: a frozen chain looks "tuned".)
+rho_acceptance <- function(spmeta_result) {
+  as.numeric(spmeta_result$acctot_rho_trans[1]) / (ncol(spmeta_result$rho) - 1)
 }
 
-# Function to tune rho acceptance rate
-tune_rho_acceptance <- function(data, outcome, W_matrix, target_acceptance = 0.25, 
-                                tolerance = 0.05, max_iterations = 10) {
-  
-  # Prepare data
-  spmeta_data <- prepare_spmeta_data(data, outcome)
-  
-  # Create inputs
-  theta_hat <- list(spmeta_data$abs_change)
-  se <- list(spmeta_data$abs_change_se)
-  X <- create_design_matrix_typology(spmeta_data, outcome_prefix = outcome, modifier_var = NULL)
-  x <- list(X)
-  
-  # Create spatial weights matrix for sample
-  n <- nrow(spmeta_data)
-  W_sample <- W_matrix[spmeta_data$GEOID, spmeta_data$GEOID]
-  neighbors <- list(W_sample)
-  
-  # Start with initial value
-  metrop_var_rho_trans <- 1.0
-  
+# Tune the random-walk proposal variance for logit(rho) with short runs on the
+# exact inputs of the main run. Each round starts from the previous round's
+# last draw. The update uses the 1-D normal approximation
+# acceptance ~ (2/pi) * atan(2/s), where s = proposal SD / posterior SD.
+tune_rho_acceptance <- function(theta_hat, se, x, neighbors, target_acceptance = 0.40,
+                                tolerance = 0.05, max_iterations = 10,
+                                tune_samples = 500, metrop_var_rho_trans = 1.0) {
+  inits <- list()
   for(i in 1:max_iterations) {
-    cat(sprintf("Tuning iteration %d: metrop_var_rho_trans = %.3f", i, metrop_var_rho_trans))
+    cat(sprintf("Tuning iteration %d: metrop_var_rho_trans = %.4f", i, metrop_var_rho_trans))
     
-    # Run short MCMC for tuning
-    spmeta_result <- SpMeta(
-      mcmc_samples = 1000,
+    spmeta_result <- do.call(SpMeta, c(list(
+      mcmc_samples = tune_samples,
       theta_hat = theta_hat,
       se = se,
       x = x,
       model_indicator = 1,
       neighbors = neighbors,
       metrop_var_rho_trans = metrop_var_rho_trans
-    )
+    ), inits))
+    stopifnot("non-finite draws while tuning rho" =
+                all(is.finite(spmeta_result$beta)), all(is.finite(spmeta_result$tau2)),
+              all(is.finite(spmeta_result$rho)))
     
-    # Calculate acceptance rate from rho samples
-    rho_samples <- spmeta_result$rho[1, ]
-    acceptance_rate <- calculate_rho_acceptance(rho_samples)
+    acceptance_rate <- rho_acceptance(spmeta_result)
+    cat(sprintf(" -> acceptance rate: %.3f (rho = %.3f)\n", acceptance_rate,
+                spmeta_result$rho[1, tune_samples]))
     
-    if(is.na(acceptance_rate)) {
-      cat(" -> Unable to calculate acceptance rate\n")
-      break
-    }
-    
-    cat(sprintf(" -> acceptance rate: %.3f\n", acceptance_rate))
-    
-    # Check if within tolerance
     if(abs(acceptance_rate - target_acceptance) < tolerance) {
       cat(sprintf("Target acceptance rate achieved: %.3f\n", acceptance_rate))
       return(metrop_var_rho_trans)
     }
     
-    # Adjust metrop_var_rho_trans
-    if(acceptance_rate > target_acceptance) {
-      metrop_var_rho_trans <- metrop_var_rho_trans * 1.5  # Increase variance to decrease acceptance
-    } else {
-      metrop_var_rho_trans <- metrop_var_rho_trans * 0.7  # Decrease variance to increase acceptance
-    }
+    acc <- min(max(acceptance_rate, 0.02), 0.98)
+    sd_ratio <- tan(pi * acc / 2) / tan(pi * target_acceptance / 2)
+    metrop_var_rho_trans <- metrop_var_rho_trans * sd_ratio^2
+    inits <- list(beta_init = spmeta_result$beta[, tune_samples],
+                  tau2_init = spmeta_result$tau2[, tune_samples],
+                  rho_init  = spmeta_result$rho[, tune_samples])
   }
   
-  cat(sprintf("Max iterations reached. Final metrop_var_rho_trans: %.3f\n", metrop_var_rho_trans))
+  warning(sprintf("rho tuning did not reach %.2f +/- %.2f in %d rounds; using metrop_var_rho_trans = %.4f",
+                  target_acceptance, tolerance, max_iterations, metrop_var_rho_trans))
   return(metrop_var_rho_trans)
 }
 
-# MCMC diagnostic plots function 
-create_mcmc_diagnostics <- function(outcome, spmeta_result, X, spmeta_data, burn_in, timestamp) {
+# MCMC diagnostic plots: one page of trace plots (every beta, tau2 and rho,
+# chains overlaid, post burn-in) and a theta_true recovery plot
+create_mcmc_diagnostics <- function(outcome, chains, keep_samples, X, spmeta_data,
+                                    convergence_summary, timestamp) {
+  terms <- colnames(X)
+  mc <- chains_to_mcmc_list(chains, keep_samples, terms)
+  params <- colnames(mc[[1]])
+  stopifnot(identical(convergence_summary$parameter, params))
+  chain_cols <- adjustcolor(c("#0072B2", "#D55E00", "#009E73", "#CC79A7")[seq_along(chains)],
+                            alpha.f = 0.7)
   
-  # Total MCMC samples
-  total_samples <- ncol(spmeta_result$beta)
-  
-  # Extract samples after burn-in
-  keep_samples <- (burn_in + 1):total_samples
-  n_keep <- length(keep_samples)
-  
-  cat(sprintf("Processing diagnostics for %s: %d total samples, %d after burn-in\n", 
-              outcome, total_samples, n_keep))
+  cat(sprintf("Processing diagnostics for %s: %d chains x %d kept draws\n",
+              outcome, length(chains), length(keep_samples)))
   
   # Create diagnostic plots directory
-  diag_dir <- paste0("diagnostics_", timestamp)
+  diag_dir <- output_path(paste0("diagnostics_", timestamp))
   if(!dir.exists(diag_dir)) dir.create(diag_dir)
   
-  # Create diagnostic plots
-  png_file <- file.path(diag_dir, paste0("mcmc_diagnostics_", outcome, ".png"))
-  png(png_file, width = 12, height = 6, units = "in", res = 300)  
-  
-  par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
-  
-  # Plot 1: Beta[1] (Intercept) trace plot
-  plot(spmeta_result$beta[1, keep_samples], 
-       type = "l",
-       ylab = "beta",
-       xlab = "Sample",
-       main = paste("Beta[1] Trace -", toupper(outcome)),
-       col = "black", 
-       lwd = 0.8)
-  # Add posterior mean line
-  abline(h = mean(spmeta_result$beta[1, keep_samples]), 
-         col = "red", 
-         lwd = 2)
-  
-  # Plot 2: Beta[2] trace plot 
-  if(nrow(spmeta_result$beta) > 1) {
-    coef_name <- if(ncol(X) > 1) colnames(X)[2] else "Beta[2]"
-    plot(spmeta_result$beta[2, keep_samples], 
-         type = "l",
-         ylab = "beta",
-         xlab = "Sample",
-         main = paste("Beta[2] Trace -", toupper(outcome)),
-         col = "black", 
-         lwd = 0.8)
-    abline(h = mean(spmeta_result$beta[2, keep_samples]), 
-           col = "red", 
-           lwd = 2)
-  } else {
-    plot.new()
-    text(0.5, 0.5, "Only intercept coefficient available", cex = 1.2, adj = 0.5)
+  # Trace plots: one page per outcome
+  trace_file <- file.path(diag_dir, paste0("trace_", outcome, ".pdf"))
+  n_col <- ceiling(sqrt(length(params)))
+  pdf(trace_file, width = 11, height = 8.5)
+  par(mfrow = c(ceiling(length(params) / n_col), n_col), mar = c(3, 3, 3, 1), mgp = c(1.8, 0.6, 0),
+      oma = c(0, 0, 2, 0))
+  for(k in seq_along(params)) {
+    draws <- sapply(mc, function(m) as.numeric(m[, k]))
+    matplot(keep_samples, draws, type = "l", lty = 1, lwd = 0.5, col = chain_cols,
+            xlab = "Iteration", ylab = params[k],
+            main = sprintf("%s\nR-hat %.3f, ESS %.0f%s", params[k],
+                           convergence_summary$rhat[k], convergence_summary$ess[k],
+                           if(convergence_summary$converged[k]) "" else "  [FAILS BAR]"),
+            cex.main = 0.9, font.main = if(convergence_summary$converged[k]) 1 else 2)
   }
-  
-  # Plot 3: Population weighting 
-  tryCatch({
-    if("abs_change_se_original" %in% names(spmeta_data) && "totpop16" %in% names(spmeta_data)) {
-      # Plot original vs weighted standard errors
-      plot(spmeta_data$totpop16,
-           spmeta_data$abs_change_se_original / spmeta_data$abs_change_se,
-           xlab = "Population",
-           ylab = "SE Adjustment Factor",
-           main = paste("Population Weighting -", toupper(outcome)),
-           pch = 19,
-           col = "black",
-           cex = 0.8,
-           log = "x")
-      # Add reference line
-      abline(h = 1, col = "red", lwd = 2, lty = 2)
-    } else {
-      # Fallback: Theta_true recovery plot
-      n_areas <- nrow(spmeta_data)
-      
-      # Extract theta_true samples
-      theta_true_samps <- matrix(NA, nrow = total_samples, ncol = n_areas)
-      
-      for(j in 1:total_samples) {
-        theta_j <- unlist(spmeta_result$theta_true[[j]])
-        if(length(theta_j) >= n_areas) {
-          theta_true_samps[j, ] <- theta_j[1:n_areas]
-        } else if(length(theta_j) > 0) {
-          theta_true_samps[j, 1:length(theta_j)] <- theta_j
-          theta_true_samps[j, (length(theta_j)+1):n_areas] <- 0
-        } else {
-          theta_true_samps[j, ] <- 0
-        }
-      }
-      
-      # Calculate theta_true estimates from kept samples
-      theta_true_est <- colMeans(theta_true_samps[keep_samples, , drop = FALSE])
-      
-      # Use observed data as comparison
-      theta_observed <- spmeta_data$abs_change
-      
-      # Ensure dimensions match
-      min_length <- min(length(theta_true_est), length(theta_observed))
-      theta_true_est <- theta_true_est[1:min_length]
-      theta_observed <- theta_observed[1:min_length]
-      
-      # Plot theta recovery
-      plot(theta_true_est,
-           theta_observed,
-           ylab = "Observed Change",
-           xlab = "Estimated True Change", 
-           main = paste("Theta Recovery -", toupper(outcome)),
-           pch = 19, 
-           col = "black", 
-           cex = 0.8)
-      abline(0, 1, col = "red", lwd = 2)
-    }
-    
-  }, error = function(e) {
-    cat(sprintf("Error in plot 3: %s\n", e$message))
-    plot.new()
-    text(0.5, 0.5, paste("Error in diagnostic plot:\n", e$message), cex = 1, adj = 0.5)
-  })
-  
-  # Reset plotting parameters
-  par(mfrow = c(1, 1))
+  mtext(sprintf("%s: %d chains, post burn-in (bar: R-hat < %.2f, ESS > %.0f)",
+                toupper(outcome), length(chains), rhat_max, ess_min), outer = TRUE, cex = 1.1)
   dev.off()
+  cat(sprintf("Trace plots saved: %s\n", trace_file))
   
-  cat(sprintf("Diagnostic plots saved: %s\n", png_file))
+  # theta_true recovery: posterior mean (all chains, equal kept draws each)
+  # vs observed change
+  n_areas <- nrow(spmeta_data)
+  theta_means <- lapply(chains, `[[`, "theta_mean")
+  stopifnot("theta_true summaries do not match the number of tracts" =
+              all(lengths(theta_means) == n_areas))
+  theta_true_est <- Reduce(`+`, theta_means) / length(theta_means)
   
-  # Calculate diagnostics for kept samples only
-  beta_samples_kept <- spmeta_result$beta[, keep_samples]
-  
-  # Calculate effective sample size using simple method
-  calc_ess <- function(x) {
-    tryCatch({
-      # Simple effective sample size approximation
-      acf_result <- acf(x, plot = FALSE, lag.max = min(100, length(x)/4))
-      n_eff <- length(x) / max(1, 1 + 2 * sum(acf_result$acf[-1]))
-      return(max(1, n_eff))
-    }, error = function(e) {
-      return(length(x))  # Return sample size if ACF fails
-    })
-  }
-  
-  # Return diagnostic summary
-  beta_summary <- data.frame(
-    coefficient = colnames(X),
-    mean = rowMeans(beta_samples_kept),
-    sd = apply(beta_samples_kept, 1, sd),
-    ess = apply(beta_samples_kept, 1, calc_ess),
-    stringsAsFactors = FALSE
-  )
+  theta_file <- file.path(diag_dir, paste0("theta_recovery_", outcome, ".png"))
+  png(theta_file, width = 6, height = 6, units = "in", res = 300)
+  plot(theta_true_est,
+       spmeta_data$abs_change,
+       ylab = "Observed Change",
+       xlab = "Estimated True Change (posterior mean)", 
+       main = paste("Theta Recovery -", toupper(outcome)),
+       pch = 19, 
+       col = adjustcolor("black", alpha.f = 0.4), 
+       cex = 0.6)
+  abline(0, 1, col = "red", lwd = 2)
+  dev.off()
+  cat(sprintf("Theta recovery plot saved: %s\n", theta_file))
   
   return(list(
     outcome = outcome,
-    diagnostic_file = png_file,
-    beta_summary = beta_summary,
-    n_samples_kept = n_keep,
-    phi_matrix_dims = c(total_samples, nrow(spmeta_data)),
-    theta_matrix_dims = c(total_samples, nrow(spmeta_data))
+    trace_file = trace_file,
+    theta_file = theta_file,
+    n_samples_kept = length(keep_samples) * length(chains)
   ))
 }
 
 # Run SpMeta analysis with diagnostic plots
 run_spmeta_analysis <- function(data, outcome, W_matrix) {
-  # Prepare data with population weighting
+  # Prepare data (CDC-derived SEs only; no population weighting)
   spmeta_data <- prepare_spmeta_data(data, outcome)
   
-  if(nrow(spmeta_data) < 20) return(NULL)
+  # Subset specs (A2-9 strata, SA-3, SA-4): keep the listed levels; W is subset
+  # by GEOID below
+  sub <- model_specs[[spec]]$subset
+  if (!is.null(sub)) {
+    stopifnot("subset variable missing from data" = sub$var %in% names(spmeta_data),
+              "subset level not found in data" = all(sub$levels %in% spmeta_data[[sub$var]]))
+    spmeta_data <- spmeta_data[!is.na(spmeta_data[[sub$var]]) & spmeta_data[[sub$var]] %in% sub$levels, ]
+    cat(sprintf("Subset %s in {%s}: %d tracts\n", sub$var, paste(sub$levels, collapse = "; "),
+                nrow(spmeta_data)))
+  }
+  modifier_var <- model_specs[[spec]]$modifier_var
+  
+  X <- create_design_matrix_typology(spmeta_data, outcome_prefix = outcome, modifier_var = modifier_var,
+                                     exposure_var = model_specs[[spec]]$exposure_var,
+                                     include_baseline = model_specs[[spec]]$include_baseline,
+                                     extra_covariates = if (is.null(model_specs[[spec]]$extra_covariates))
+                                       character(0) else model_specs[[spec]]$extra_covariates,
+                                     exposure_mode = if (is.null(model_specs[[spec]]$exposure_mode))
+                                       "typology" else model_specs[[spec]]$exposure_mode)
+  stopifnot(nrow(X) == nrow(spmeta_data))
+  
+  # Complete cases: SpMeta has no NA handling (one NA makes every draw NaN).
+  # Keep tracts with a finite outcome, a finite positive SE and finite X.
+  keep <- is.finite(spmeta_data$abs_change) &
+    is.finite(spmeta_data$abs_change_se) & spmeta_data$abs_change_se > 0 &
+    rowSums(!is.finite(X)) == 0
+  cat(sprintf("%s: %d of %d tracts dropped (non-finite outcome, SE or covariate); %d used\n",
+              outcome, sum(!keep), length(keep), sum(keep)))
+  spmeta_data <- spmeta_data[keep, ]
+  X <- X[keep, , drop = FALSE]
+  stopifnot("fewer than 20 complete tracts" = nrow(spmeta_data) >= 20)
+  
+  # Spatial weights for exactly these tracts, matched by GEOID
+  stopifnot(!anyDuplicated(spmeta_data$GEOID), all(spmeta_data$GEOID %in% rownames(W_matrix)))
+  W_sample <- W_matrix[spmeta_data$GEOID, spmeta_data$GEOID]
+  stopifnot(
+    !anyNA(W_sample), !anyNA(X),
+    identical(rownames(W_sample), as.character(spmeta_data$GEOID)),
+    identical(colnames(W_sample), as.character(spmeta_data$GEOID)),
+    nrow(W_sample) == nrow(X), ncol(W_sample) == nrow(X),
+    isSymmetric(unname(W_sample))
+  )
+  cat(sprintf("W: %d x %d, %d tracts with no neighbours\n",
+              nrow(W_sample), ncol(W_sample), sum(rowSums(W_sample) == 0)))
   
   # Prepare SpMeta inputs (single list entries)
   theta_hat <- list(spmeta_data$abs_change)
-  se <- list(spmeta_data$abs_change_se)  # Now population-weighted
-  X <- create_design_matrix_typology(spmeta_data, outcome_prefix = outcome, modifier_var = NULL)
+  se <- list(spmeta_data$abs_change_se)
   x <- list(X)
+  neighbors <- list(W_sample)
+  n <- nrow(spmeta_data)
+  
+  cat("Tracts per exposure cell:\n")
+  if (is.null(modifier_var)) {
+    print(table(spmeta_data[[model_specs[[spec]]$exposure_var]], useNA = "ifany"))
+  } else {
+    print(table(spmeta_data[[model_specs[[spec]]$exposure_var]], spmeta_data[[modifier_var]], useNA = "ifany"))
+  }
+  modifier_levels <- if (is.null(modifier_var)) NULL else levels(droplevels(spmeta_data[[modifier_var]]))
   
   # Print design matrix info for debugging
   cat(sprintf("Design matrix for %s: %d obs x %d vars\n", outcome, nrow(X), ncol(X)))
   cat("Variables:", paste(colnames(X), collapse = ", "), "\n")
   
   # Debug the input data
-  cat(sprintf("abs_change range: [%.4f, %.4f], %d finite values\n",
-              min(spmeta_data$abs_change[is.finite(spmeta_data$abs_change)], na.rm = TRUE),
-              max(spmeta_data$abs_change[is.finite(spmeta_data$abs_change)], na.rm = TRUE),
-              sum(is.finite(spmeta_data$abs_change))))
+  cat(sprintf("abs_change range: [%.4f, %.4f], %d values\n",
+              min(spmeta_data$abs_change), max(spmeta_data$abs_change), n))
   
-  # Debug population weighting
-  if("abs_change_se_original" %in% names(spmeta_data)) {
-    cat(sprintf("Population-weighted SE range: [%.4f, %.4f]\n",
-                min(spmeta_data$abs_change_se, na.rm = TRUE),
-                max(spmeta_data$abs_change_se, na.rm = TRUE)))
-    cat(sprintf("Original SE range: [%.4f, %.4f]\n",
-                min(spmeta_data$abs_change_se_original, na.rm = TRUE),
-                max(spmeta_data$abs_change_se_original, na.rm = TRUE)))
-  }
+  cat(sprintf("SE range: [%.4f, %.4f]\n",
+              min(spmeta_data$abs_change_se), max(spmeta_data$abs_change_se)))
   
-  # Create spatial weights matrix
-  n <- nrow(spmeta_data)
-  W_sample <- W_matrix[spmeta_data$GEOID, spmeta_data$GEOID]
-  neighbors <- list(W_sample)
-  
-  # Tune rho acceptance for this outcome
+  # Tune rho acceptance for this outcome (once; all chains share the proposal)
   cat(sprintf("Tuning rho acceptance for %s...\n", outcome))
-  metrop_var_rho_trans <- tune_rho_acceptance(data, outcome, W_matrix)
+  set.seed(chain_seed)
+  metrop_var_rho_trans <- tune_rho_acceptance(theta_hat, se, x, neighbors)
   
-  # Set MCMC samples
-  mcmc_samples <- if(fast_mode) 1000 else 110000
+  # MCMC settings
+  mcmc_samples <- if(fast_mode) 5000 else 110000
+  burn_in <- if(fast_mode) 1000 else 10000
+  thin <- if(fast_mode) 1 else 10
+  keep_samples <- seq(burn_in + 1, mcmc_samples, by = thin)
   
-  # Run SpMeta 
-  spmeta_result <- SpMeta(
-    mcmc_samples = mcmc_samples,
-    theta_hat = theta_hat,
-    se = se,  # Population-weighted standard errors
-    x = x,
-    model_indicator = 1,  
-    neighbors = neighbors,
-    metrop_var_rho_trans = metrop_var_rho_trans
-  )
+  # Dispersed starting values: rho spread over (0, 1), beta jittered around 0,
+  # tau2 spread over two orders of magnitude
+  set.seed(chain_seed)
+  chain_inits <- lapply(seq_len(n_chains), function(ch) list(
+    rho_init  = seq(0.1, 0.9, length.out = n_chains)[ch],
+    beta_init = rnorm(ncol(X), mean = 0, sd = 1),
+    tau2_init = 10^seq(-1, 1, length.out = n_chains)[ch]
+  ))
   
-  # Debug the spmeta_result structure
-  cat(sprintf("Beta dimensions: %d x %d\n", nrow(spmeta_result$beta), ncol(spmeta_result$beta)))
-  cat(sprintf("First few beta[1,] values: %s\n", paste(round(spmeta_result$beta[1, 1:5], 4), collapse = ", ")))
-  cat(sprintf("Phi list length: %d\n", length(spmeta_result$phi)))
-  cat(sprintf("First phi sample length: %d\n", length(unlist(spmeta_result$phi[[1]]))))
-  cat(sprintf("Theta_true list length: %d\n", length(spmeta_result$theta_true)))
-  cat(sprintf("First theta_true sample length: %d\n", length(unlist(spmeta_result$theta_true[[1]]))))
-  
-  # Process results
-  burn_in <- if(fast_mode) 100 else 10000
-  if(fast_mode) {
-    keep_samples <- (burn_in + 1):ncol(spmeta_result$beta)
-  } else {
-    # For full mode: thin by factor of 10 after burn-in
-    all_post_burnin <- (burn_in + 1):ncol(spmeta_result$beta)
-    keep_samples <- all_post_burnin[seq(1, length(all_post_burnin), by = 10)]
+  # run_chain() is shipped to worker processes, which do not see globals:
+  # everything it uses must live in this function's environment.
+  seed_base <- chain_seed
+  run_chain <- function(ch) {
+    set.seed(seed_base + ch)
+    fit <- do.call(SpMeta::SpMeta, c(list(
+      mcmc_samples = mcmc_samples,
+      theta_hat = theta_hat,
+      se = se,
+      x = x,
+      model_indicator = 1,
+      neighbors = neighbors,
+      metrop_var_rho_trans = metrop_var_rho_trans
+    ), chain_inits[[ch]]))
+    # A broken likelihood shows up as NaN draws: stop rather than summarise them.
+    # theta_true is checked one iteration at a time: unlist() of the whole list
+    # would copy every draw (~1.8 GB per chain at 110,000 iterations).
+    stopifnot(
+      "non-finite beta draws" = all(is.finite(fit$beta)),
+      "non-finite tau2 draws" = all(is.finite(fit$tau2)),
+      "non-finite rho draws" = all(is.finite(fit$rho)),
+      "non-finite theta_true draws" =
+        all(vapply(fit$theta_true, function(t) all(is.finite(unlist(t))), logical(1)))
+    )
+    # Return per-tract posterior mean and SD of theta_true (kept draws) instead
+    # of every draw, so the workers send back a small object.
+    theta_sum <- theta_sumsq <- numeric(n)
+    for(j in keep_samples) {
+      t_j <- unlist(fit$theta_true[[j]])
+      theta_sum <- theta_sum + t_j
+      theta_sumsq <- theta_sumsq + t_j^2
+    }
+    n_kept <- length(keep_samples)
+    fit$theta_mean <- theta_sum / n_kept
+    fit$theta_sd <- sqrt(pmax(theta_sumsq / n_kept - fit$theta_mean^2, 0) * n_kept / (n_kept - 1))
+    fit$theta_true <- NULL
+    fit
   }
   
-  # Extract beta samples for posterior summaries
-  beta_samples <- spmeta_result$beta[, keep_samples]
+  cat(sprintf("Running %d chains (%d at a time), %d iterations each...\n",
+              n_chains, n_cores, mcmc_samples))
+  if(n_cores > 1) {
+    cl <- parallel::makeCluster(n_cores)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    chains <- parallel::parLapply(cl, seq_len(n_chains), run_chain)
+  } else {
+    chains <- lapply(seq_len(n_chains), run_chain)
+  }
+  cat("All beta, tau2, rho and theta_true draws are finite in every chain\n")
   
-  # Assess convergence
+  chain_acceptance <- vapply(chains, rho_acceptance, numeric(1))
+  cat("rho acceptance by chain:", paste(sprintf("%.3f", chain_acceptance), collapse = ", "), "\n")
+  
+  # Posterior draws pooled across chains (post burn-in, thinned), plus the
+  # additive interaction contrast computed draw by draw
+  beta_samples <- do.call(cbind, lapply(chains, function(f) f$beta[, keep_samples, drop = FALSE]))
+  summary_samples <- t(add_interaction_contrast(t(beta_samples), colnames(X)))
+  ic_terms <- grep("^interaction_contrast|^gent_x_aq_z$", rownames(summary_samples), value = TRUE)
+  stopifnot("no interaction term to report" = length(ic_terms) > 0)
+  for (ic_term in ic_terms) {
+    ic <- summary_samples[ic_term, ]
+    cat(sprintf("Additive interaction (%s): %.3f (95%% CrI %.3f, %.3f); Pr(< 0) = %.3f\n",
+                ic_term, mean(ic), quantile(ic, 0.025), quantile(ic, 0.975), mean(ic < 0)))
+  }
+  
+  # Assess convergence across chains
   cat("Assessing convergence...\n")
-  convergence_results <- assess_convergence(spmeta_result, burn_in, outcome)
+  convergence_results <- assess_convergence(chains, keep_samples, colnames(X), outcome,
+                                            rhat_max = rhat_max, ess_min = ess_min)
   
-  # Calculate final acceptance rate for rho
-  rho_samples_all <- spmeta_result$rho[1, ]
-  final_rho_acceptance <- calculate_rho_acceptance(rho_samples_all)
-  
-  # Calculate posterior summaries for beta coefficients
-  posterior_means <- rowMeans(beta_samples)
-  posterior_sd <- apply(beta_samples, 1, sd)
-  cred_low <- apply(beta_samples, 1, quantile, probs = 0.025)
-  cred_high <- apply(beta_samples, 1, quantile, probs = 0.975)
+  # Posterior summaries for the beta coefficients and the interaction contrast
+  posterior_means <- rowMeans(summary_samples)
+  posterior_sd <- apply(summary_samples, 1, sd)
+  cred_low <- apply(summary_samples, 1, quantile, probs = 0.025)
+  cred_high <- apply(summary_samples, 1, quantile, probs = 0.975)
+  prob_negative <- rowMeans(summary_samples < 0)
   
   # Create results
-  var_names <- colnames(X)
+  var_names <- rownames(summary_samples)
   
   results <- data.frame(
     outcome = outcome,
+    spec = spec,
+    sample = if (is.null(sub)) "all tracts" else sprintf("%s in {%s}", sub$var, paste(sub$levels, collapse = "; ")),
+    modifier = if (is.null(modifier_var)) NA_character_ else
+      sprintf("%s (s1 = %s; s2 = %s)", modifier_var, modifier_levels[1], modifier_levels[2]),
     term = var_names,
     posterior_mean = posterior_means,
     posterior_sd = posterior_sd,
     cred_low = cred_low,
     cred_high = cred_high,
+    prob_negative = prob_negative,
     n_obs = n,
-    mcmc_samples = length(keep_samples),
+    n_chains = n_chains,
+    mcmc_samples = ncol(summary_samples),
     total_iterations = mcmc_samples,
     burn_in = burn_in,
-    thinning = if(fast_mode) 1 else 10,
+    thinning = thin,
     stringsAsFactors = FALSE
   )
+  conv <- convergence_results$convergence_summary
+  results$rhat <- conv$rhat[match(results$term, conv$parameter)]
+  results$ess <- conv$ess[match(results$term, conv$parameter)]
   
   # Store convergence info
   attr(results, "convergence") <- convergence_results
   
   # Store rho information
   attr(results, "rho_info") <- list(
-    rho_acceptance_rate = final_rho_acceptance,
+    rho_acceptance_min = min(chain_acceptance),
+    rho_acceptance_max = max(chain_acceptance),
     metrop_var_rho_trans = metrop_var_rho_trans
   )
   
-  # Store raw MCMC samples for diagnostics
+  # Store raw MCMC output for diagnostics
   attr(results, "mcmc_samples") <- list(
-    beta_samples = beta_samples,
-    rho_samples = if(length(keep_samples) > 0) spmeta_result$rho[1, keep_samples] else spmeta_result$rho[1, ],
-    spmeta_result = spmeta_result,
+    chains = chains,
+    chain_inits = chain_inits,
+    keep_samples = keep_samples,
     design_matrix = X,
     data = spmeta_data,
-    burn_in = burn_in
+    burn_in = burn_in,
+    thin = thin
   )
   
   return(results)
 }
 
 # Run analysis
-cat("Running SpMeta Analysis with Population Weighting in", if(fast_mode) "FAST MODE" else "FULL MODE", "\n")
+cat("Running SpMeta Analysis in", if(fast_mode) "FAST MODE" else "FULL MODE", "- spec:", spec, "\n")
 
 all_results <- list()
 rho_info_list <- list()
 diagnostic_summaries <- list()
 
 # Create timestamp for this run
-timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+# Spec in every output name; PID suffix keeps file names unique across runs
+timestamp <- paste0(spec, "_", format(Sys.time(), "%Y%m%d_%H%M%S"), "_", Sys.getpid())
 
 # Run analyses sequentially
 cat("Running sequential analysis...\n")
@@ -672,16 +585,29 @@ for(outcome in outcomes) {
     # Store rho info for reporting
     rho_info_list[[outcome]] <- attr(result, "rho_info")
     
+    # Save the parameter draws (all iterations, every chain) for diagnostics
+    mcmc_data <- attr(result, "mcmc_samples")
+    saveRDS(list(chains = lapply(mcmc_data$chains, function(f)
+                   f[c("beta", "tau2", "rho", "acctot_rho_trans", "theta_mean", "theta_sd")]),
+                 GEOID = as.character(mcmc_data$data$GEOID),
+                 chain_inits = mcmc_data$chain_inits,
+                 terms = colnames(mcmc_data$design_matrix),
+                 burn_in = mcmc_data$burn_in,
+                 thin = mcmc_data$thin,
+                 metrop_var_rho_trans = attr(result, "rho_info")$metrop_var_rho_trans),
+            output_path(paste0("draws_", outcome, if(fast_mode) "_fast" else "_full", "_", timestamp, ".rds")))
+    
     # Create diagnostic plots if requested
     if(save_diagnostics) {
       mcmc_data <- attr(result, "mcmc_samples")
       if(!is.null(mcmc_data)) {
         diag_summary <- create_mcmc_diagnostics(
           outcome = outcome,
-          spmeta_result = mcmc_data$spmeta_result,
+          chains = mcmc_data$chains,
+          keep_samples = mcmc_data$keep_samples,
           X = mcmc_data$design_matrix,
           spmeta_data = mcmc_data$data,
-          burn_in = mcmc_data$burn_in,
+          convergence_summary = attr(result, "convergence")$convergence_summary,
           timestamp = timestamp
         )
         diagnostic_summaries[[outcome]] <- diag_summary
@@ -707,7 +633,8 @@ if(length(all_results) > 0) {
   cat("\n=== RHO TUNING SUMMARY ===\n")
   rho_summary <- data.frame(
     outcome = names(rho_info_list),
-    rho_acceptance_rate = sapply(rho_info_list, function(x) x$rho_acceptance_rate),
+    rho_acceptance_min = sapply(rho_info_list, function(x) x$rho_acceptance_min),
+    rho_acceptance_max = sapply(rho_info_list, function(x) x$rho_acceptance_max),
     metrop_var_rho_trans = sapply(rho_info_list, function(x) x$metrop_var_rho_trans),
     stringsAsFactors = FALSE
   )
@@ -719,11 +646,11 @@ if(length(all_results) > 0) {
     cat("\n=== MCMC DIAGNOSTIC SUMMARY ===\n")
     for(outcome in names(diagnostic_summaries)) {
       cat(sprintf("\n%s:\n", toupper(outcome)))
-      cat(sprintf("  Diagnostic file: %s\n", diagnostic_summaries[[outcome]]$diagnostic_file))
-      beta_sum <- diagnostic_summaries[[outcome]]$beta_summary
-      cat("  Effective Sample Sizes:\n")
-      for(j in 1:nrow(beta_sum)) {
-        cat(sprintf("    %s: %.0f\n", beta_sum$coefficient[j], beta_sum$ess[j]))
+      cat(sprintf("  Trace plots: %s\n", diagnostic_summaries[[outcome]]$trace_file))
+      conv_sum <- attr(all_results[[outcome]], "convergence")$convergence_summary
+      cat("  Effective Sample Sizes (pooled across chains):\n")
+      for(j in 1:nrow(conv_sum)) {
+        cat(sprintf("    %s: %.0f\n", conv_sum$parameter[j], conv_sum$ess[j]))
       }
     }
   }
@@ -756,28 +683,28 @@ if(length(all_results) > 0) {
   mode_suffix <- if(fast_mode) "_fast" else "_full"
   
   # Save complete results
-  rds_file <- paste0("spmeta_bayesian_results_pop_weighted", mode_suffix, "_", timestamp, ".rds")
+  rds_file <- output_path(paste0("spmeta_bayesian_results", mode_suffix, "_", timestamp, ".rds"))
   saveRDS(final_results, rds_file)
   
   # Save rho summary separately
-  rho_rds_file <- paste0("rho_tuning_summary_pop_weighted", mode_suffix, "_", timestamp, ".rds")
+  rho_rds_file <- output_path(paste0("rho_tuning_summary", mode_suffix, "_", timestamp, ".rds"))
   saveRDS(rho_summary, rho_rds_file)
   cat(sprintf("Rho tuning summary saved: %s\n", rho_rds_file))
   
   # Save diagnostic summaries
   if(length(diagnostic_summaries) > 0) {
-    diag_rds_file <- paste0("mcmc_diagnostic_summary_pop_weighted", mode_suffix, "_", timestamp, ".rds")
+    diag_rds_file <- output_path(paste0("mcmc_diagnostic_summary", mode_suffix, "_", timestamp, ".rds"))
     saveRDS(diagnostic_summaries, diag_rds_file)
     cat(sprintf("Diagnostic summary saved: %s\n", diag_rds_file))
   }
   
   if(save_csv) {
-    csv_file <- paste0("spmeta_bayesian_results_pop_weighted", mode_suffix, "_", timestamp, ".csv")
+    csv_file <- output_path(paste0("spmeta_bayesian_results", mode_suffix, "_", timestamp, ".csv"))
     write.csv(final_results, csv_file, row.names = FALSE)
     cat(sprintf("CSV results saved: %s\n", csv_file))
     
     # Save rho summary as CSV
-    rho_csv_file <- paste0("rho_tuning_summary_pop_weighted", mode_suffix, "_", timestamp, ".csv")
+    rho_csv_file <- output_path(paste0("rho_tuning_summary", mode_suffix, "_", timestamp, ".csv"))
     write.csv(rho_summary, rho_csv_file, row.names = FALSE)
     cat(sprintf("Rho tuning summary CSV saved: %s\n", rho_csv_file))
   }
@@ -787,16 +714,18 @@ if(length(all_results) > 0) {
   
   # Print final summary of tuning parameters and acceptance rates
   cat("\n=== FINAL TUNING SUMMARY ===\n")
-  tuning_summary <- rho_summary[, c("outcome", "metrop_var_rho_trans", "rho_acceptance_rate")]
+  tuning_summary <- rho_summary[, c("outcome", "metrop_var_rho_trans", "rho_acceptance_min", "rho_acceptance_max")]
   print(tuning_summary)
   
   # Summary of diagnostic plots created
   if(save_diagnostics && length(diagnostic_summaries) > 0) {
     cat(sprintf("\n=== DIAGNOSTIC PLOTS CREATED ===\n"))
-    cat(sprintf("Diagnostic plots saved in directory: diagnostics_%s/\n", timestamp))
+    cat(sprintf("Diagnostic plots saved in directory: %s\n", output_path(paste0("diagnostics_", timestamp))))
+
     cat("Files created:\n")
     for(outcome in names(diagnostic_summaries)) {
-      cat(sprintf("  - mcmc_diagnostics_%s.png\n", outcome))
+      cat(sprintf("  - %s\n  - %s\n", basename(diagnostic_summaries[[outcome]]$trace_file),
+                  basename(diagnostic_summaries[[outcome]]$theta_file)))
     }
   }
   
